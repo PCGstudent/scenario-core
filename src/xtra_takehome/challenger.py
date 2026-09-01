@@ -16,20 +16,50 @@ class GjrSkewTParams:
     eta: float
     lam: float
 
+    def innovation_moments(self) -> tuple[float, float, float]:
+        """Return E[z^2 I(z<0)], E[z^4], E[z^4 I(z<0)] for standardized skew-t."""
+        from arch.univariate import SkewStudent
+
+        dist = SkewStudent()
+        parameters = np.array([self.eta, self.lam], dtype=float)
+        m2_negative = float(dist.partial_moment(2, z=0.0, parameters=parameters))
+        m4 = float(dist.moment(4, parameters=parameters))
+        m4_negative = float(dist.partial_moment(4, z=0.0, parameters=parameters))
+        return m2_negative, m4, m4_negative
+
     @property
-    def approximate_persistence(self) -> float:
-        """Common symmetric-innovation approximation used for discussion only."""
-        return self.alpha + 0.5 * self.gamma + self.beta
+    def effective_persistence(self) -> float:
+        """Expected one-step GJR variance multiplier under the fitted innovation law."""
+        m2_negative, _, _ = self.innovation_moments()
+        return self.alpha + self.beta + self.gamma * m2_negative
+
+    @property
+    def fourth_moment_coefficient(self) -> float:
+        """E[A(z)^2], where A(z)=beta+alpha*z^2+gamma*z^2*I(z<0).
+
+        A value below one is the usual finite-fourth-moment condition for this
+        GJR recursion when the innovation fourth moment exists.
+        """
+        if self.eta <= 4:
+            return float("inf")
+        m2_negative, m4, m4_negative = self.innovation_moments()
+        return float(
+            self.beta**2
+            + 2.0 * self.beta * self.alpha
+            + 2.0 * self.beta * self.gamma * m2_negative
+            + self.alpha**2 * m4
+            + (2.0 * self.alpha * self.gamma + self.gamma**2) * m4_negative
+        )
 
 
 class GjrSkewTGenerator:
     """GJR-GARCH(1,1,1) with Hansen skewed-t innovations.
 
-    The challenger is intentionally a single justified refinement of the baseline:
-    GJR adds sign-dependent volatility response, while skewed-t innovations allow
+    This is a single targeted refinement of the development baseline: GJR adds
+    sign-dependent volatility response, while skewed-t innovations allow
     conditional asymmetry in addition to heavy tails.
 
-    Simulation starts each path from a randomly sampled *historical fitted state*
+    Simulation starts each path from a randomly sampled historical fitted state
     (residual and conditional variance). This avoids forcing every 252-day path to
     start from one arbitrary volatility regime and better matches the empirical
     mixture of calm/stressed starting conditions used in the calibration check.
@@ -84,8 +114,8 @@ class GjrSkewTGenerator:
         if n_steps <= 0 or n_paths <= 0:
             raise ValueError("n_steps and n_paths must be positive.")
 
-        # arch's SkewStudent distribution owns a seedable NumPy generator and
-        # returns standardized (mean 0, variance 1) innovations.
+        # arch's SkewStudent generator is explicitly seeded and returns
+        # standardized innovations (mean 0, variance 1).
         from arch.univariate import SkewStudent
 
         rng = np.random.default_rng(seed)
