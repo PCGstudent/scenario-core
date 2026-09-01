@@ -169,27 +169,31 @@ def _failure_narrative(
         f"The pooled family fails {_names(pooled_failures)}. The horizon-matched family "
         f"fails {_names(matched_failures)}. Every failure is retained.",
         "",
-        "One tolerance did change during development, and the direction matters. A "
-        "negative-control audit showed that moving to the block estimator had "
-        "unintentionally altered the strictness of the squared-return ACF gate, because "
-        "the same absolute number means something different against a target three times "
-        "smaller. Rescaling it to the estimator makes the submitted model **fail** that "
-        "gate, where before it passed. No tolerance was tuned to make this model pass, "
-        "and none was moved in the direction that would have.",
+        "Two tolerance *definitions* were corrected during audit, and the direction "
+        "matters. The mean tolerance was placed on a standard-error scale, since an "
+        "absolute tolerance on a daily mean has no meaning without one. The "
+        "squared-return ACF tolerance was re-expressed relative to the historical scale "
+        "of the estimator in use, after a negative control showed that carrying an "
+        "absolute number across estimators had unintentionally changed the strictness "
+        "being demanded. Neither correction was made to improve this model's result: the "
+        "ACF correction changes the submitted model from PASS to **FAIL** on that gate.",
         "",
-        "### The pooled moment failures are realization noise, not miscalibration",
+        "### The pooled moment failures are consistent with finite-record variability",
         "",
-        "This is settled by simulating records of the *same length* as the historical one "
-        "rather than by argument. Across those records the historical value of every "
+        "The evidence is simulation of whole records of the *same length* as the "
+        "historical one — continuous paths, initialized once, not stitched together from "
+        "independent years — rather than by argument. Across those records the historical value of every "
         f"pooled moment lands inside the model's own 5-95% band — "
         + ", ".join(
             f"{r.statistic} at percentile {r.percentile:.0f}" for r in inside
         )
         + ". A single 16-year record simply does not pin these quantities down: the "
         "model's own records disagree with each other by more than the model disagrees "
-        "with history. Comparing 252,000 pooled synthetic observations against 4,158 "
-        "historical ones cannot detect miscalibration in them, and the apparent failures "
-        "are what that mismatch produces.",
+        "with history. This does not prove the marginals are correctly calibrated "
+        "— it is an in-sample generative check, not a test with power against every "
+        "alternative — but it does mean these three failures are not, by themselves, "
+        "evidence of miscalibration. A comparison of 252,000 pooled synthetic "
+        "observations against 4,158 historical ones cannot distinguish the two.",
         "",
         "The kurtosis case has a structural explanation on top of the sampling one. With "
         f"`E[A(z)^2] = {params.fourth_moment_coefficient:.4f} >= 1` the fitted process has "
@@ -242,10 +246,10 @@ def _failure_narrative(
     lines += [
         "**Severity beyond the historical record is extrapolation, and it is heavy.** This is "
         "the finding that matters for a stress engine, and it is a governance problem rather "
-        "than a calibration failure. At the edge of the record the model is well calibrated: "
-        "the stressed-region table above shows the worst observed year sitting in the middle of "
-        "the model's predicted distribution for a record of this length. Beyond that edge there "
-        "is nothing to calibrate against. Because the fitted recursion has no finite fourth "
+        "than a calibration failure. At the edge of the record the observed extreme is "
+        "plausible under the fitted model: the stressed-region table above shows the worst "
+        "observed year sitting in the middle of the model's predicted distribution for a "
+        "record of this length. Beyond that edge there is nothing to compare against at all. Because the fitted recursion has no finite fourth "
         f"moment, the extrapolation is unusually heavy: {100*beyond_max_fraction:.1f}% of "
         "simulated years are more volatile than any year in the record, which is itself "
         "unremarkable for a record this short, but the severity of those years is set entirely "
@@ -348,7 +352,7 @@ The fit-then-simulate interface is explicit and every stochastic source is seed-
 
 ## How this is validated
 
-Every metric is checked under two estimators. The tolerances are the same in both; what differs is only how the statistic is measured.
+Every metric is checked under two estimators. The acceptance rules are shared across both families: scale-free tolerances are numerically identical, while the mean and squared-return ACF tolerances are re-expressed on the historical scale of the estimator in use. What never differs is the strictness being demanded.
 
 1. **Pooled marginal check.** All synthetic observations pooled against the pooled historical sample: {synthetic_stats.n_blocks * synthetic_stats.horizon:,} against {n_returns:,}. The right instrument for the unconditional marginal law, and the wrong one for any statistic that depends on sample size.
 2. **Horizon-matched year-level check.** Every statistic estimated inside blocks of {real_stats.horizon} trading days on *both* sides: {real_stats.n_blocks:,} overlapping historical windows against {synthetic_stats.n_blocks:,} independent synthetic paths, compared at the median.
@@ -358,6 +362,8 @@ Every metric is checked under two estimators. The tolerances are the same in bot
 Drawdowns are horizon-matched by construction, so they are computed once and reported once in the first table rather than duplicated into both.
 
 These are pragmatic engineering acceptance gates, not hypothesis-test significance levels.
+
+**Threshold rationale.** Every tolerance was fixed before the baseline and the challenger were compared, and they follow one ladder: the deeper into a tail a statistic reaches, or the more path-dependent it is, the noisier its estimate and the wider its tolerance. Volatility, a measure of scale using the whole sample, gets **10%**. Statistics at the 5% tails — `q05`, `q95`, `VaR 95%` — get **15%**. Statistics at the 1% tails and the first expected-shortfall level — `q01`, `q99`, `VaR 99%`, `ES 95%` — get **20%**, each resting on roughly a fifth as many observations. `ES 99%` averages only the most extreme losses and gets **25%**, as does the median drawdown, which is path-dependent and estimated from overlapping windows. Skewness and excess kurtosis are gated on **absolute** differences of 0.50 and 2.00 rather than relative ones: both are shape parameters that can sit near zero, where a relative error is unstable and, at the crossing, undefined. The two tolerances that cannot be constants are derived instead, as described next.
 
 ### Family 1: pooled marginal gates
 
