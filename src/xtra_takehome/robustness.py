@@ -24,9 +24,7 @@ class SeedRun:
 
 
 def _normalized_error(gates: list[Gate]) -> float:
-    return float(
-        sum(g.error / g.threshold for g in gates if g.threshold > 0)
-    )
+    return float(sum(g.error / g.threshold for g in gates if g.threshold > 0))
 
 
 def _severe_failures(gates: list[Gate], multiple: float = 2.0) -> int:
@@ -184,7 +182,7 @@ def main() -> None:
         "",
         "## Model-selection conclusion",
         "",
-        "I select the **GJR-GARCH skew-t challenger** for the submitted generator. Its improvements in negative skew, upper/lower quantiles and drawdown behaviour are persistent across seeds, and the additional structure is still small and interpretable. I do not select it because it merely has more PASS labels: normalized error, severe failures and analytical tail diagnostics are reviewed explicitly.",
+        "I select the **GJR-GARCH skew-t challenger** for the submitted generator because it captures the observed negative asymmetry materially better, improves right-tail calibration and extreme drawdown behaviour, and those gains persist across seeds while the additional structure remains small and interpretable. The choice is deliberately not presented as uniform dominance: the simpler baseline is somewhat closer on some left-tail q01/VaR/ES measures, while the challenger keeps those measures inside the declared acceptance gates. Aggregate normalized error is also worse for the challenger because the unstable kurtosis miss is extremely large; that higher-moment failure is therefore treated as a model-risk finding rather than hidden inside a winner score.",
         "",
         "The selection is conditional, not a claim of adequacy. Higher-moment instability and squared-return ACF mismatch remain model-risk findings. In a production stress engine I would test GARCH-EVT for conditional tails and/or regime-aware volatility, with rolling/regime holdouts, before treating either model as production-ready.",
     ]
