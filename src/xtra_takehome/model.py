@@ -20,24 +20,34 @@ class GarchTParams:
         return self.alpha + self.beta
 
 
+def _standardized_t_draws(
+    rng: np.random.Generator,
+    nu: float,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    if nu <= 2:
+        raise ValueError("Student-t degrees of freedom must exceed 2 for finite variance.")
+    z = rng.standard_t(df=nu, size=shape)
+    return z * np.sqrt((nu - 2.0) / nu)
+
+
 def simulate_garch_t(
     params: GarchTParams,
     horizon: int,
     n_paths: int,
     seed: int,
 ) -> np.ndarray:
-    """Simulate percentage returns from a fitted GARCH(1,1)-Student-t model.
+    """Standalone GARCH-t simulation from a single documented initial variance.
 
-    Student-t innovations are standardized to unit variance.
+    This helper is retained for simple deterministic unit tests. The fitted generator
+    below uses empirical fitted-state initialization so model comparisons do not mix
+    a fixed unconditional start for one model with historical-state starts for another.
     """
-    if params.nu <= 2:
-        raise ValueError("Student-t degrees of freedom must exceed 2 for finite variance.")
     if horizon <= 0 or n_paths <= 0:
         raise ValueError("horizon and n_paths must be positive.")
 
     rng = np.random.default_rng(seed)
-    z = rng.standard_t(df=params.nu, size=(n_paths, horizon))
-    z *= np.sqrt((params.nu - 2.0) / params.nu)
+    z = _standardized_t_draws(rng, params.nu, (n_paths, horizon))
 
     returns = np.empty((n_paths, horizon), dtype=float)
     variance = np.empty((n_paths, horizon), dtype=float)
@@ -61,12 +71,50 @@ def simulate_garch_t(
     return returns
 
 
+def simulate_garch_t_from_states(
+    params: GarchTParams,
+    residuals: np.ndarray,
+    variances: np.ndarray,
+    horizon: int,
+    n_paths: int,
+    seed: int,
+) -> np.ndarray:
+    """GARCH-t simulation initialized from sampled historical fitted states."""
+    if horizon <= 0 or n_paths <= 0:
+        raise ValueError("horizon and n_paths must be positive.")
+    if residuals.size == 0 or variances.size == 0 or residuals.size != variances.size:
+        raise ValueError("residuals and variances must be non-empty aligned arrays.")
+
+    rng = np.random.default_rng(seed)
+    state_idx = rng.integers(0, residuals.size, size=n_paths)
+    eps_prev = np.asarray(residuals[state_idx], dtype=float).copy()
+    var_prev = np.asarray(variances[state_idx], dtype=float).copy()
+    z = _standardized_t_draws(rng, params.nu, (n_paths, horizon))
+
+    out = np.empty((n_paths, horizon), dtype=float)
+    for t in range(horizon):
+        variance = (
+            params.omega
+            + params.alpha * eps_prev**2
+            + params.beta * var_prev
+        )
+        variance = np.maximum(variance, 1e-12)
+        eps = np.sqrt(variance) * z[:, t]
+        out[:, t] = params.mu + eps
+        eps_prev = eps
+        var_prev = variance
+
+    return out
+
+
 class GarchTGenerator:
     """Documented fit-then-simulate interface for the assessment."""
 
     def __init__(self) -> None:
         self.params_: GarchTParams | None = None
         self.fit_summary_: str | None = None
+        self._residuals: np.ndarray | None = None
+        self._variances: np.ndarray | None = None
 
     def fit(self, returns: pd.Series) -> "GarchTGenerator":
         from arch import arch_model
@@ -98,25 +146,32 @@ class GarchTGenerator:
         else:
             unconditional_variance = float(np.var(x, ddof=1))
 
-        # Start simulation from a stable, data-scale variance.
-        initial_variance = max(unconditional_variance, float(np.var(x, ddof=1)) * 0.25)
-
         self.params_ = GarchTParams(
             mu=mu,
             omega=omega,
             alpha=alpha,
             beta=beta,
             nu=nu,
-            initial_variance=initial_variance,
+            initial_variance=max(unconditional_variance, 1e-12),
         )
         self.fit_summary_ = str(result.summary())
+
+        residuals = np.asarray(result.resid, dtype=float)
+        variances = np.asarray(result.conditional_volatility, dtype=float) ** 2
+        valid = np.isfinite(residuals) & np.isfinite(variances) & (variances > 0)
+        self._residuals = residuals[valid]
+        self._variances = variances[valid]
+        if self._residuals.size == 0:
+            raise RuntimeError("No valid fitted states were produced by the GARCH model.")
         return self
 
     def simulate(self, n_steps: int, n_paths: int, seed: int) -> np.ndarray:
-        if self.params_ is None:
+        if self.params_ is None or self._residuals is None or self._variances is None:
             raise RuntimeError("Call fit() before simulate().")
-        return simulate_garch_t(
+        return simulate_garch_t_from_states(
             self.params_,
+            residuals=self._residuals,
+            variances=self._variances,
             horizon=n_steps,
             n_paths=n_paths,
             seed=seed,
