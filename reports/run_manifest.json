@@ -10,25 +10,78 @@
   "model": {
     "name": "GJR-GARCH(1,1,1) with Hansen skewed-t innovations",
     "parameters": {
-      "mu": -0.00026186978471486413,
-      "omega": 0.05643822178760102,
-      "alpha": 0.06533414244059708,
-      "gamma": 0.03444241961043443,
-      "beta": 0.9092304358934601,
-      "eta": 5.2934422659221925,
-      "lambda": -0.12146247354046702,
-      "effective_persistence": 0.9934538020024218,
-      "fourth_moment_coefficient": 1.0457320685533895
+      "mu": -0.00025547673949627436,
+      "omega": 0.05642679250542944,
+      "alpha": 0.0653305295397982,
+      "gamma": 0.03442891769281265,
+      "beta": 0.9092422943704717,
+      "eta": 5.2932959681055545,
+      "lambda": -0.12146091894347609,
+      "effective_persistence": 0.9934546510047532,
+      "implied_unconditional_volatility": 2.936136744833882,
+      "fourth_moment_coefficient": 1.0457202129024177
     }
   },
   "simulation": {
     "seed": 42,
     "horizon_trading_days": 252,
     "n_paths": 1000,
-    "initialization": "sampled historical fitted residual/variance states"
+    "initialization": "sampled historical fitted residual/variance states",
+    "rng": "numpy SeedSequence(seed).spawn(2): independent state and innovation streams"
   },
   "validation": {
-    "passed_gates": 12,
-    "total_gates": 15
+    "pooled_marginal": {
+      "passed_gates": 10,
+      "total_gates": 15
+    },
+    "horizon_matched": {
+      "horizon": 252,
+      "historical_blocks": 3907,
+      "independent_years": 16,
+      "passed_gates": 15,
+      "total_gates": 15
+    },
+    "worst_year_exceedance": {
+      "volatility": {
+        "historical_max": 4.536733720682207,
+        "model_annual_probability": 0.044,
+        "expected_count_in_sample": 0.704,
+        "poisson_interval": [
+          0.05129329438755052,
+          4.743864518390577
+        ],
+        "passed": true
+      },
+      "VaR 99%": {
+        "historical_max": 13.122895776098787,
+        "model_annual_probability": 0.048,
+        "expected_count_in_sample": 0.768,
+        "poisson_interval": [
+          0.05129329438755052,
+          4.743864518390577
+        ],
+        "passed": true
+      },
+      "ES 99%": {
+        "historical_max": 23.31301892310871,
+        "model_annual_probability": 0.023,
+        "expected_count_in_sample": 0.368,
+        "poisson_interval": [
+          0.05129329438755052,
+          4.743864518390577
+        ],
+        "passed": true
+      },
+      "maximum drawdown": {
+        "historical_max": 0.7407804746840074,
+        "model_annual_probability": 0.024,
+        "expected_count_in_sample": 0.384,
+        "poisson_interval": [
+          0.05129329438755052,
+          4.743864518390577
+        ],
+        "passed": true
+      }
+    }
   }
 }
