@@ -37,7 +37,7 @@ Use **IAM roles**, never long-lived access keys. API callers authenticate throug
 
 ## Observability and reproducibility
 
-**CloudWatch Logs** receives structured events with `job_id`, model/image version, timings, seed and failure class. Custom metrics cover job latency, failures, queue time and compute use; alarms target abnormal failure rate/runtime. I would also emit the model-risk metric this validation surfaced — the fraction of simulated years more volatile than anything in the calibration window — and alarm on it, because a refit that quietly drifts further into the non-stationary region would otherwise show up only as unusable scenarios downstream. Step Functions provides execution-level state. A run manifest in S3 makes every numerical result traceable to code, data cut-off, parameters and initialization state; idempotency keys prevent accidental duplicate work.
+**CloudWatch Logs** receives structured events with `job_id`, model/image version, timings, seed and failure class. Custom metrics cover job latency, failures, queue time and compute use; alarms target abnormal failure rate/runtime. I would also emit the structural diagnostics this validation depends on — effective persistence, `E[A(z)^2]`, and the implied return tail index — and alarm when a refit crosses the finite-fourth-moment boundary, because that is what governs whether far-tail scenarios may be used at all, and a drift across it would otherwise surface only as unusable numbers downstream. Step Functions provides execution-level state. A run manifest in S3 makes every numerical result traceable to code, data cut-off, parameters and initialization state; idempotency keys prevent accidental duplicate work.
 
 ## Cost and 100× usage
 

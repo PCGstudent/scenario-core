@@ -6,7 +6,7 @@ The project follows the assessment cycle explicitly:
 
 **diagnose → baseline → fit → simulate → validate → refine once → robustness-check → report limitations**
 
-The submitted generator is **GJR-GARCH(1,1,1) with Hansen skewed-t innovations**. A simpler GARCH(1,1)-Student-t model remains in the repository as the development baseline that motivated the refinement.
+The submitted generator is **one model**: GJR-GARCH(1,1,1) with Hansen skewed-t innovations. A simpler GARCH(1,1)-Student-t remains in the repository as the development baseline that motivated the single refinement, and as the comparison the selection argument rests on. It is evidence about how the choice was made, not a second submission.
 
 ## Canonical clean-clone command
 
@@ -53,7 +53,9 @@ Diagnostics show four features that drive the modelling decision:
 3. negative skew, inconsistent with a symmetric innovation law;
 4. a Hill tail index near 3 in **both** tails, against a fitted conditional innovation with about 5.3 degrees of freedom.
 
-Point 4 is the one that decides the family. An unconditional tail much heavier than the conditional innovation means roughly half the unconditional tail weight is manufactured by volatility clustering rather than by fat innovations — exactly what a GARCH-type recursion with moderately heavy innovations produces. It also shows the asymmetry is not a tail-index asymmetry: the two tails decay at similar rates, and the skew lives in the body and in the volatility response, which is what GJR plus a skewed innovation targets.
+Point 4 is the one that decides the family. An unconditional tail markedly heavier than the conditional innovation is the signature of volatility clustering: a GARCH-type recursion driven by moderately heavy innovations produces an unconditional law heavier-tailed than those innovations. The fit then makes a checkable prediction. Solving `E[A(z)^k] = 1` for the fitted variance multiplier gives a **model-implied return tail index of 2.70**, against a **Hill estimate of 2.94** taken directly from the returns. Those agree to within about 8%, and the agreement is not circular: the tail index never entered the likelihood, which sees only the conditional density.
+
+Point 4 also shows the asymmetry is not a tail-index asymmetry — the two tails decay at similar rates, so the skew lives in the body and in the volatility response, which is exactly what GJR plus a skewed innovation targets.
 
 I first fitted **GARCH(1,1)-Student-t** because it is the smallest model that directly targets volatility clustering plus heavy tails. Validation exposed a material asymmetry miss. I therefore made one targeted refinement rather than jumping to a neural generator: **GJR-GARCH + skewed-t**.
 
@@ -87,27 +89,37 @@ It is **not** intended to reproduce:
 
 ## How validation works
 
-Every metric is checked twice against **one shared table of thresholds** declared in `validation.THRESHOLDS`. The two families differ only in how the statistic is estimated, never in the tolerance it must meet.
+Every metric is checked under two estimators, plus a third family of checks for the region where neither estimator can help.
 
-**Family 1, pooled marginal.** All synthetic observations pooled against the pooled historical sample. The right instrument for the unconditional marginal law.
+**Family 1, pooled marginal.** All synthetic observations pooled against the pooled historical sample: 252,000 against 4,158. The right instrument for the unconditional marginal law, and the wrong one for any statistic that depends on sample size.
 
-**Family 2, horizon-matched.** Every statistic estimated inside 252-day blocks on *both* sides — 3,907 overlapping historical windows against 1,000 independent synthetic paths — then compared at the median.
+**Family 2, horizon-matched.** Every statistic estimated inside 252-day blocks on *both* sides — 3,907 overlapping historical windows against 1,000 independent synthetic paths — then compared at the median. This family exists because the sample ACF of squared returns is biased toward zero in short blocks, and because the fitted recursion has no finite unconditional fourth moment, so sample kurtosis has no population value to converge to. Comparing either across unequal sample sizes measures the estimator, not the model.
 
-The second family exists because several statistics are sample-size dependent, so comparing 252,000 pooled synthetic observations against ~4,158 historical ones measures the estimator rather than the model. The sample ACF of squared returns is biased toward zero in short blocks; and because the fitted recursion has no finite unconditional fourth moment, sample kurtosis has no limit to converge to and simply grows with the simulated sample size. This is the same like-for-like principle the original design already applied to drawdowns, extended to the rest of the suite.
+**Two tolerances cannot be constants**, and treating them as constants was a real defect that an audit of an earlier version caught. Carrying the same *absolute* squared-return ACF tolerance into the block estimator quietly relaxed the gate to the point where it could not fail: the historical target shrinks from 0.127 to 0.046 under that estimator, so an iid bootstrap of the real returns — the exact historical marginal with no volatility clustering at all — scored 0.0498 against a 0.05 threshold and passed. Those tolerances are now declared as a fraction of the historical scale *under the estimator in use*, fixed at the fraction the original absolute number implied. The strictness is unchanged; only the units travel. A regression test pins this by asserting the gate rejects a zero-clustering generator. The mean-return tolerance is likewise expressed in standard errors of the historical mean, since an absolute tolerance on a daily mean has no scale.
 
-**Family 3, worst-observed-year exceedance.** The stressed region is deliberately *not* gated on a historical percentile. With overlapping windows the top few per cent of blocks are one episode repeated — for this sample, the 222 blocks above the 95% ES-99% quantile all begin between 2019-04-23 and 2020-03-09 — so a historical "95th percentile" is not identified. There are only 16 independent trading years in the sample. What is identified is a frequency, so the model-implied annual probability of a year at least as severe as the worst observed one is checked against the exact 90% Poisson interval for having seen exactly one such year.
+Drawdowns are horizon-matched by construction, so they are computed once and reported once rather than duplicated into both scorecards.
+
+**Family 3, the stressed region.** Two tempting comparisons are avoided here, and the report says why rather than quietly reporting them. Gating on an upper historical percentile is meaningless: with overlapping windows the top few per cent of blocks are one episode repeated — the 222 blocks above the 95% ES-99% quantile all begin between 2019-04-23 and 2020-03-09 — so that quantile is not identified. Comparing `max(1,000 simulated years)` with `max(16 observed years)` is the same error in disguise, since the maximum of a heavy-tailed sample grows with the sample. Instead the model is projected onto a record of the same length as the historical one, asking how likely 16 years are to contain nothing worse than what was observed. Nothing in this family is a formal gate: 16 non-overlapping blocks — which are not 16 independent observations — do not support one.
+
+A separate **matched-length reference** settles the pooled moments directly: records of the historical length are simulated, and the observed value is located in the model's own distribution.
 
 Covered metrics: mean, volatility, skewness, excess kurtosis; the 1%, 5%, 95% and 99% return quantiles; VaR and ES at 95% and 99%; squared-return ACF over lags 1–20; and maximum drawdown over 252-day horizons. VaR and ES use **loss `L = -return`** and are reported as positive loss magnitudes. Squared-return ACF is always estimated within a path and then averaged; independent paths are never concatenated.
 
-Acceptance thresholds are pragmatic engineering gates, not hypothesis-test significance levels. They are fixed in code and FAILs are retained rather than tuned away.
+Acceptance thresholds are pragmatic engineering gates, not hypothesis-test significance levels, and FAILs are retained rather than tuned away.
 
-## Model-risk finding
+## What the model gets right, and what it gets wrong
 
-The generator is well calibrated for typical and moderately adverse years and passes every horizon-matched gate. Its material limitation is at the other end: **a near-integrated variance recursion that occasionally runs away.**
+The pooled family fails five gates and the horizon-matched family fails one. Neither count is the finding; what the difference between them means is.
 
-Effective persistence is 0.9935 and `E[A(z)^2] = 1.0457`, so the fitted process has no finite unconditional fourth moment, and its implied unconditional volatility (2.94%/day) sits well above the sample volatility (2.34%/day). The consequence is visible directly in the scenarios: about 4% of simulated years are more volatile than anything in the historical record, and the pooled unconditional moments are hostage to a handful of paths — removing the 10 most volatile of 1,000 paths moves pooled excess kurtosis from roughly 390 to 14 against a historical 14.7. `reports/validation_report.md` quantifies this with a leave-out sensitivity table, and `reports/robustness_report.md` shows the pooled moment statistics swinging by several hundred per cent across seeds while the horizon-matched estimates of the same quantities move by ten to twenty per cent.
+**The pooled moment failures are realization noise.** Simulating records of the same length as the historical one settles this: the historical volatility, skewness and excess kurtosis land at the 41st, 19th and 69th percentile of the model's own distribution over such records, all inside its 5–95% band. A single 16-year record does not pin these quantities down — the model's own records disagree with each other by more than the model disagrees with history.
 
-That instability is reported as a model-risk finding rather than smoothed away. The next experiment would be **GARCH-EVT** if conditional-tail calibration is the priority, or a **regime-aware volatility model** if bounding the explosive paths and fitting the long-memory-like ACF profile matter more. I intentionally stop before those extensions.
+**The genuine failure is the shape of volatility memory.** The horizon-matched squared-return ACF misses its gate at 0.0191 against a tolerance of 0.0180. That is not sampling noise: two independent simulations of this same model differ from each other by only 0.0032 on the identical statistic, so the discrepancy with history is roughly six times the irreducible simulation noise. The historical block ACF decays slowly and irregularly; the model's decays geometrically. A single stationary GJR recursion reproduces the average level of volatility persistence without reproducing its profile.
+
+**The material limitation is extrapolation, not calibration.** At the edge of the record the model is well calibrated: the worst observed year sits in the middle of the model's predicted distribution for a 16-year record on all four severity measures, with P(record max ≤ observed) between 46% and 69%. Beyond that edge there is nothing to calibrate against, and because `E[A(z)^2] = 1.0457 ≥ 1` the fitted process has no finite unconditional fourth moment, so the extrapolation is unusually heavy. This generator should not produce a far-tail capital number without an explicitly governed cap, or without a specification whose stationary law has the moments the use case assumes. That is a statement about where the model may be trusted rather than a defect in its fit — the same property that makes the extrapolation heavy is what lets it reproduce the unconditional tail index it was never fitted to.
+
+`reports/robustness_report.md` shows which statistics can carry a decision. Across ten seeds, pooled excess kurtosis ranges over [33.9, 389.5] and pooled skewness over [-4.88, -0.32], while the horizon-matched estimates of the same two quantities stay within [2.20, 2.41] and [-0.31, -0.26]. Most other metrics are reasonably stable under both estimators. No number from the pooled column should be quoted as characteristic of the generator.
+
+The next experiment would be **GARCH-EVT** if conditional-tail calibration is the priority, or a **regime-aware volatility model** to test whether state-dependent persistence reproduces the ACF profile a single recursion misses. I intentionally stop before those extensions.
 
 ## Outputs
 
@@ -160,7 +172,7 @@ reports/
 
 Every stochastic operation is seed-controlled. Simulation draws its state-sampling and innovation streams from independent `SeedSequence(seed).spawn(2)` children, so replications in the robustness study never share a generator stream. The fitted model uses an explicit fit-then-simulate interface, and calibration simulations start from sampled historical fitted residual/variance states so paths cover empirically observed calm and stressed initial conditions. `run_manifest.json` records the data window, path count, horizon, seed, RNG scheme, fitted parameters, persistence and higher-moment diagnostics, and the results of all three validation families.
 
-One caveat, verified rather than assumed. The committed reports were reproduced from a clean clone with a single command: the fetched price series is bit-identical, the test suite passes, and every gate verdict matches. The fitted parameters, however, differ in the fifth significant figure, because the `arch` maximum-likelihood optimizer converges to a marginally different point depending on the BLAS threading of the host. The resulting drift in reported statistics is below 0.1% and changes no PASS/FAIL outcome, but a re-run will not match the committed numbers digit for digit. Bit-level determinism here would require pinning BLAS thread counts in the environment, which I judged out of scope for a take-home; the honest claim is reproducible conclusions, not reproducible last digits.
+One caveat, verified rather than assumed. The committed reports were reproduced from a clean clone with the single documented command: the fetched price series is bit-identical, the suite passes, and every gate verdict matches. Re-running in the *same* environment reproduces the reports byte for byte. Across a differently built virtual environment the fitted parameters drift in the fifth significant figure, because the `arch` maximum-likelihood optimizer converges to a marginally different point depending on host BLAS threading; the resulting drift in reported statistics is below 0.1% and changed no PASS/FAIL outcome. Bit-level determinism across environments would require pinning BLAS thread counts, which I judged out of scope; the claim is reproducible conclusions, and reproducible digits within an environment.
 
 AI-assisted development is documented in `AIUSAGE.md`, including what was delegated, what remained human review responsibility, and the concrete mistakes that review caught.
 
