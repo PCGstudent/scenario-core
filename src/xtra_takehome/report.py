@@ -98,6 +98,15 @@ Daily Brent crude `BZ=F` close prices are fetched in code from Yahoo Finance. Th
 
 **GJR-GARCH(1,1,1) + Hansen skewed-t innovations**
 
+```text
+r_t       = mu + eps_t
+eps_t     = sigma_t z_t
+sigma_t^2 = omega + alpha eps_(t-1)^2
+            + gamma I(eps_(t-1) < 0) eps_(t-1)^2
+            + beta sigma_(t-1)^2
+z_t       ~ standardized Hansen skewed-t(eta, lambda)
+```
+
 | Parameter | Estimate |
 |---|---:|
 | mu | {_fmt(params.mu)} |
@@ -111,7 +120,7 @@ Daily Brent crude `BZ=F` close prices are fetched in code from Yahoo Finance. Th
 
 For the asymmetric innovation law, persistence is computed as `alpha + beta + gamma * E[z^2 I(z<0)]`; I do not use the symmetric `gamma/2` shortcut. {fourth_text}
 
-The fit-then-simulate interface is explicit and every stochastic source is seed-controlled. Simulation starts each independent path from a sampled historical fitted residual/conditional-variance state, so the calibration check represents a mixture of empirically observed calm and stressed starting conditions rather than forcing all paths into one arbitrary initial volatility state.
+The fit-then-simulate interface is explicit and every stochastic source is seed-controlled. Simulation starts each independent path from a sampled historical fitted residual/conditional-variance state, so the calibration check represents a mixture of empirically observed calm and stressed starting conditions rather than forcing all paths into one arbitrary initial volatility state. The full optimizer summary is saved to `reports/fit_summary.txt` and run metadata to `reports/run_manifest.json`.
 
 The baseline and selected model are compared in `reports/model_comparison.md`. A separate 10-seed check in `reports/robustness_report.md` distinguishes structural behaviour from one favourable Monte Carlo realization. Model selection is therefore not based on a single seed or a raw count of green gates alone.
 
