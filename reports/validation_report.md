@@ -74,6 +74,8 @@ These are pragmatic engineering acceptance gates, not formal hypothesis-test sig
 
 ![Drawdown comparison](figures/drawdown_distribution.png)
 
+The historical drawdown distribution uses overlapping rolling 252-day windows. It is therefore a descriptive like-for-like calibration target, not an iid sample for formal inferential testing.
+
 ## Honest failure mode
 
 - **volatility** fails its declared gate; I retain the failure rather than retuning the threshold after seeing the result.

@@ -10,7 +10,7 @@ This is a development comparison, not the final model-selection rule. Both model
 Baseline: **10/15** gates; aggregate normalized gate error **24.715**; severe failures **2**.
 Challenger: **12/15** gates; aggregate normalized gate error **38.289**; severe failures **1**.
 
-I deliberately do **not** declare a winner from this one realization. An early AI-assisted comparison used pass count as the primary winner rule; review of the tail errors showed that this was too simplistic. The selection decision therefore uses the multi-seed robustness analysis in `robustness_report.md`, failure severity, and model interpretability in addition to this table.
+I deliberately do **not** declare a winner from this one realization. An early AI-assisted comparison used pass count as the primary winner rule; review of the tail errors showed that this was too simplistic. The selection decision therefore uses the multi-seed robustness analysis in `robustness_report.md`, failure severity, metric relevance and model interpretability in addition to this table.
 
 ## Fitted challenger parameters
 
@@ -63,4 +63,4 @@ For the skewed innovation law, effective persistence uses `alpha + beta + gamma 
 
 ## Selection rationale
 
-The asymmetric challenger was retained because its improvements in negative skew, tail quantiles and drawdown behaviour persisted across seeds, while the extra parameterization remains small and interpretable. The decision is not a claim that the challenger is fully adequate: higher-moment instability and squared-return ACF mismatch remain explicit model-risk findings.
+The asymmetric challenger is retained because it captures the observed negative skew materially better and improves right-tail quantiles and extreme drawdown calibration while the added structure remains small and interpretable. It is not uniformly better: the baseline is somewhat closer on some left-tail q01/VaR/ES measures, although those challenger measures remain inside the declared gates. The challenger's much larger kurtosis miss also makes its aggregate normalized error worse; that is treated as an explicit higher-moment model-risk finding rather than averaged away or used as a reason to move thresholds.
