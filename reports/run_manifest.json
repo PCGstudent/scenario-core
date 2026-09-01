@@ -5,6 +5,7 @@
     "end_exclusive": "2026-09-01",
     "n_closes": 4159,
     "n_returns": 4158,
+    "non_overlapping_blocks": 16,
     "return_definition": "100 * log(P_t / P_{t-1})"
   },
   "model": {
@@ -19,7 +20,8 @@
       "lambda": -0.12146091894347609,
       "effective_persistence": 0.9934546510047532,
       "implied_unconditional_volatility": 2.936136744833882,
-      "fourth_moment_coefficient": 1.0457202129024177
+      "fourth_moment_coefficient": 1.0457202129024177,
+      "implied_return_tail_index": 2.6964247720201326
     }
   },
   "simulation": {
@@ -31,57 +33,79 @@
   },
   "validation": {
     "pooled_marginal": {
-      "passed_gates": 10,
-      "total_gates": 15
+      "passed_gates": 9,
+      "total_gates": 14
     },
     "horizon_matched": {
       "horizon": 252,
       "historical_blocks": 3907,
-      "independent_years": 16,
-      "passed_gates": 15,
-      "total_gates": 15
+      "passed_gates": 12,
+      "total_gates": 13
     },
-    "worst_year_exceedance": {
+    "squared_acf_monte_carlo_floor": {
+      "median": 0.0031515927730442535,
+      "max": 0.0033134700323871084
+    },
+    "matched_sample_reference": {
       "volatility": {
-        "historical_max": 4.536733720682207,
-        "model_annual_probability": 0.044,
-        "expected_count_in_sample": 0.704,
-        "poisson_interval": [
-          0.05129329438755052,
-          4.743864518390577
-        ],
-        "passed": true
+        "historical": 2.3437040979024153,
+        "model_median": 2.4268179011928095,
+        "model_p05": 1.9584693266477216,
+        "model_p95": 3.826703149881669,
+        "percentile": 41.39784946236559,
+        "inside_90pct_band": true
+      },
+      "skewness": {
+        "historical": -0.9584231595584,
+        "model_median": -0.49112495988075244,
+        "model_p05": -1.7975778406530463,
+        "model_p95": 0.29800812993275994,
+        "percentile": 18.817204301075268,
+        "inside_90pct_band": true
+      },
+      "excess kurtosis": {
+        "historical": 14.691476231676702,
+        "model_median": 9.860498445694212,
+        "model_p05": 4.026267888956609,
+        "model_p95": 66.34011417921693,
+        "percentile": 69.35483870967742,
+        "inside_90pct_band": true
+      }
+    },
+    "extreme_region": {
+      "volatility": {
+        "historical_max_non_overlapping": 4.4611152595315895,
+        "model_annual_exceedance_probability": 0.046,
+        "blocks_in_record": 16,
+        "probability_record_contains_one": 0.5292677041493669,
+        "probability_model_record_max_below_observed": 0.47073229585063314,
+        "flagged": false
       },
       "VaR 99%": {
-        "historical_max": 13.122895776098787,
-        "model_annual_probability": 0.048,
-        "expected_count_in_sample": 0.768,
-        "poisson_interval": [
-          0.05129329438755052,
-          4.743864518390577
-        ],
-        "passed": true
+        "historical_max_non_overlapping": 13.122895776098787,
+        "model_annual_exceedance_probability": 0.048,
+        "blocks_in_record": 16,
+        "probability_record_contains_one": 0.5448116124055158,
+        "probability_model_record_max_below_observed": 0.45518838759448416,
+        "flagged": false
       },
       "ES 99%": {
-        "historical_max": 23.31301892310871,
-        "model_annual_probability": 0.023,
-        "expected_count_in_sample": 0.368,
-        "poisson_interval": [
-          0.05129329438755052,
-          4.743864518390577
-        ],
-        "passed": true
+        "historical_max_non_overlapping": 23.31301892310871,
+        "model_annual_exceedance_probability": 0.023,
+        "blocks_in_record": 16,
+        "probability_record_contains_one": 0.31085117581844346,
+        "probability_model_record_max_below_observed": 0.6891488241815565,
+        "flagged": false
       },
       "maximum drawdown": {
-        "historical_max": 0.7407804746840074,
-        "model_annual_probability": 0.024,
-        "expected_count_in_sample": 0.384,
-        "poisson_interval": [
-          0.05129329438755052,
-          4.743864518390577
-        ],
-        "passed": true
+        "historical_max_non_overlapping": 0.6295515559476015,
+        "model_annual_exceedance_probability": 0.042,
+        "blocks_in_record": 16,
+        "probability_record_contains_one": 0.49667541368803325,
+        "probability_model_record_max_below_observed": 0.5033245863119667,
+        "flagged": false
       }
-    }
+    },
+    "beyond_historical_max_year_fraction": 0.044
   }
 }

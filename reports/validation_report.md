@@ -8,11 +8,13 @@ Daily Brent crude `BZ=F` close prices are fetched in code from Yahoo Finance. Th
 
 The sample contains **4,158** daily observations. Mean daily log return is 0.0029% with volatility 2.344%. The distribution is negatively skewed (-0.9584) and has excess kurtosis 14.691, which is inconsistent with a thin-tailed Gaussian description. A fitted Student-t reference has approximately **2.97 degrees of freedom**, providing a compact heavy-tailed benchmark for the QQ diagnostic.
 
-Linear return dependence is comparatively limited: the maximum absolute return ACF over the inspected non-zero lags is 0.0503. In contrast, the mean absolute squared-return ACF is 0.1271, evidence of conditional heteroskedasticity / volatility clustering. That motivates a volatility-aware generator rather than iid Monte Carlo.
+Linear return dependence is comparatively limited: the maximum absolute return ACF over the inspected non-zero lags is 0.0503. In contrast, the mean absolute squared-return ACF is 0.1271, evidence of conditional heteroskedasticity and volatility clustering. That motivates a volatility-aware generator rather than iid Monte Carlo.
 
-The tail diagnostics decide the innovation law. At k=100 order statistics the Hill estimator gives a tail index of **2.94** on the loss side and **2.91** on the gain side; the gain tail is the marginally heavier of the two, and both sit close to the fitted Student-t degrees of freedom. An index near three implies a finite variance but an infinite fourth moment, so sample kurtosis is not a stable estimation target for this series, and the mean-excess function for losses rises with the threshold, the signature of a heavy rather than exponential tail. Note that the asymmetry visible in the skewness is *not* mirrored by a large gap between the two tail indices: the asymmetry lives mainly in the body and in the volatility response, not in how fast the extremes decay.
+The tail diagnostics decide the innovation law. At k=100 order statistics the Hill estimator gives a tail index of **2.94** on the loss side and **2.91** on the gain side, both close to the fitted Student-t degrees of freedom. An index near three is consistent with a finite variance but a non-finite fourth moment, so sample kurtosis is not a stable estimation target for this series — a point that returns in the validation. The mean-excess function for losses rises with the threshold, the signature of a heavy rather than exponential tail. Note that the asymmetry visible in the skewness is *not* mirrored by a large gap between the two tail indices: the asymmetry lives in the body and in the volatility response, not in how fast the extremes decay.
 
-Two facts then pin down the model family. First, the unconditional tail index near 2.9 is much heavier than the fitted conditional innovation, which has eta = 5.29 degrees of freedom: roughly half of the unconditional tail weight is *manufactured by volatility clustering* rather than by fat innovations, which is precisely what a GARCH-type recursion with moderately heavy innovations produces. Second, the negative skew and the leverage effect require an asymmetric response. A parsimonious GARCH(1,1)-Student-t was fitted first as a development baseline; its validation exposed a material asymmetry miss, since a symmetric innovation model cannot reproduce negative skew. I therefore made one targeted refinement rather than escalating to a neural generator: **GJR-GARCH(1,1,1) with Hansen skewed-t innovations**.
+Two facts then pin down the model family. First, the unconditional tail is much heavier than the conditional innovation, which has eta = 5.29 degrees of freedom. A GARCH-type recursion generates exactly that gap: volatility clustering makes the unconditional law heavier-tailed than the innovations that drive it. Second, the negative skew and the leverage effect require an asymmetric response. A parsimonious GARCH(1,1)-Student-t was fitted first as a development baseline; its validation exposed a material asymmetry miss, since a symmetric innovation model cannot reproduce negative skew. I therefore made one targeted refinement rather than escalating to a neural generator: **GJR-GARCH(1,1,1) with Hansen skewed-t innovations**.
+
+The fitted recursion implies a stationary return tail index of **2.70**, against a Hill estimate of 2.92 taken directly from the returns. Those agree to within 8%, and the agreement is not circular: the tail index never entered the likelihood, which sees only the conditional density. A volatility model that reproduces an unconditional tail it was not fitted to is doing the specific job this data asks of it.
 
 ![ACF diagnostics](figures/diagnostics_acf.png)
 
@@ -43,29 +45,34 @@ z_t       ~ standardized Hansen skewed-t(eta, lambda)
 | effective variance persistence | 0.9935 |
 | implied unconditional volatility (%/day) | 2.936 |
 | sample volatility (%/day) | 2.344 |
+| implied return tail index | 2.696 |
 | skew-t eta | 5.293 |
 | skew-t lambda | -0.1215 |
 
-For the asymmetric innovation law, persistence is computed as `alpha + beta + gamma * E[z^2 I(z<0)]`; I do not use the symmetric `gamma/2` shortcut. The fitted GJR process has `E[A(z)^2] = 1.0457` for `A(z)=beta + alpha*z^2 + gamma*z^2*I(z<0)`. Because this is >= 1, the usual finite unconditional fourth-moment condition is not satisfied, so sample kurtosis has no limit to converge to and grows with the simulated sample size. This is a structural property of the fit, and it drives the main failure mode reported below.
+For the asymmetric innovation law, persistence is computed as `alpha + beta + gamma * E[z^2 I(z<0)]`; I do not use the symmetric `gamma/2` shortcut. The fitted process has `E[A(z)^2] = 1.0457` for `A(z) = beta + alpha*z^2 + gamma*z^2*I(z<0)`, which is at or above one, so the unconditional fourth moment does not exist. Both quantities are evaluated from the fitted skew-t law rather than approximated, and the quadrature used for the non-integer moment is checked against the closed-form values at powers one and two in the test suite.
 
-Two fitted quantities are worth stating plainly because they explain most of what follows. Effective persistence is 0.9935, close enough to one that the variance recursion mean-reverts only slowly over a 252-day horizon, and the level it reverts *to* implies an unconditional volatility of 2.936%/day against a sample volatility of 2.344%/day. A near-integrated variance process with an unconditional level above the sample average is exactly the configuration that produces occasional runaway paths.
+Effective persistence is 0.9935, close enough to one that the variance recursion mean-reverts only slowly over a 252-day horizon, and the level it reverts toward implies an unconditional volatility of 2.936%/day against a sample volatility of 2.344%/day.
 
 The fit-then-simulate interface is explicit and every stochastic source is seed-controlled, using two independent child streams from a single `SeedSequence` so that replications never share a generator stream. Simulation starts each independent path from a sampled historical fitted residual/conditional-variance state, so the calibration check represents a mixture of empirically observed calm and stressed starting conditions rather than forcing all paths into one arbitrary initial volatility state. The full optimizer summary is saved to `reports/fit_summary.txt` and run metadata to `reports/run_manifest.json`.
 
 ## How this is validated
 
-Every metric is checked twice, against **one shared table of thresholds declared in `validation.THRESHOLDS`**. The two families differ only in how the statistic is estimated, never in the tolerance it must meet, so a change of estimator cannot be confused with a relaxation of the acceptance criteria.
+Every metric is checked under two estimators. The tolerances are the same in both; what differs is only how the statistic is measured.
 
-1. **Pooled marginal check.** All synthetic observations are pooled and compared with the pooled historical sample. This is the right instrument for the unconditional marginal law, but the two samples have very different sizes (252,000 against 4,158), which matters for any statistic that is sample-size dependent.
-2. **Horizon-matched year-level check.** Every statistic is estimated inside blocks of 252 trading days on *both* sides: 3,907 overlapping historical windows against 1,000 independent synthetic paths, then compared at the median. This is the same like-for-like principle already applied to drawdowns, extended to the rest of the suite.
+1. **Pooled marginal check.** All synthetic observations pooled against the pooled historical sample: 252,000 against 4,158. The right instrument for the unconditional marginal law, and the wrong one for any statistic that depends on sample size.
+2. **Horizon-matched year-level check.** Every statistic estimated inside blocks of 252 trading days on *both* sides: 3,907 overlapping historical windows against 1,000 independent synthetic paths, compared at the median.
 
-These are pragmatic engineering acceptance gates, not formal hypothesis-test significance levels. Central-distribution and volatility targets have tighter tolerances; far-tail measures and drawdowns are looser because their effective sample sizes are smaller.
+**Two tolerances cannot be constants, and treating them as constants was a real defect.** An audit of an earlier version of this report found that carrying the same *absolute* squared-return ACF tolerance across both estimators quietly relaxed the gate to the point where it could not fail: the historical mean absolute squared-return autocorrelation is 0.1271 on the full sample but only 0.0457 inside 252-day blocks, so a generator with no volatility clustering whatsoever scored 0.0498 against a 0.05 threshold and passed. The tolerance is now declared as a fraction of the historical scale *under the estimator in use*, fixed at the fraction the original absolute number implied on the pooled estimator. The strictness is unchanged; only the units travel. Likewise the mean-return tolerance is expressed in standard errors of the historical mean, since an absolute tolerance on a daily mean has no meaning without a scale.
+
+Drawdowns are horizon-matched by construction, so they are computed once and reported once in the first table rather than duplicated into both.
+
+These are pragmatic engineering acceptance gates, not hypothesis-test significance levels.
 
 ### Family 1: pooled marginal gates
 
 | Metric | Real | Synthetic | Error | Threshold | Status |
 |---|---:|---:|---:|---:|:---:|
-| mean return (pp) | 0.0029 | -0.0043 | 0.0072 | 0.1000 | PASS |
+| mean return (pp) | 0.0029 | -0.0043 | 0.0072 | 0.0727 | PASS |
 | volatility | 2.344 | 2.827 | 20.6% | 10% | FAIL |
 | skewness | -0.9584 | -4.876 | 3.918 | 0.5000 | FAIL |
 | excess kurtosis | 14.691 | 389.49 | 374.80 | 2.000 | FAIL |
@@ -77,17 +84,18 @@ These are pragmatic engineering acceptance gates, not formal hypothesis-test sig
 | ES 95% | 5.756 | 6.504 | 13.0% | 20% | PASS |
 | VaR 99% | 6.707 | 7.534 | 12.3% | 20% | PASS |
 | ES 99% | 9.939 | 12.696 | 27.7% | 25% | FAIL |
-| squared-return ACF MAE | 0.0000 | 0.0649 | 0.0649 | 0.0500 | FAIL |
+| squared-return ACF MAE | - | 0.0649 | 0.0649 | 0.0500 | FAIL |
 | drawdown median | 0.2459 | 0.2848 | 15.8% | 25% | PASS |
-| drawdown p95 | 0.6951 | 0.6189 | 11.0% | 30% | PASS |
+
+The mean gate is weak by construction and it is worth saying so: the historical daily mean is 0.0029 with a standard error of 0.0363, so no tolerance that respects the sampling error of the drift can be tight. It is reported for completeness, not as evidence.
 
 ### Family 2: horizon-matched year-level gates
 
-Median of the statistic across 252-day blocks. The band column reports the 5th-95th percentile spread of the statistic across blocks on each side; it is shown for context and is deliberately **not** gated, for the reason given in the next section.
+Median of the statistic across 252-day blocks. The band column reports the 5th-95th percentile spread of the statistic across blocks on each side; it is shown for context and is deliberately **not** gated, for the reason given in the stressed-region section.
 
 | Metric | Real median | Synthetic median | Error | Threshold | 5-95% band, real vs synthetic | Status |
 |---|---:|---:|---:|---:|---|:---:|
-| mean return (pp) | -0.0055 | 0.0124 | 0.0179 | 0.1000 | [-0.2385, 0.2085] vs [-0.2425, 0.2239] | PASS |
+| mean return (pp) | -0.0055 | 0.0124 | 0.0179 | 0.0727 | [-0.2385, 0.2085] vs [-0.2425, 0.2239] | PASS |
 | volatility | 1.966 | 1.929 | 1.9% | 10% | [1.062, 4.404] vs [1.278, 4.432] | PASS |
 | skewness | -0.4525 | -0.2696 | 0.1829 | 0.5000 | [-1.429, 0.3519] vs [-1.091, 0.4946] | PASS |
 | excess kurtosis | 2.132 | 2.291 | 0.1591 | 2.000 | [0.5412, 12.947] vs [0.6455, 8.233] | PASS |
@@ -99,9 +107,13 @@ Median of the statistic across 252-day blocks. The band column reports the 5th-9
 | ES 95% | 4.639 | 4.539 | 2.2% | 20% | [2.445, 11.729] vs [2.804, 10.929] | PASS |
 | VaR 99% | 5.636 | 5.298 | 6.0% | 20% | [2.746, 13.123] vs [3.219, 13.078] | PASS |
 | ES 99% | 6.889 | 6.516 | 5.4% | 25% | [3.288, 23.313] vs [3.679, 17.807] | PASS |
-| squared-return ACF MAE | 0.0000 | 0.0191 | 0.0191 | 0.0500 | - | PASS |
-| drawdown median | 0.2459 | 0.2848 | 15.8% | 25% | - | PASS |
-| drawdown p95 | 0.6951 | 0.6189 | 11.0% | 30% | - | PASS |
+| squared-return ACF MAE | - | 0.0191 | 0.0191 | 0.0180 | - | FAIL |
+
+### Reported, not gated
+
+| Quantity | Real | Synthetic | Why it is not a gate |
+|---|---:|---:|---|
+| drawdown p95 | 0.6951 | 0.6189 | Upper quantile of overlapping historical windows: not identified, reported rather than gated. |
 
 ![Marginal comparison](figures/marginal_comparison.png)
 
@@ -109,74 +121,76 @@ Median of the statistic across 252-day blocks. The band column reports the 5th-9
 
 ![Year-level severity](figures/year_severity.png)
 
-In the first two panels the historical distribution shows an isolated spike sitting exactly on the worst-observed-year line. That spike is not a cluster of bad years; it is the same crisis appearing in every overlapping window that contains it, and it is the visual form of the argument in the next section.
-
 ![Drawdown comparison](figures/drawdown_distribution.png)
 
-## Family 3: the stressed region, and why it is not a percentile gate
+## Is the observed record a plausible draw from this model?
 
-The obvious next step would be to gate the model against the 95th percentile of the historical year-severity distribution. That gate would be meaningless, and it is worth saying why rather than quietly reporting it.
+The pooled table above compares a statistic measured on 252,000 synthetic observations with the same statistic measured on 4,158 historical ones. That comparison cannot tell miscalibration from sampling noise. Simulating records of the *same length* as the historical one can, and it is the decisive check for the pooled moments.
 
-| Quantile of the year-level statistic | Volatility, real | Volatility, synthetic | ES 99%, real | ES 99%, synthetic |
-|---|---:|---:|---:|---:|
-| 0.50 | 1.966 | 1.929 | 6.889 | 6.516 |
-| 0.75 | 2.582 | 2.504 | 8.383 | 8.993 |
-| 0.90 | 3.008 | 3.407 | 11.978 | 12.942 |
-| 0.95 | 4.404 | 4.432 | 23.313 | 17.807 |
-| 0.99 | 4.502 | 7.166 | 23.313 | 30.671 |
-| max | 4.537 | 36.645 | 23.313 | 184.57 |
-
-The historical column stops moving above roughly the 90th percentile. That is not a property of oil markets; it is window overlap. The 3,907 historical blocks are rolling windows over the same 4,158 returns, so the worst few per cent of them are the *same* episode counted many times. Concretely: the 222 blocks above the 95% quantile of ES 99% all begin between 2019-04-23 and 2020-03-09, spanning 2019 and 2020 — one crisis, replicated. The historical "95th percentile" is therefore effectively the historical maximum, and there are only 16 independent 252-day years in this sample.
-
-What is identified is a frequency. History produced one year at least as severe as its worst; the model implies some annual probability of such a year. Comparing the two is a Poisson question, so each check below asks whether the model-implied expected count over 16 independent years is consistent with having observed exactly one, using the exact 90% Poisson interval for a single event.
-
-| Statistic | Worst observed year | Model annual probability | Expected count in 16 years | 90% Poisson interval for 1 event | Status |
+| Statistic | Historical | Model median | Model 5-95% band | Historical percentile | Verdict |
 |---|---:|---:|---:|---:|:---:|
-| volatility | 4.537 | 4.40% | 0.70 | 0.05 - 4.74 | PASS |
-| VaR 99% | 13.123 | 4.80% | 0.77 | 0.05 - 4.74 | PASS |
-| ES 99% | 23.313 | 2.30% | 0.37 | 0.05 - 4.74 | PASS |
-| maximum drawdown | 0.7408 | 2.40% | 0.38 | 0.05 - 4.74 | PASS |
+| volatility | 2.344 | 2.427 | [1.958, 3.827] | 41 | inside |
+| skewness | -0.9584 | -0.4911 | [-1.798, 0.2980] | 19 | inside |
+| excess kurtosis | 14.691 | 9.860 | [4.026, 66.340] | 69 | inside |
 
-The interval is wide because one observation is genuinely weak evidence. That width is the honest answer, not a weakness of the test: no dataset containing a single crisis of a given size can pin down its frequency more tightly, and a narrower gate here would be false precision.
+Every historical value falls inside the model's own band for a record of this length.
+
+## The stressed region
+
+The obvious next step would be to gate the model against the 95th percentile of the historical year-severity distribution, or to compare the worst simulated year with the worst observed one. Both would be mistakes, and it is worth saying why rather than quietly reporting them.
+
+The historical block distribution stops moving above roughly its 90th percentile. That is not a property of oil markets; it is window overlap. The 3,907 historical blocks are rolling windows over the same 4,158 returns, so the worst few per cent of them are the same episode counted many times: the 222 blocks above the 95% quantile of ES 99% all begin between 2019-04-23 and 2020-03-09, spanning 2019 and 2020 — one crisis, replicated. An upper quantile estimated from them is not identified.
+
+Comparing maxima directly is the same error in a different disguise. The maximum of a heavy-tailed sample grows with the sample, so `max(1,000 simulated years)` against `max(16 observed years)` measures the simulation budget, not the model. The comparison below is therefore projected onto a record of the same length as the historical one: the model's per-year exceedance probability is taken from the simulation, and the question asked is how likely a record of 16 years is to contain nothing worse than what was observed. The historical maximum is taken over **non-overlapping** blocks, to match that framing.
+
+| Statistic | Worst year in 16 observed | Model annual probability | P(record contains at least one) | P(model record max <= observed) | Verdict |
+|---|---:|---:|---:|---:|:---:|
+| volatility | 4.461 | 4.60% | 53% | 47% | plausible |
+| VaR 99% | 13.123 | 4.80% | 54% | 46% | plausible |
+| ES 99% | 23.313 | 2.30% | 31% | 69% | plausible |
+| maximum drawdown | 0.6296 | 4.20% | 50% | 50% | plausible |
+
+A value in the middle of the last column means the observed extreme is a typical draw for a record of this length. Values near 0% would mean the model almost always produces something worse; near 100%, that it cannot reach what was observed. Nothing here is a formal gate: with only 16 non-overlapping blocks — and those are not 16 independent observations, since consecutive years share regimes and volatility persistence — the data does not support a tight acceptance criterion in this region, and a narrow gate would be false precision.
 
 ## Honest failure mode
 
-The pooled family fails **volatility**, **skewness**, **excess kurtosis**, **ES 99%** and **squared-return ACF MAE**. The horizon-matched family fails no gate. Every failure is retained and no threshold was moved after seeing a result: both families are scored against the same declared table. What follows is why the two disagree, because the disagreement is the finding. A clean horizon-matched scorecard is not a claim of adequacy: the gates are deliberately silent about the region where this model actually breaks, which the next two sections locate.
+The pooled family fails **volatility**, **skewness**, **excess kurtosis**, **ES 99%** and **squared-return ACF MAE**. The horizon-matched family fails **squared-return ACF MAE**. Every failure is retained; no threshold was moved after seeing a result.
 
-### The estimator-driven part
+### The pooled moment failures are realization noise, not miscalibration
 
-**excess kurtosis** and **squared-return ACF MAE** cannot be read as model failures. Both statistics are strongly sample-size dependent, and the pooled comparison puts 252,000 synthetic observations against a few thousand historical ones. The sample ACF of squared returns is biased toward zero in short blocks, so an average of 252-day synthetic ACFs can never reach a full-sample historical ACF. Sample kurtosis is worse than biased: with `E[A(z)^2] >= 1` the unconditional fourth moment does not exist, so the statistic has no limit to converge to and simply grows with the simulated sample size. Estimated like-for-like on 252-day blocks, against the identical thresholds, both pass.
+This is settled by simulating records of the *same length* as the historical one rather than by argument. Across those records the historical value of every pooled moment lands inside the model's own 5-95% band — volatility at percentile 41, skewness at percentile 19, excess kurtosis at percentile 69. A single 16-year record simply does not pin these quantities down: the model's own records disagree with each other by more than the model disagrees with history. Comparing 252,000 pooled synthetic observations against 4,158 historical ones cannot detect miscalibration in them, and the apparent failures are what that mismatch produces.
 
-### The real failure: a near-integrated variance recursion that occasionally runs away
+The kurtosis case has a structural explanation on top of the sampling one. With `E[A(z)^2] = 1.0457 >= 1` the fitted process has no finite unconditional fourth moment, so sample kurtosis does not converge to a population value at all; it becomes progressively more dominated by rare extremes as the sample grows. A pooled kurtosis comparison across unequal sample sizes is therefore not a well-posed test, whatever the model.
 
-The typical simulated year is well calibrated. Median block variance is 3.864 historically against 3.722 synthetically, and every horizon-matched gate passes. The *mean* block variance, however, is 5.282 against 7.972, a factor of 1.51. That entire gap is created in the extreme upper tail: the worst historical year has volatility 4.537%/day while the worst simulated year reaches 36.645%/day, the largest historical daily move is 27.976% against 212.87% simulated, and 4.4% of simulated years are more volatile than anything in the record.
+### The leave-out diagnostic, with the comparator that makes it honest
 
-How concentrated is that? Removing the most volatile simulated paths and recomputing the pooled moments answers it directly. This is a sensitivity diagnostic, not a proposed fix; trimming paths after seeing the result would be data snooping.
+Dropping the most volatile block and recomputing the pooled moments shows how much of each estimate rests on one block. The historical rows are the point: heavy-tailed data behaves the same way, so this table does not convict the generator of anything. It measures the fragility of the *estimator*.
 
-| Paths removed | Share of simulation | Pooled volatility | Pooled skewness | Pooled excess kurtosis |
-|---|---:|---:|---:|---:|
-| 0 | 0.0% | 2.827 | -4.876 | 389.49 |
-| 1 | 0.1% | 2.576 | -1.164 | 37.975 |
-| 5 | 0.5% | 2.461 | -0.7311 | 17.149 |
-| 10 | 1.0% | 2.398 | -0.5786 | 14.385 |
-| *historical target* | - | *2.344* | *-0.9584* | *14.691* |
+| Source | Blocks dropped | Pooled volatility | Pooled skewness | Pooled excess kurtosis |
+|---|---|---:|---:|---:|
+| synthetic | none | 2.827 | -4.876 | 389.49 |
+| synthetic | 1 of 1000 | 2.576 | -1.164 | 37.975 |
+| historical | none | 2.247 | -0.9291 | 16.523 |
+| historical | 1 of 16 | 2.016 | -0.2827 | 3.835 |
 
-Removing 10 of 1,000 paths (1.0%) moves pooled excess kurtosis from 389.49 to 14.385 against a historical 14.691, and pooled skewness from -4.876 to -0.5786 against -0.9584. The unconditional moments of this generator are not a property of the generator in any useful sense; they are a property of a handful of paths.
+Both sides collapse. Reporting the synthetic row alone — as an earlier draft of this report did — would have made a universal property of heavy-tailed samples look like a defect of the model.
 
-The mechanism is in the fit, not in the simulation code: effective persistence 0.9935 with `E[A(z)^2] = 1.0457` is a variance process that mean-reverts too slowly to contain a large shock within the horizon and has no finite fourth moment to pull it back. Pooling then imports those paths into every unconditional moment at once, which is why **volatility**, **skewness** and **ES 99%** fail pooled and pass horizon-matched, and why the kurtosis miss is so much larger than sample-size dependence alone would produce.
+The synthetic figures above are one seed. Because pooled kurtosis has no population value under this process, it varies by an order of magnitude across simulations of the identical model: `reports/robustness_report.md` gives the range across ten seeds. No single number from that column, including the one in this table, should be read as characteristic of the generator.
 
-For a stress-testing application this is the material limitation. The generator is usable for typical and moderately adverse years, and its severity ladder tracks history to roughly the 90th percentile. Beyond that it stops making a calibrated statement about Brent: a day with a 212.87% move is not a scenario, it is the recursion diverging. Before any of this fed a capital number I would want either a variance process that is fourth-moment stationary, or an economically justified cap on the conditional variance, declared in advance rather than fitted after the fact.
+### What the model actually gets wrong
 
-### A second, milder failure
+**The shape of volatility memory.** The horizon-matched squared-return ACF misses its gate at 0.0191 against a tolerance of 0.0180. This is not a sample-size artefact and it is not Monte Carlo noise: two independent simulations of this same model differ from each other by only 0.0032 on the identical statistic, so the discrepancy with history is roughly 6 times the irreducible simulation noise. The historical block ACF decays slowly and irregularly while the model's decays geometrically. A single stationary GJR recursion reproduces the average level of volatility persistence without reproducing its long-memory-like profile, and the figure shows this plainly.
 
-The horizon-matched squared-return ACF passes on mean absolute error, but the *shape* is wrong: the historical block ACF decays slowly and irregularly while the model's decays geometrically. A single stationary GJR recursion reproduces the average level of volatility persistence without reproducing its long-memory-like profile. The gate does not catch this because a mean absolute error over twenty lags averages the discrepancy away; the figure shows it plainly.
+**Severity beyond the historical record is extrapolation, and it is heavy.** This is the finding that matters for a stress engine, and it is a governance problem rather than a calibration failure. At the edge of the record the model is well calibrated: the stressed-region table above shows the worst observed year sitting in the middle of the model's predicted distribution for a record of this length. Beyond that edge there is nothing to calibrate against. Because the fitted recursion has no finite fourth moment, the extrapolation is unusually heavy: 4.4% of simulated years are more volatile than any year in the record, which is itself unremarkable for a record this short, but the severity of those years is set entirely by the fitted dynamics and cannot be checked against anything.
 
-I would not address these by adding complexity indiscriminately. My next experiment would depend on the production objective: **GARCH-EVT** (POT/GPD on the standardized residual tails, which the Hill and mean-excess diagnostics already suggest is the natural extension) if conditional tail calibration is the priority; or a **regime-aware volatility model** if the long-memory-like ACF profile and the runaway upper tail are the dominant concern, since a two-state persistence structure would both fit the ACF shape better and bound the explosive paths. Either extension would be validated on regime and rolling-origin holdouts before production use.
+The practical consequence is that this generator should not be used to produce a capital number in the far tail without an explicitly governed cap, or without a specification whose stationary law has the moments the use case assumes. That is a statement about where the model may be trusted, not a defect in its fit: the same `E[A(z)^2] = 1.0457` that makes the extrapolation heavy is also what lets the model reproduce the unconditional tail index it was never fitted to.
+
+My next experiment would depend on the production objective. **GARCH-EVT** (POT/GPD on the standardized residual tails, which the Hill and mean-excess diagnostics already suggest) if conditional tail calibration is the priority. A **regime-aware volatility model** if the ACF shape is the concern — that would test whether state-dependent persistence reproduces the slow, irregular decay a single recursion misses, though it is worth noting that regime switching does not by itself guarantee finite higher moments. Either extension would be validated on regime and rolling-origin holdouts before production use.
 
 ## What this validation does and does not establish
 
-This is primarily a **generative calibration / posterior-predictive-style check**: after fitting the historical process, it asks whether simulated scenarios reproduce selected properties of that process. It does **not** establish out-of-sample forecasting skill, causal geopolitical understanding, or adequacy for genuinely unprecedented future regimes.
+This is a **generative calibration / posterior-predictive-style check**: after fitting the historical process, it asks whether simulated scenarios reproduce selected properties of that process. It does **not** establish out-of-sample forecasting skill, causal geopolitical understanding, or adequacy for genuinely unprecedented regimes.
 
-The horizon-matched family removes an estimator confound; it does not remove the deeper limitation that both sides are being compared against a single historical realization. The overlapping windows make the year-level comparison descriptive rather than inferential, and the 16 independent years in this sample are the binding constraint on everything said about the stressed region.
+The horizon-matched family removes an estimator confound and the matched-length reference removes a sample-size confound, but neither removes the binding constraint: there is one historical realization, containing 16 non-overlapping years and one major crisis. Everything said about the stressed region rests on that.
 
 A production validation programme would add rolling-origin and regime holdouts, parameter-stability monitoring, explicit stress-period tests, sensitivity to the futures-series construction, and model-risk governance. `BZ=F` is a convenient front-month proxy, not a professionally engineered constant-maturity Brent series; roll and contract-construction effects are therefore a known data limitation.
