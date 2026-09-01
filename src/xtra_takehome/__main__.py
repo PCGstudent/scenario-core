@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from .challenger import GjrSkewTGenerator
 from .config import Config
 from .data import fetch_close, log_returns_pct
@@ -30,6 +32,7 @@ def main() -> None:
     print("Fitting selected GJR-GARCH(1,1,1)-skew-t generator...")
     generator = GjrSkewTGenerator().fit(returns)
     assert generator.params_ is not None
+    assert generator.fit_summary_ is not None
     p = generator.params_
 
     print(
@@ -82,6 +85,46 @@ def main() -> None:
         figures / "drawdown_distribution.png",
     )
 
+    fit_summary_path = cfg.output_dir / "fit_summary.txt"
+    fit_summary_path.write_text(generator.fit_summary_ + "\n", encoding="utf-8")
+
+    manifest = {
+        "data": {
+            "ticker": cfg.ticker,
+            "start": cfg.start,
+            "end_exclusive": cfg.end,
+            "n_closes": int(len(close)),
+            "n_returns": int(len(returns)),
+            "return_definition": "100 * log(P_t / P_{t-1})",
+        },
+        "model": {
+            "name": "GJR-GARCH(1,1,1) with Hansen skewed-t innovations",
+            "parameters": {
+                "mu": p.mu,
+                "omega": p.omega,
+                "alpha": p.alpha,
+                "gamma": p.gamma,
+                "beta": p.beta,
+                "eta": p.eta,
+                "lambda": p.lam,
+                "effective_persistence": p.effective_persistence,
+                "fourth_moment_coefficient": p.fourth_moment_coefficient,
+            },
+        },
+        "simulation": {
+            "seed": cfg.seed,
+            "horizon_trading_days": cfg.horizon,
+            "n_paths": cfg.n_paths,
+            "initialization": "sampled historical fitted residual/variance states",
+        },
+        "validation": {
+            "passed_gates": int(sum(g.passed for g in gates)),
+            "total_gates": int(len(gates)),
+        },
+    }
+    manifest_path = cfg.output_dir / "run_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
     report_path = cfg.output_dir / "validation_report.md"
     write_report(
         report_path,
@@ -95,6 +138,8 @@ def main() -> None:
     for g in gates:
         print(f"  {'PASS' if g.passed else 'FAIL'}  {g.metric}")
     print(f"Report written to {report_path}")
+    print(f"Fit summary written to {fit_summary_path}")
+    print(f"Run manifest written to {manifest_path}")
 
 
 if __name__ == "__main__":
