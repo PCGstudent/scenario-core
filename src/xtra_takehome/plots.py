@@ -18,13 +18,17 @@ def _save(fig: plt.Figure, path: Path) -> None:
 
 def plot_diagnostics_acf(returns: pd.Series, path: Path, nlags: int = 20) -> None:
     r_acf, sq_acf = acf_values(returns, nlags=nlags)
-    lags = np.arange(nlags + 1)
+    # Lag 0 is identically 1 and visually compresses the economically relevant lags.
+    lags = np.arange(1, nlags + 1)
+    approx_band = 1.96 / np.sqrt(len(returns))
 
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(lags, r_acf, marker="o", label="returns")
-    ax.plot(lags, sq_acf, marker="o", label="squared returns")
+    ax.plot(lags, r_acf[1:], marker="o", label="returns")
+    ax.plot(lags, sq_acf[1:], marker="o", label="squared returns")
     ax.axhline(0.0, linewidth=1)
-    ax.set_title("ACF: returns vs squared returns")
+    ax.axhline(approx_band, linewidth=0.8, linestyle="--", label="approx. 95% white-noise band")
+    ax.axhline(-approx_band, linewidth=0.8, linestyle="--")
+    ax.set_title("ACF: returns vs squared returns (lags 1–20)")
     ax.set_xlabel("Lag")
     ax.set_ylabel("Autocorrelation")
     ax.legend()
@@ -72,12 +76,13 @@ def plot_squared_acf_comparison(
     synthetic_sq_acf: np.ndarray,
     path: Path,
 ) -> None:
-    lags = np.arange(len(real_sq_acf))
+    # Exclude lag 0 (=1 by definition) so differences across lags 1..L are visible.
+    lags = np.arange(1, len(real_sq_acf))
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.plot(lags, real_sq_acf, marker="o", label="real")
-    ax.plot(lags, synthetic_sq_acf, marker="o", label="synthetic mean")
+    ax.plot(lags, real_sq_acf[1:], marker="o", label="real")
+    ax.plot(lags, synthetic_sq_acf[1:], marker="o", label="synthetic mean")
     ax.axhline(0.0, linewidth=1)
-    ax.set_title("Squared-return ACF")
+    ax.set_title("Squared-return ACF (lags 1–20)")
     ax.set_xlabel("Lag")
     ax.set_ylabel("Autocorrelation")
     ax.legend()
@@ -95,8 +100,20 @@ def plot_drawdown_comparison(
         60,
     )
     fig, ax = plt.subplots(figsize=(8, 4.5))
-    ax.hist(historical_drawdowns, bins=bins, density=True, alpha=0.55, label="historical rolling 252d")
-    ax.hist(synthetic_drawdowns, bins=bins, density=True, alpha=0.45, label="synthetic 252d")
+    ax.hist(
+        historical_drawdowns,
+        bins=bins,
+        density=True,
+        alpha=0.55,
+        label="historical rolling 252d",
+    )
+    ax.hist(
+        synthetic_drawdowns,
+        bins=bins,
+        density=True,
+        alpha=0.45,
+        label="synthetic 252d",
+    )
     ax.set_title("252-day maximum drawdown distribution")
     ax.set_xlabel("Maximum drawdown")
     ax.set_ylabel("Density")
