@@ -42,7 +42,8 @@ def main() -> None:
             "beta": p.beta,
             "eta": p.eta,
             "lambda": p.lam,
-            "approx_persistence": p.approximate_persistence,
+            "effective_persistence": p.effective_persistence,
+            "fourth_moment_coefficient": p.fourth_moment_coefficient,
         },
     )
 
