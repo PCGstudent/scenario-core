@@ -69,6 +69,17 @@ def write_report(
     if not fail_text:
         fail_text = "- No declared gate fails on this particular seeded run."
 
+    fourth = params.fourth_moment_coefficient
+    fourth_text = (
+        f"The fitted GJR process has `E[A(z)^2] = {fourth:.4f}` for "
+        f"`A(z)=beta + alpha*z^2 + gamma*z^2*I(z<0)`. "
+        + (
+            "Because this is >= 1, the usual finite unconditional fourth-moment condition is not satisfied, so sample kurtosis is intrinsically unstable."
+            if fourth >= 1.0
+            else "Because this is < 1, the usual finite unconditional fourth-moment condition is satisfied."
+        )
+    )
+
     text = f"""# Brent synthetic-scenario validation report
 
 ## Scope
@@ -94,13 +105,15 @@ Daily Brent crude `BZ=F` close prices are fetched in code from Yahoo Finance. Th
 | alpha | {_fmt(params.alpha)} |
 | gamma (negative-shock leverage) | {_fmt(params.gamma)} |
 | beta | {_fmt(params.beta)} |
-| alpha + gamma/2 + beta (approx.) | {_fmt(params.approximate_persistence)} |
+| effective variance persistence | {_fmt(params.effective_persistence)} |
 | skew-t eta | {_fmt(params.eta)} |
 | skew-t lambda | {_fmt(params.lam)} |
 
+For the asymmetric innovation law, persistence is computed as `alpha + beta + gamma * E[z^2 I(z<0)]`; I do not use the symmetric `gamma/2` shortcut. {fourth_text}
+
 The fit-then-simulate interface is explicit and every stochastic source is seed-controlled. Simulation starts each independent path from a sampled historical fitted residual/conditional-variance state, so the calibration check represents a mixture of empirically observed calm and stressed starting conditions rather than forcing all paths into one arbitrary initial volatility state.
 
-The baseline and the selected model are compared in `reports/model_comparison.md`. A separate 10-seed check in `reports/robustness_report.md` is used to distinguish structural behaviour from one favourable Monte Carlo realization. Model selection is therefore not based on a single seed or a raw count of green gates alone.
+The baseline and selected model are compared in `reports/model_comparison.md`. A separate 10-seed check in `reports/robustness_report.md` distinguishes structural behaviour from one favourable Monte Carlo realization. Model selection is therefore not based on a single seed or a raw count of green gates alone.
 
 ## Validation gates
 
@@ -120,7 +133,7 @@ These are pragmatic engineering acceptance gates, not formal hypothesis-test sig
 
 {fail_text}
 
-The important remaining model-risk issue is the **ultra-tail / higher-moment behaviour**. Both the development baseline and the asymmetric challenger can generate very large sample kurtosis in finite simulations; the multi-seed report makes that instability visible rather than hiding it behind one realization. The models also leave residual mismatch in squared-return autocorrelation, indicating that a single stationary volatility recursion does not capture every feature of the historical volatility process.
+The important remaining model-risk issue is the **ultra-tail / higher-moment behaviour**. The multi-seed report makes higher-moment instability visible rather than hiding it behind one realization. The model also leaves residual mismatch in squared-return autocorrelation, indicating that a single stationary volatility recursion does not capture every feature of the historical volatility process.
 
 I would not address those failures by adding complexity indiscriminately. My next experiment would depend on the production objective: **GARCH-EVT** (POT/GPD on standardized residual tails) if conditional tail calibration is the priority, or a **regime-aware volatility model** if persistence and stress-state transitions remain the dominant failure. Either extension would be validated on regime/rolling holdouts before production use.
 
