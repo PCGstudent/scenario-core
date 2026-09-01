@@ -1,12 +1,15 @@
 # Multi-seed robustness analysis
 
-Both models are fitted once to the same historical returns and simulated over seeds 40-49. Each seed uses the same horizon, number of paths, validation metrics, and fixed acceptance gates. The purpose is not hyperparameter tuning; it is to distinguish structural behaviour from a single Monte Carlo realization.
+Both models are fitted once to the same historical returns and simulated over seeds 40-49. Each seed uses the same horizon, number of paths, validation metrics, fitted-state initialization principle, and fixed acceptance gates. The purpose is not hyperparameter tuning; it is to distinguish structural behaviour from a single Monte Carlo realization.
 
-## Fourth-moment diagnostic for the baseline
+## Analytical persistence / fourth-moment diagnostics
 
-For the fitted GARCH(1,1)-Student-t baseline, `E[(alpha z^2 + beta)^2] = 1.0451`.
+- Baseline GARCH(1,1)-t: `E[(alpha z^2 + beta)^2] = 1.0451`.
+- Challenger GJR-skew-t effective persistence: `0.9935`, computed as `alpha + beta + gamma * E[z^2 I(z<0)]` under the fitted skew-t law.
+- Challenger GJR-skew-t fourth-moment coefficient: `E[A(z)^2] = 1.0457`, with `A(z)=beta + alpha*z^2 + gamma*z^2*I(z<0)`.
 
-Because this is >= 1, the fitted process does not satisfy the usual finite unconditional fourth-moment condition; sample kurtosis can therefore be intrinsically unstable across simulations.
+The baseline does not satisfy the usual finite unconditional fourth-moment condition; sample kurtosis is therefore intrinsically unstable across simulations.
+The challenger also does not satisfy the usual finite unconditional fourth-moment condition; this provides a structural explanation for unstable simulated kurtosis.
 
 ## Aggregate stability
 
@@ -29,6 +32,8 @@ Because this is >= 1, the fitted process does not satisfy the usual finite uncon
 | squared-return ACF MAE (lags 1-20) | 0.0672 [0.0661, 0.0678] | 0.0668 [0.0653, 0.0681] |
 | drawdown p95 | 0.5813 [0.5470, 0.6051] | 0.6310 [0.6067, 0.6534] |
 
-## Decision principle
+## Model-selection conclusion
 
-I would not select a model from a single seed or from pass count alone. I prefer the model whose improvements are stable across seeds, whose severe failures are fewer, and whose known structural limitations are easiest to explain and govern. The far-tail metrics and kurtosis receive special scrutiny because this application is explicitly about stress scenarios.
+I select the **GJR-GARCH skew-t challenger** for the submitted generator. Its improvements in negative skew, upper/lower quantiles and drawdown behaviour are persistent across seeds, and the additional structure is still small and interpretable. I do not select it because it merely has more PASS labels: normalized error, severe failures and analytical tail diagnostics are reviewed explicitly.
+
+The selection is conditional, not a claim of adequacy. Higher-moment instability and squared-return ACF mismatch remain model-risk findings. In a production stress engine I would test GARCH-EVT for conditional tails and/or regime-aware volatility, with rolling/regime holdouts, before treating either model as production-ready.
