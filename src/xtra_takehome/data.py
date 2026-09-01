@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+CACHE_DIR = Path(".cache")
 
 
 def extract_close(frame: pd.DataFrame, ticker: str = "BZ=F") -> pd.Series:
@@ -40,12 +44,44 @@ def extract_close(frame: pd.DataFrame, ticker: str = "BZ=F") -> pd.Series:
     return close.astype(float).rename("close")
 
 
+def _cache_path(ticker: str, start: str, end: str, cache_dir: Path) -> Path:
+    key = f"{ticker}_{start}_{end}".replace("=", "").replace(":", "")
+    return cache_dir / f"{key}.csv"
+
+
+def _validate_close(close: pd.Series) -> pd.Series:
+    close = close[~close.index.duplicated(keep="last")].sort_index().dropna()
+
+    if (close <= 0).any():
+        bad = close[close <= 0]
+        raise ValueError(f"Non-positive close prices prevent log returns: {bad.head()}")
+
+    if close.shape[0] < 2520:
+        raise ValueError(
+            f"Expected at least ~10 trading years; received {close.shape[0]} observations."
+        )
+    return close
+
+
 def fetch_close(
     ticker: str,
     start: str,
     end: str,
+    cache_dir: Path | None = CACHE_DIR,
 ) -> pd.Series:
-    """Fetch market data in code; raw data is intentionally not persisted."""
+    """Fetch market data in code.
+
+    Raw data is never committed. A gitignored local cache is used only so that the
+    three analysis entry points in one clean-clone run share a single download,
+    which keeps the run reproducible when the upstream API rate-limits.
+    """
+    cache_file = None
+    if cache_dir is not None:
+        cache_file = _cache_path(ticker, start, end, Path(cache_dir))
+        if cache_file.exists():
+            cached = pd.read_csv(cache_file, index_col=0, parse_dates=True).iloc[:, 0]
+            return _validate_close(cached.astype(float).rename("close"))
+
     import yfinance as yf
 
     frame = yf.download(
@@ -57,17 +93,11 @@ def fetch_close(
         actions=False,
     )
     close = extract_close(frame, ticker=ticker)
-    close = close[~close.index.duplicated(keep="last")].sort_index()
-    close = close.dropna()
+    close = _validate_close(close)
 
-    if (close <= 0).any():
-        bad = close[close <= 0]
-        raise ValueError(f"Non-positive close prices prevent log returns: {bad.head()}")
-
-    if close.shape[0] < 2520:
-        raise ValueError(
-            f"Expected at least ~10 trading years; received {close.shape[0]} observations."
-        )
+    if cache_file is not None:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        close.to_csv(cache_file)
     return close
 
 

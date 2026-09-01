@@ -57,3 +57,34 @@ def test_fourth_moment_coefficient_is_positive_and_finite_when_eta_gt_four():
     assert p is not None
     assert np.isfinite(p.fourth_moment_coefficient)
     assert p.fourth_moment_coefficient > 0.0
+
+
+def test_consecutive_seeds_do_not_share_a_generator_stream():
+    """Replications must be independent.
+
+    Deriving the innovation stream as `default_rng(seed + 1)` would make the
+    innovations of seed s the state stream of seed s+1, so the seeds in the
+    robustness study would not be independent replications.
+    """
+    g = _fitted_like_generator()
+    a = g.simulate(n_steps=40, n_paths=6, seed=40)
+    b = g.simulate(n_steps=40, n_paths=6, seed=41)
+
+    assert not np.array_equal(a, b)
+    # Independent streams: no path of one run is reproduced by the other.
+    for row in a:
+        assert not any(np.array_equal(row, other) for other in b)
+
+
+def test_implied_unconditional_variance_matches_the_persistence_identity():
+    p = _fitted_like_generator().params_
+    assert p is not None
+    expected = p.omega / (1.0 - p.effective_persistence)
+    assert np.isclose(p.implied_unconditional_variance, expected)
+
+
+def test_implied_unconditional_variance_is_infinite_at_unit_persistence():
+    p = GjrSkewTParams(
+        mu=0.0, omega=0.05, alpha=0.10, gamma=0.0, beta=0.90, eta=6.0, lam=0.0
+    )
+    assert np.isinf(p.implied_unconditional_variance)

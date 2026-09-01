@@ -34,6 +34,14 @@ class GjrSkewTParams:
         return self.alpha + self.beta + self.gamma * m2_negative
 
     @property
+    def implied_unconditional_variance(self) -> float:
+        """omega / (1 - effective persistence), the level the recursion drifts toward."""
+        slack = 1.0 - self.effective_persistence
+        if slack <= 0.0:
+            return float("inf")
+        return float(self.omega / slack)
+
+    @property
     def fourth_moment_coefficient(self) -> float:
         """E[A(z)^2], where A(z)=beta+alpha*z^2+gamma*z^2*I(z<0).
 
@@ -118,12 +126,17 @@ class GjrSkewTGenerator:
         # standardized innovations (mean 0, variance 1).
         from arch.univariate import SkewStudent
 
-        rng = np.random.default_rng(seed)
+        # Two independent child streams. Using default_rng(seed) and
+        # default_rng(seed + 1) would make consecutive seeds share a stream,
+        # so replications in the robustness study would not be independent.
+        state_seed, innovation_seed = np.random.SeedSequence(seed).spawn(2)
+
+        rng = np.random.default_rng(state_seed)
         state_idx = rng.integers(0, self._residuals.size, size=n_paths)
         eps_prev = self._residuals[state_idx].copy()
         var_prev = self._variances[state_idx].copy()
 
-        dist = SkewStudent(seed=np.random.default_rng(seed + 1))
+        dist = SkewStudent(seed=np.random.default_rng(innovation_seed))
         draw = dist.simulate(np.array([self.params_.eta, self.params_.lam]))
         z = np.asarray(draw((n_paths, n_steps)), dtype=float)
 

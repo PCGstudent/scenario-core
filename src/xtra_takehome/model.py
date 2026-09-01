@@ -19,6 +19,14 @@ class GarchTParams:
     def persistence(self) -> float:
         return self.alpha + self.beta
 
+    @property
+    def implied_unconditional_variance(self) -> float:
+        """omega / (1 - persistence), the level the recursion drifts toward."""
+        slack = 1.0 - self.persistence
+        if slack <= 0.0:
+            return float("inf")
+        return float(self.omega / slack)
+
 
 def _standardized_t_draws(
     rng: np.random.Generator,
@@ -85,11 +93,15 @@ def simulate_garch_t_from_states(
     if residuals.size == 0 or variances.size == 0 or residuals.size != variances.size:
         raise ValueError("residuals and variances must be non-empty aligned arrays.")
 
-    rng = np.random.default_rng(seed)
-    state_idx = rng.integers(0, residuals.size, size=n_paths)
+    # Independent child streams for state sampling and innovations, so that
+    # consecutive seeds in the robustness study do not share a generator stream.
+    state_seed, innovation_seed = np.random.SeedSequence(seed).spawn(2)
+
+    state_rng = np.random.default_rng(state_seed)
+    state_idx = state_rng.integers(0, residuals.size, size=n_paths)
     eps_prev = np.asarray(residuals[state_idx], dtype=float).copy()
     var_prev = np.asarray(variances[state_idx], dtype=float).copy()
-    z = _standardized_t_draws(rng, params.nu, (n_paths, horizon))
+    z = _standardized_t_draws(np.random.default_rng(innovation_seed), params.nu, (n_paths, horizon))
 
     out = np.empty((n_paths, horizon), dtype=float)
     for t in range(horizon):
