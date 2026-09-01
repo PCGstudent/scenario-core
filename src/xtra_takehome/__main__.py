@@ -100,10 +100,8 @@ def main() -> None:
     disjoint_stats = compute_window_stats(disjoint_blocks, acf_lags=cfg.max_acf_lag)
     extremes = extreme_region_checks(disjoint_stats, synthetic_stats)
 
-    print("Simulating records of the historical length for the matched-n reference...")
-    references = matched_sample_reference(
-        generator, returns_array, cfg.horizon, cfg.n_paths
-    )
+    print(f"Simulating whole {len(returns):,}-day records for the matched-length reference...")
+    references = matched_sample_reference(generator, returns_array)
     acf_floor_median, acf_floor_max = acf_monte_carlo_floor(
         generator, cfg.horizon, cfg.n_paths, cfg.max_acf_lag
     )

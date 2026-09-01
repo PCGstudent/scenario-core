@@ -167,8 +167,15 @@ def _failure_narrative(
 
     lines = [
         f"The pooled family fails {_names(pooled_failures)}. The horizon-matched family "
-        f"fails {_names(matched_failures)}. Every failure is retained; no threshold was "
-        "moved after seeing a result.",
+        f"fails {_names(matched_failures)}. Every failure is retained.",
+        "",
+        "One tolerance did change during development, and the direction matters. A "
+        "negative-control audit showed that moving to the block estimator had "
+        "unintentionally altered the strictness of the squared-return ACF gate, because "
+        "the same absolute number means something different against a target three times "
+        "smaller. Rescaling it to the estimator makes the submitted model **fail** that "
+        "gate, where before it passed. No tolerance was tuned to make this model pass, "
+        "and none was moved in the direction that would have.",
         "",
         "### The pooled moment failures are realization noise, not miscalibration",
         "",

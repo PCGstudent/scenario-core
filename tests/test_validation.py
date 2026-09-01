@@ -4,6 +4,7 @@ import pytest
 
 from xtra_takehome.validation import (
     ACF_TOLERANCE_FRACTION,
+    matched_sample_reference,
     MEAN_TOLERANCE_STANDARD_ERRORS,
     THRESHOLDS,
     beyond_historical_max_fraction,
@@ -283,3 +284,42 @@ def test_beyond_historical_max_fraction_is_a_share():
         _iid_bootstrap(returns, 200, seed=14) * 0.1, acf_lags=ACF_LAGS
     )
     assert beyond_historical_max_fraction(real_stats, calm) == 0.0
+
+
+class _RecordingGenerator:
+    """Records the shape asked of it, then returns iid noise of that shape."""
+
+    def __init__(self):
+        self.calls: list[tuple[int, int]] = []
+
+    def simulate(self, n_steps: int, n_paths: int, seed: int) -> np.ndarray:
+        self.calls.append((n_steps, n_paths))
+        return np.random.default_rng(seed).standard_t(df=5, size=(n_paths, n_steps))
+
+
+def test_matched_reference_simulates_whole_records_not_stitched_years():
+    """The section claims records of the historical length; it must build them.
+
+    An earlier version concatenated independent 252-day paths, which resets the
+    conditional variance every year and drops any volatility episode crossing a
+    year boundary -- with persistence near one that is not a harmless difference.
+    """
+    returns = _clustered_returns(seed=15, n=1000).to_numpy()
+    generator = _RecordingGenerator()
+
+    references = matched_sample_reference(
+        generator, returns, records_per_seed=5, seeds=(1, 2)
+    )
+
+    assert generator.calls == [(1000, 5), (1000, 5)], (
+        "each record must be one continuous path of exactly the historical length"
+    )
+    assert {r.statistic for r in references} == {
+        "volatility",
+        "skewness",
+        "excess kurtosis",
+    }
+    for r in references:
+        assert r.model_p05 <= r.model_median <= r.model_p95
+        assert 0.0 <= r.percentile <= 100.0
+        assert r.inside == (r.model_p05 <= r.historical <= r.model_p95)

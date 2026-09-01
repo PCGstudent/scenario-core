@@ -49,26 +49,26 @@
     "matched_sample_reference": {
       "volatility": {
         "historical": 2.3437040979024153,
-        "model_median": 2.4268179011928095,
-        "model_p05": 1.9584693266477216,
-        "model_p95": 3.826703149881669,
-        "percentile": 41.39784946236559,
+        "model_median": 2.4147903613794797,
+        "model_p05": 1.9082243602331024,
+        "model_p95": 4.047538592151713,
+        "percentile": 45.33333333333333,
         "inside_90pct_band": true
       },
       "skewness": {
         "historical": -0.9584231595584,
-        "model_median": -0.49112495988075244,
-        "model_p05": -1.7975778406530463,
-        "model_p95": 0.29800812993275994,
-        "percentile": 18.817204301075268,
+        "model_median": -0.4688118963118224,
+        "model_p05": -1.9521168017511212,
+        "model_p95": 0.34374684370943026,
+        "percentile": 17.0,
         "inside_90pct_band": true
       },
       "excess kurtosis": {
         "historical": 14.691476231676702,
-        "model_median": 9.860498445694212,
-        "model_p05": 4.026267888956609,
-        "model_p95": 66.34011417921693,
-        "percentile": 69.35483870967742,
+        "model_median": 9.525110437835407,
+        "model_p05": 3.755788717982228,
+        "model_p95": 54.82267487363248,
+        "percentile": 71.66666666666667,
         "inside_90pct_band": true
       }
     },

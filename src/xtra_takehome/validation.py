@@ -468,26 +468,32 @@ def extreme_region_checks(
 def matched_sample_reference(
     generator,
     real_returns: np.ndarray,
-    horizon: int,
-    n_paths: int,
-    seeds: tuple[int, ...] = (701, 702, 703, 704, 705, 706),
+    records_per_seed: int = 100,
+    seeds: tuple[int, ...] = (701, 702, 703),
 ) -> list[MatchedSampleReference]:
-    """Simulate at the historical sample size and locate the observed value.
+    """Simulate whole records of the historical length and locate the observed value.
 
     This is the decisive check for the pooled moments. A pooled comparison against
     252,000 synthetic observations cannot say whether the historical value is
     surprising; simulating records of the same length as the historical one can.
+
+    Each record is a single continuous simulated path of exactly `len(real_returns)`
+    steps, initialized once. An earlier version concatenated sixteen independent
+    252-day paths instead, which is not the same object: it reset the conditional
+    variance to a fresh historical state every year and so removed any volatility
+    episode spanning a year boundary. With an effective persistence of 0.9935 about
+    19% of the variance memory survives 252 steps, so that reset is not negligible.
     """
-    from .windows import non_overlapping_block_count
-
     x = np.asarray(real_returns, dtype=float).reshape(-1)
-    blocks_per_record = non_overlapping_block_count(x.size, horizon)
 
-    samples: dict[str, list[float]] = {"volatility": [], "skewness": [], "excess kurtosis": []}
+    samples: dict[str, list[float]] = {
+        "volatility": [],
+        "skewness": [],
+        "excess kurtosis": [],
+    }
     for seed in seeds:
-        paths = generator.simulate(horizon, n_paths, seed)
-        for i in range(paths.shape[0] // blocks_per_record):
-            record = paths[i * blocks_per_record : (i + 1) * blocks_per_record].reshape(-1)
+        records = generator.simulate(x.size, records_per_seed, seed)
+        for record in records:
             samples["volatility"].append(float(np.std(record, ddof=1)))
             samples["skewness"].append(float(stats.skew(record, bias=False)))
             samples["excess kurtosis"].append(

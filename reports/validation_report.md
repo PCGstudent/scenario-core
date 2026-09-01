@@ -129,9 +129,9 @@ The pooled table above compares a statistic measured on 252,000 synthetic observ
 
 | Statistic | Historical | Model median | Model 5-95% band | Historical percentile | Verdict |
 |---|---:|---:|---:|---:|:---:|
-| volatility | 2.344 | 2.427 | [1.958, 3.827] | 41 | inside |
-| skewness | -0.9584 | -0.4911 | [-1.798, 0.2980] | 19 | inside |
-| excess kurtosis | 14.691 | 9.860 | [4.026, 66.340] | 69 | inside |
+| volatility | 2.344 | 2.415 | [1.908, 4.048] | 45 | inside |
+| skewness | -0.9584 | -0.4688 | [-1.952, 0.3437] | 17 | inside |
+| excess kurtosis | 14.691 | 9.525 | [3.756, 54.823] | 72 | inside |
 
 Every historical value falls inside the model's own band for a record of this length.
 
@@ -154,11 +154,13 @@ A value in the middle of the last column means the observed extreme is a typical
 
 ## Honest failure mode
 
-The pooled family fails **volatility**, **skewness**, **excess kurtosis**, **ES 99%** and **squared-return ACF MAE**. The horizon-matched family fails **squared-return ACF MAE**. Every failure is retained; no threshold was moved after seeing a result.
+The pooled family fails **volatility**, **skewness**, **excess kurtosis**, **ES 99%** and **squared-return ACF MAE**. The horizon-matched family fails **squared-return ACF MAE**. Every failure is retained.
+
+One tolerance did change during development, and the direction matters. A negative-control audit showed that moving to the block estimator had unintentionally altered the strictness of the squared-return ACF gate, because the same absolute number means something different against a target three times smaller. Rescaling it to the estimator makes the submitted model **fail** that gate, where before it passed. No tolerance was tuned to make this model pass, and none was moved in the direction that would have.
 
 ### The pooled moment failures are realization noise, not miscalibration
 
-This is settled by simulating records of the *same length* as the historical one rather than by argument. Across those records the historical value of every pooled moment lands inside the model's own 5-95% band — volatility at percentile 41, skewness at percentile 19, excess kurtosis at percentile 69. A single 16-year record simply does not pin these quantities down: the model's own records disagree with each other by more than the model disagrees with history. Comparing 252,000 pooled synthetic observations against 4,158 historical ones cannot detect miscalibration in them, and the apparent failures are what that mismatch produces.
+This is settled by simulating records of the *same length* as the historical one rather than by argument. Across those records the historical value of every pooled moment lands inside the model's own 5-95% band — volatility at percentile 45, skewness at percentile 17, excess kurtosis at percentile 72. A single 16-year record simply does not pin these quantities down: the model's own records disagree with each other by more than the model disagrees with history. Comparing 252,000 pooled synthetic observations against 4,158 historical ones cannot detect miscalibration in them, and the apparent failures are what that mismatch produces.
 
 The kurtosis case has a structural explanation on top of the sampling one. With `E[A(z)^2] = 1.0457 >= 1` the fitted process has no finite unconditional fourth moment, so sample kurtosis does not converge to a population value at all; it becomes progressively more dominated by rare extremes as the sample grows. A pooled kurtosis comparison across unequal sample sizes is therefore not a well-posed test, whatever the model.
 

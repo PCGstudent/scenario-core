@@ -12,8 +12,10 @@ sample-size dependent:
   full-sample historical ACF cannot be compared with an ACF averaged over
   252-day synthetic paths;
 * under the fitted volatility recursion the unconditional fourth moment does not
-  exist, so sample kurtosis *diverges* with sample size and a pooled synthetic
-  sample of 252,000 observations is not comparable with 4,158 historical ones.
+  exist, so sample kurtosis does not converge to a finite population value and
+  becomes progressively more dominated by rare extremes as the sample grows; a
+  pooled synthetic sample of 252,000 observations is therefore not comparable
+  with 4,158 historical ones.
 
 Comparing those statistics across different sample sizes measures the estimator,
 not the model.
@@ -35,7 +37,8 @@ def rolling_blocks(returns: np.ndarray, horizon: int) -> np.ndarray:
     """Overlapping historical blocks of length `horizon`, shape (n-horizon+1, horizon).
 
     The blocks overlap, so they are a descriptive calibration target rather than an
-    iid sample. `independent_block_count` reports the honest effective sample size.
+    iid sample. `non_overlapping_block_count` reports how many disjoint blocks the
+    sample actually contains, which is the honest upper bound on independent draws.
     """
     x = np.asarray(returns, dtype=float).reshape(-1)
     if x.size < horizon:
