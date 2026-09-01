@@ -88,3 +88,34 @@ def test_implied_unconditional_variance_is_infinite_at_unit_persistence():
         mu=0.0, omega=0.05, alpha=0.10, gamma=0.0, beta=0.90, eta=6.0, lam=0.0
     )
     assert np.isinf(p.implied_unconditional_variance)
+
+
+def test_quadrature_reproduces_the_closed_form_moments():
+    """The non-integer moment is only trustworthy if the integer ones are exact.
+
+    E[A(z)^1] and E[A(z)^2] have closed forms in the skew-t partial moments, so
+    they pin the quadrature that the implied tail index depends on.
+    """
+    p = _fitted_like_generator().params_
+    assert p is not None
+    assert np.isclose(p._variance_multiplier_moment(1.0), p.effective_persistence, atol=1e-8)
+    assert np.isclose(
+        p._variance_multiplier_moment(2.0), p.fourth_moment_coefficient, atol=1e-8
+    )
+
+
+def test_implied_tail_index_solves_its_defining_equation():
+    p = _fitted_like_generator().params_
+    assert p is not None
+    index = p.implied_return_tail_index
+    assert np.isfinite(index) and index > 0.0
+    # kappa = index / 2 must satisfy E[A(z)^kappa] = 1.
+    assert np.isclose(p._variance_multiplier_moment(index / 2.0), 1.0, atol=1e-6)
+
+
+def test_moment_is_infinite_beyond_the_innovation_moment_bound():
+    """E[A^p] needs E[z^{2p}], which the skew-t only has below order eta."""
+    p = _fitted_like_generator().params_
+    assert p is not None
+    assert np.isinf(p._variance_multiplier_moment(p.eta / 2.0))
+    assert np.isinf(p._variance_multiplier_moment(p.eta))
