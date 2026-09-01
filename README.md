@@ -56,6 +56,8 @@ I first fitted **GARCH(1,1)-Student-t** because it is the smallest model that di
 
 The challenger was not selected from one favourable seed. `reports/robustness_report.md` compares both models over seeds 40–49 using identical data, horizons, path counts, initialization principles, metrics and gates. It also reports severe failures and analytical higher-moment diagnostics. This was added after rejecting an overly simplistic AI-assisted rule that initially equated “more PASS gates” with “better model.”
 
+The selected model is **not uniformly better on every metric**. The simpler baseline is somewhat closer on some left-tail q01/VaR/ES measures, while the GJR-skew-t model materially improves negative-skew calibration, right-tail quantiles and extreme drawdowns and keeps those left-tail risk measures inside the declared gates. Its much larger kurtosis miss is retained as an explicit model-risk finding rather than hidden inside a single winner score.
+
 ## Submitted model
 
 ```text
@@ -96,7 +98,7 @@ The final generator is checked against historical returns on:
 
 VaR and ES use **loss `L = -return`** and are reported as positive loss magnitudes.
 
-Marginal metrics pool observations across independent simulated paths. Squared-return ACF is deliberately calculated **within each synthetic path and then averaged**; independent paths are never concatenated. Drawdowns are compared like-for-like: synthetic 252-day paths versus historical rolling 252-day windows.
+Marginal metrics pool observations across independent simulated paths. Squared-return ACF is deliberately calculated **within each synthetic path and then averaged**; independent paths are never concatenated. Drawdowns are compared like-for-like: synthetic 252-day paths versus historical rolling 252-day windows. The historical windows overlap, so that drawdown distribution is a descriptive calibration target rather than an iid sample for formal inference.
 
 Acceptance thresholds are pragmatic engineering gates rather than hypothesis-test significance levels. Far-tail tolerances are wider because effective sample size is smaller. Thresholds are fixed in code and FAILs are retained rather than tuned away.
 
@@ -158,6 +160,6 @@ reports/
 
 Every stochastic operation is seed-controlled. The fitted model uses an explicit fit-then-simulate interface, and the calibration simulations start from sampled historical fitted residual/variance states so paths cover empirically observed calm and stressed initial conditions. `run_manifest.json` records the exact data window, path count, horizon, seed, fitted parameters, effective persistence and higher-moment diagnostic for the final run.
 
-AI-assisted development is documented in `AIUSAGE.md`, including what was delegated, what was deliberately kept as human judgement, and a concrete AI-generated model-selection mistake that was detected and corrected through review.
+AI-assisted development is documented in `AIUSAGE.md`, including what was delegated, what remained explicit human review responsibility, and a concrete AI-generated model-selection mistake that was detected and corrected through review.
 
 `AWS_DESIGN.md` describes an on-demand production path using API Gateway, Lambda, Step Functions, ECS Fargate, ECR, S3, DynamoDB and CloudWatch, including identity/secrets, conditioning state, cost and a 100× usage design.
