@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 
 from .challenger import GjrSkewTGenerator
 from .config import Config
@@ -25,17 +24,15 @@ class SeedRun:
 
 
 def _normalized_error(gates: list[Gate]) -> float:
-    total = 0.0
-    for gate in gates:
-        if gate.threshold > 0:
-            total += gate.error / gate.threshold
-    return float(total)
+    return float(
+        sum(g.error / g.threshold for g in gates if g.threshold > 0)
+    )
 
 
 def _severe_failures(gates: list[Gate], multiple: float = 2.0) -> int:
     return sum(
-        (not gate.passed) and gate.threshold > 0 and gate.error > multiple * gate.threshold
-        for gate in gates
+        (not g.passed) and g.threshold > 0 and g.error > multiple * g.threshold
+        for g in gates
     )
 
 
@@ -47,12 +44,7 @@ def _extract(gates: list[Gate], name: str) -> float:
 
 
 def baseline_fourth_moment_coefficient(model: GarchTGenerator) -> float:
-    """Return E[(alpha z^2 + beta)^2] for standardized Student-t innovations.
-
-    A value < 1 is the standard GARCH(1,1) condition for a finite unconditional
-    fourth moment when the innovation fourth moment exists. For standardized
-    Student-t, E[z^4] = 3(nu-2)/(nu-4) when nu > 4.
-    """
+    """Return E[(alpha z^2 + beta)^2] for standardized Student-t innovations."""
     if model.params_ is None:
         raise RuntimeError("Fit the model first.")
     p = model.params_
@@ -121,6 +113,8 @@ def main() -> None:
 
     baseline = GarchTGenerator().fit(returns)
     challenger = GjrSkewTGenerator().fit(returns)
+    assert baseline.params_ is not None
+    assert challenger.params_ is not None
 
     seeds = list(range(40, 50))
     baseline_runs = [evaluate_seed("baseline", baseline, returns, cfg, s) for s in seeds]
@@ -128,7 +122,9 @@ def main() -> None:
 
     b_summary = _summarize_runs(baseline_runs)
     c_summary = _summarize_runs(challenger_runs)
-    fourth_coeff = baseline_fourth_moment_coefficient(baseline)
+    baseline_fourth = baseline_fourth_moment_coefficient(baseline)
+    challenger_fourth = challenger.params_.fourth_moment_coefficient
+    challenger_persistence = challenger.params_.effective_persistence
 
     metric_names = [
         "volatility",
@@ -145,15 +141,24 @@ def main() -> None:
     lines = [
         "# Multi-seed robustness analysis",
         "",
-        "Both models are fitted once to the same historical returns and simulated over seeds 40-49. Each seed uses the same horizon, number of paths, validation metrics, and fixed acceptance gates. The purpose is not hyperparameter tuning; it is to distinguish structural behaviour from a single Monte Carlo realization.",
+        "Both models are fitted once to the same historical returns and simulated over seeds 40-49. Each seed uses the same horizon, number of paths, validation metrics, fitted-state initialization principle, and fixed acceptance gates. The purpose is not hyperparameter tuning; it is to distinguish structural behaviour from a single Monte Carlo realization.",
         "",
-        "## Fourth-moment diagnostic for the baseline",
+        "## Analytical persistence / fourth-moment diagnostics",
         "",
-        f"For the fitted GARCH(1,1)-Student-t baseline, `E[(alpha z^2 + beta)^2] = {fourth_coeff:.4f}`.",
+        f"- Baseline GARCH(1,1)-t: `E[(alpha z^2 + beta)^2] = {baseline_fourth:.4f}`.",
+        f"- Challenger GJR-skew-t effective persistence: `{challenger_persistence:.4f}`, computed as `alpha + beta + gamma * E[z^2 I(z<0)]` under the fitted skew-t law.",
+        f"- Challenger GJR-skew-t fourth-moment coefficient: `E[A(z)^2] = {challenger_fourth:.4f}`, with `A(z)=beta + alpha*z^2 + gamma*z^2*I(z<0)`.",
         "",
-        ("Because this is >= 1, the fitted process does not satisfy the usual finite unconditional fourth-moment condition; sample kurtosis can therefore be intrinsically unstable across simulations."
-         if fourth_coeff >= 1.0 else
-         "Because this is < 1, the fitted process satisfies the usual finite unconditional fourth-moment condition."),
+        (
+            "The baseline does not satisfy the usual finite unconditional fourth-moment condition; sample kurtosis is therefore intrinsically unstable across simulations."
+            if baseline_fourth >= 1.0
+            else "The baseline satisfies the usual finite unconditional fourth-moment condition."
+        ),
+        (
+            "The challenger also does not satisfy the usual finite unconditional fourth-moment condition; this provides a structural explanation for unstable simulated kurtosis."
+            if challenger_fourth >= 1.0
+            else "The challenger satisfies the usual finite unconditional fourth-moment condition."
+        ),
         "",
         "## Aggregate stability",
         "",
@@ -177,9 +182,11 @@ def main() -> None:
 
     lines += [
         "",
-        "## Decision principle",
+        "## Model-selection conclusion",
         "",
-        "I would not select a model from a single seed or from pass count alone. I prefer the model whose improvements are stable across seeds, whose severe failures are fewer, and whose known structural limitations are easiest to explain and govern. The far-tail metrics and kurtosis receive special scrutiny because this application is explicitly about stress scenarios.",
+        "I select the **GJR-GARCH skew-t challenger** for the submitted generator. Its improvements in negative skew, upper/lower quantiles and drawdown behaviour are persistent across seeds, and the additional structure is still small and interpretable. I do not select it because it merely has more PASS labels: normalized error, severe failures and analytical tail diagnostics are reviewed explicitly.",
+        "",
+        "The selection is conditional, not a claim of adequacy. Higher-moment instability and squared-return ACF mismatch remain model-risk findings. In a production stress engine I would test GARCH-EVT for conditional tails and/or regime-aware volatility, with rolling/regime holdouts, before treating either model as production-ready.",
     ]
 
     out = Path(cfg.output_dir) / "robustness_report.md"
@@ -188,7 +195,9 @@ def main() -> None:
 
     print("Baseline summary:", b_summary)
     print("Challenger summary:", c_summary)
-    print(f"Baseline fourth-moment coefficient: {fourth_coeff:.4f}")
+    print(f"Baseline fourth-moment coefficient: {baseline_fourth:.4f}")
+    print(f"Challenger effective persistence: {challenger_persistence:.4f}")
+    print(f"Challenger fourth-moment coefficient: {challenger_fourth:.4f}")
 
 
 if __name__ == "__main__":
