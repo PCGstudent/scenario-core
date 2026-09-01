@@ -1,3 +1,3 @@
-"""4-Xtra take-home package."""
+"""4-Xtra Brent synthetic-scenario take-home package."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
