@@ -26,6 +26,9 @@ class DiagnosticSummary:
     student_t_df: float
     student_t_loc: float
     student_t_scale: float
+    hill_left: float
+    hill_right: float
+    hill_k: int
 
 
 def empirical_moments(returns: pd.Series) -> dict[str, float]:
@@ -68,6 +71,31 @@ def student_t_qq(
     return theoretical, x, params
 
 
+def hill_estimator(values: np.ndarray, k: int) -> float:
+    """Hill estimate of the tail index alpha from the k largest positive values.
+
+    Smaller alpha means a heavier tail; alpha <= 2 implies infinite variance and
+    alpha <= 4 implies infinite kurtosis for the marginal law.
+    """
+    x = np.asarray(values, dtype=float)
+    x = np.sort(x[x > 0.0])[::-1]
+    if k < 1 or k >= x.size:
+        raise ValueError("k must satisfy 1 <= k < number of positive observations.")
+    return float(1.0 / np.mean(np.log(x[:k] / x[k])))
+
+
+def hill_profile(
+    returns: pd.Series,
+    k_values: tuple[int, ...] = (50, 100, 150, 200, 300, 400),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Hill tail-index profiles for the loss (left) and gain (right) tails."""
+    x = np.asarray(returns, dtype=float)
+    ks = np.asarray(k_values, dtype=int)
+    left = np.asarray([hill_estimator(-x, k) for k in ks], dtype=float)
+    right = np.asarray([hill_estimator(x, k) for k in ks], dtype=float)
+    return ks, left, right
+
+
 def mean_excess(
     returns: pd.Series,
     q_min: float = 0.90,
@@ -85,10 +113,14 @@ def mean_excess(
     return thresholds, np.asarray(excess, dtype=float)
 
 
+HILL_REFERENCE_K = 100
+
+
 def summarize(returns: pd.Series, nlags: int = 20) -> DiagnosticSummary:
     m = empirical_moments(returns)
     r_acf, sq_acf = acf_values(returns, nlags=nlags)
     df, loc, scale = fit_student_t(returns)
+    x = np.asarray(returns, dtype=float)
     return DiagnosticSummary(
         n=int(m["n"]),
         mean=m["mean"],
@@ -106,4 +138,7 @@ def summarize(returns: pd.Series, nlags: int = 20) -> DiagnosticSummary:
         student_t_df=df,
         student_t_loc=loc,
         student_t_scale=scale,
+        hill_left=hill_estimator(-x, HILL_REFERENCE_K),
+        hill_right=hill_estimator(x, HILL_REFERENCE_K),
+        hill_k=HILL_REFERENCE_K,
     )
