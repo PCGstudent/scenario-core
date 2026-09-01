@@ -138,6 +138,8 @@ These are pragmatic engineering acceptance gates, not formal hypothesis-test sig
 
 ![Drawdown comparison](figures/drawdown_distribution.png)
 
+The historical drawdown distribution uses overlapping rolling 252-day windows. It is therefore a descriptive like-for-like calibration target, not an iid sample for formal inferential testing.
+
 ## Honest failure mode
 
 {fail_text}
