@@ -31,3 +31,29 @@ def test_challenger_shape_and_finite_values():
     x = g.simulate(n_steps=252, n_paths=20, seed=42)
     assert x.shape == (20, 252)
     assert np.isfinite(x).all()
+
+
+def test_symmetric_skewt_recovers_half_negative_second_moment():
+    p = GjrSkewTParams(
+        mu=0.0,
+        omega=0.05,
+        alpha=0.06,
+        gamma=0.08,
+        beta=0.88,
+        eta=6.0,
+        lam=0.0,
+    )
+    m2_negative, _, _ = p.innovation_moments()
+    assert np.isclose(m2_negative, 0.5, atol=1e-10)
+    assert np.isclose(
+        p.effective_persistence,
+        p.alpha + p.beta + 0.5 * p.gamma,
+        atol=1e-10,
+    )
+
+
+def test_fourth_moment_coefficient_is_positive_and_finite_when_eta_gt_four():
+    p = _fitted_like_generator().params_
+    assert p is not None
+    assert np.isfinite(p.fourth_moment_coefficient)
+    assert p.fourth_moment_coefficient > 0.0
