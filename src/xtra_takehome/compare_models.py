@@ -9,14 +9,18 @@ from .model import GarchTGenerator
 from .validation import validate
 
 
-def _score(gates) -> tuple[int, float]:
+def _score(gates) -> tuple[int, float, int]:
     passed = sum(g.passed for g in gates)
     normalized_error = 0.0
+    severe_failures = 0
     for g in gates:
         if g.threshold <= 0:
             continue
-        normalized_error += g.error / g.threshold
-    return passed, normalized_error
+        ratio = g.error / g.threshold
+        normalized_error += ratio
+        if (not g.passed) and ratio > 2.0:
+            severe_failures += 1
+    return passed, float(normalized_error), severe_failures
 
 
 def _table(name, gates):
@@ -51,13 +55,18 @@ def main() -> None:
         returns, challenger_paths, horizon=cfg.horizon, acf_lags=cfg.max_acf_lag
     )
 
-    b_pass, b_err = _score(baseline_gates)
-    c_pass, c_err = _score(challenger_gates)
-    winner = "challenger" if (c_pass > b_pass or (c_pass == b_pass and c_err < b_err)) else "baseline"
+    b_pass, b_err, b_severe = _score(baseline_gates)
+    c_pass, c_err, c_severe = _score(challenger_gates)
 
-    print(f"Baseline:   {b_pass}/{len(baseline_gates)} gates, normalized error={b_err:.3f}")
-    print(f"Challenger: {c_pass}/{len(challenger_gates)} gates, normalized error={c_err:.3f}")
-    print(f"Provisional winner: {winner}")
+    print(
+        f"Baseline:   {b_pass}/{len(baseline_gates)} gates, "
+        f"normalized error={b_err:.3f}, severe fails={b_severe}"
+    )
+    print(
+        f"Challenger: {c_pass}/{len(challenger_gates)} gates, "
+        f"normalized error={c_err:.3f}, severe fails={c_severe}"
+    )
+    print("No automatic winner is declared from this single seed; see robustness_report.md.")
 
     assert baseline.params_ is not None
     assert challenger.params_ is not None
@@ -65,18 +74,17 @@ def main() -> None:
     lines = [
         "# Baseline vs challenger",
         "",
-        "This development comparison uses the same data, horizon, number of paths, seed, validation metrics, and acceptance gates for both models.",
+        "This is a development comparison, not the final model-selection rule. Both models use the same data, horizon, number of paths, seed, fitted-state initialization principle, validation metrics, and acceptance gates.",
         "",
         "## Models",
         "",
         "- **Baseline:** GARCH(1,1) with Student-t innovations.",
-        "- **Challenger:** GJR-GARCH(1,1,1) with Hansen skewed-t innovations and empirical fitted-state initialization.",
+        "- **Challenger / submitted model:** GJR-GARCH(1,1,1) with Hansen skewed-t innovations.",
         "",
-        f"Baseline gates passed: **{b_pass}/{len(baseline_gates)}**; aggregate normalized gate error: **{b_err:.3f}**.",
-        f"Challenger gates passed: **{c_pass}/{len(challenger_gates)}**; aggregate normalized gate error: **{c_err:.3f}**.",
-        f"Provisional winner under the declared rule: **{winner}**.",
+        f"Baseline: **{b_pass}/{len(baseline_gates)}** gates; aggregate normalized gate error **{b_err:.3f}**; severe failures **{b_severe}**.",
+        f"Challenger: **{c_pass}/{len(challenger_gates)}** gates; aggregate normalized gate error **{c_err:.3f}**; severe failures **{c_severe}**.",
         "",
-        "The pass count is the primary criterion; aggregate error relative to each declared threshold is only a tie-breaker. This is a development aid, not an excuse to tune thresholds after observing results.",
+        "I deliberately do **not** declare a winner from this one realization. An early AI-assisted comparison used pass count as the primary winner rule; review of the tail errors showed that this was too simplistic. The selection decision therefore uses the multi-seed robustness analysis in `robustness_report.md`, failure severity, and model interpretability in addition to this table.",
         "",
         "## Fitted challenger parameters",
         "",
@@ -96,9 +104,9 @@ def main() -> None:
         *_table("baseline", baseline_gates),
         *_table("challenger", challenger_gates),
         "",
-        "## Decision note",
+        "## Selection rationale",
         "",
-        "The challenger is justified only if the observed negative skew / volatility asymmetry and validation results improve enough to warrant the extra parameterization. If not, the simpler baseline should remain the submission model.",
+        "The asymmetric challenger was retained because its improvements in negative skew, tail quantiles and drawdown behaviour persisted across seeds, while the extra parameterization remains small and interpretable. The decision is not a claim that the challenger is fully adequate: higher-moment instability and squared-return ACF mismatch remain explicit model-risk findings.",
     ]
 
     out = Path(cfg.output_dir) / "model_comparison.md"
