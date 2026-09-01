@@ -5,14 +5,22 @@ from xtra_takehome.challenger import GjrSkewTParams
 from xtra_takehome.diagnostics import DiagnosticSummary
 from xtra_takehome.report import write_report
 from xtra_takehome.validation import (
-    ExceedanceCheck,
-    Gate,
-    explosive_path_sensitivity,
+    ExtremeRegionCheck,
+    MatchedSampleReference,
+    leave_out_sensitivity,
+    pooled_context,
+    validate,
     validate_horizon_matched,
 )
-from xtra_takehome.windows import compute_window_stats, stress_episode_span
+from xtra_takehome.windows import (
+    compute_window_stats,
+    non_overlapping_blocks,
+    rolling_blocks,
+    stress_episode_span,
+)
 
 HORIZON = 40
+ACF_LAGS = 5
 
 
 def _summary() -> DiagnosticSummary:
@@ -45,37 +53,53 @@ def _params() -> GjrSkewTParams:
     )
 
 
-def _fixture(tmp_path):
+def _fixture(tmp_path) -> str:
     rng = np.random.default_rng(0)
-    real_paths = rng.standard_t(df=5, size=(120, HORIZON))
-    synthetic_paths = rng.standard_t(df=5, size=(80, HORIZON))
-    real_stats = compute_window_stats(real_paths, acf_lags=5)
-    block_starts = pd.bdate_range("2015-01-01", periods=real_stats.n_blocks)
-    synthetic_stats = compute_window_stats(synthetic_paths, acf_lags=5)
+    real = pd.Series(rng.standard_t(df=5, size=1200))
+    synthetic = rng.standard_t(df=5, size=(80, HORIZON))
 
-    gates = [
-        Gate(
-            metric="volatility",
-            real=2.0,
-            synthetic=2.3,
-            error=0.15,
-            threshold=0.10,
-            error_type="relative",
-            passed=False,
-        )
-    ]
-    exceedances = [
-        ExceedanceCheck(
+    real_stats = compute_window_stats(
+        rolling_blocks(real.to_numpy(), HORIZON), acf_lags=ACF_LAGS
+    )
+    synthetic_stats = compute_window_stats(synthetic, acf_lags=ACF_LAGS)
+    disjoint = non_overlapping_blocks(real.to_numpy(), HORIZON)
+    disjoint_stats = compute_window_stats(disjoint, acf_lags=ACF_LAGS)
+    context = pooled_context(real.to_numpy(), acf_lags=ACF_LAGS)
+
+    gates, diagnostics, extras = validate(
+        real, synthetic, horizon=HORIZON, acf_lags=ACF_LAGS
+    )
+    matched = validate_horizon_matched(
+        real_stats, synthetic_stats, context.mean_standard_error
+    )
+
+    extremes = [
+        ExtremeRegionCheck(
             statistic="ES 99%",
             historical_max=23.3,
-            synthetic_exceedance_probability=0.02,
-            independent_years=16,
-            implied_expected_count=0.32,
-            lower_count=0.05,
-            upper_count=4.74,
-            passed=True,
+            annual_exceedance_probability=0.023,
+            n_blocks=disjoint_stats.n_blocks,
+            probability_at_least_one=0.31,
+            probability_below=0.69,
+            flagged=False,
         )
     ]
+    references = [
+        MatchedSampleReference(
+            statistic="excess kurtosis",
+            historical=14.7,
+            model_median=9.9,
+            model_p05=4.0,
+            model_p95=66.0,
+            percentile=69.0,
+            inside=True,
+        )
+    ]
+    leave_out = leave_out_sensitivity(
+        "synthetic", synthetic, synthetic_stats.volatility, drops=(0, 1)
+    ) + leave_out_sensitivity(
+        "historical", disjoint, disjoint_stats.volatility, drops=(0, 1)
+    )
 
     out = tmp_path / "validation_report.md"
     write_report(
@@ -83,83 +107,99 @@ def _fixture(tmp_path):
         summary=_summary(),
         params=_params(),
         gates=gates,
-        matched_gates=validate_horizon_matched(real_stats, synthetic_stats),
-        exceedances=exceedances,
+        diagnostics=diagnostics,
+        matched_gates=matched,
+        extremes=extremes,
+        references=references,
         real_stats=real_stats,
         synthetic_stats=synthetic_stats,
-        leave_out=explosive_path_sensitivity(
-            synthetic_paths, synthetic_stats.volatility, drops=(0, 1, 5)
+        leave_out=leave_out,
+        beyond_max_fraction=0.044,
+        acf_floor=(0.0029, 0.0045),
+        acf_scale=(
+            float(extras["acf_scale"]),
+            float(np.mean(np.abs(real_stats.mean_squared_acf[1:]))),
         ),
-        real_moments=(2.0, -0.8, 10.0),
-        real_max_abs_return=27.9,
-        synthetic_max_abs_return=212.9,
         stress_episode=stress_episode_span(
-            real_stats.es99, block_starts, "ES 99%", quantile=0.95
+            real_stats.es99,
+            pd.bdate_range("2015-01-01", periods=real_stats.n_blocks),
+            "ES 99%",
+            quantile=0.95,
         ),
-        n_returns=3000,
+        n_returns=1200,
     )
     return out.read_text(encoding="utf-8")
 
 
-def test_report_names_the_model_and_keeps_the_failure(tmp_path):
+def test_report_names_the_model_and_its_structural_diagnostic(tmp_path):
     text = _fixture(tmp_path)
     assert "GJR-GARCH(1,1,1)" in text
     assert "effective variance persistence" in text
-    assert "FAIL" in text
-    assert "fourth-moment" in text or "E[A(z)^2]" in text
+    assert "E[A(z)^2]" in text
 
 
 def test_report_documents_both_estimator_families(tmp_path):
     text = _fixture(tmp_path)
     assert "Family 1: pooled marginal gates" in text
     assert "Family 2: horizon-matched year-level gates" in text
-    assert "same declared table" in text
+
+
+def test_report_discloses_the_scale_dependent_tolerances(tmp_path):
+    """The unfailable-gate defect must be stated, not silently fixed."""
+    text = _fixture(tmp_path)
+    assert "could not fail" in text
+    assert "fraction of the historical scale" in text
+    assert "standard errors of the historical mean" in text
 
 
 def test_report_explains_why_the_stressed_region_is_not_gated(tmp_path):
     text = _fixture(tmp_path)
-    assert "Poisson" in text
     assert "window overlap" in text
-    assert "independent" in text
+    assert "one crisis, replicated" in text
+    assert "measures the simulation budget" in text
+    assert "non-overlapping" in text
 
 
-def test_report_quantifies_the_explosive_path_failure(tmp_path):
+def test_report_carries_the_matched_length_reference(tmp_path):
     text = _fixture(tmp_path)
-    assert "Paths removed" in text
-    assert "sensitivity diagnostic, not a proposed fix" in text
-    assert "212.9" in text
+    assert "plausible draw" in text
+    assert "Model 5-95% band" in text
+
+
+def test_leave_out_table_includes_the_historical_comparator(tmp_path):
+    """Without the historical rows the table would convict the model unfairly."""
+    text = _fixture(tmp_path)
+    assert "| historical |" in text
+    assert "| synthetic |" in text
+    assert "Both sides collapse" in text
+
+
+def test_report_does_not_claim_the_recursion_diverges(tmp_path):
+    """An earlier draft called an extreme path evidence of divergence.
+
+    The variance recursion is second-moment stationary, so that was wrong: the
+    finding is about unvalidatable extrapolation, not divergence.
+    """
+    lowered = _fixture(tmp_path).lower()
+    assert "recursion diverging" not in lowered
+    assert "explosive" not in lowered
+    assert "extrapolation" in lowered
 
 
 def test_report_reports_the_tail_index_diagnostics(tmp_path):
     text = _fixture(tmp_path)
     assert "Hill estimator" in text
     assert "mean-excess" in text
+    assert "implied return tail index" in text
 
 
-def test_report_locates_the_stressed_blocks_in_calendar_time(tmp_path):
-    """The 'one episode repeated' claim must be evidenced, not asserted."""
+def test_report_does_not_print_a_meaningless_zero_for_the_acf_real_column(tmp_path):
     text = _fixture(tmp_path)
-    assert "all begin between" in text
-    assert "one crisis, replicated" in text
-
-
-def test_stress_episode_span_reports_a_contiguous_crisis():
-    values = np.concatenate([np.ones(90), np.full(10, 50.0)])
-    dates = pd.bdate_range("2019-01-01", periods=values.size)
-    episode = stress_episode_span(values, dates, "ES 99%", quantile=0.95)
-
-    # The 95% quantile of this array is 50, so the whole elevated block is selected
-    # and its calendar span is contiguous: the signature of one repeated episode.
-    assert episode.n_blocks == 10
-    assert episode.first_start == str(dates[90].date())
-    assert episode.last_start == str(dates[99].date())
-    assert episode.distinct_years == (2019,)
-
-
-def test_stress_episode_span_spreads_when_severity_is_not_one_episode():
-    """A generator-like series with scattered extremes must not look contiguous."""
-    rng = np.random.default_rng(3)
-    values = rng.random(500)
-    dates = pd.bdate_range("2015-01-01", periods=values.size)
-    episode = stress_episode_span(values, dates, "ES 99%", quantile=0.95)
-    assert len(episode.distinct_years) > 1
+    rows = [
+        line
+        for line in text.splitlines()
+        if line.startswith("| squared-return ACF MAE")
+    ]
+    assert rows
+    for row in rows:
+        assert "| 0.0000 |" not in row

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
+
 from .challenger import GjrSkewTGenerator
 from .config import Config
 from .data import fetch_close, log_returns_pct
@@ -17,12 +19,22 @@ from .plots import (
 )
 from .report import write_report
 from .validation import (
-    exceedance_checks,
-    explosive_path_sensitivity,
+    acf_monte_carlo_floor,
+    beyond_historical_max_fraction,
+    extreme_region_checks,
+    leave_out_sensitivity,
+    matched_sample_reference,
+    pooled_context,
     validate,
     validate_horizon_matched,
 )
-from .windows import compute_window_stats, rolling_blocks, stress_episode_span
+from .windows import (
+    compute_window_stats,
+    non_overlapping_block_count,
+    non_overlapping_blocks,
+    rolling_blocks,
+    stress_episode_span,
+)
 
 
 def main() -> None:
@@ -56,32 +68,52 @@ def main() -> None:
             "effective_persistence": p.effective_persistence,
             "implied_unconditional_volatility": p.implied_unconditional_variance**0.5,
             "fourth_moment_coefficient": p.fourth_moment_coefficient,
+            "implied_return_tail_index": p.implied_return_tail_index,
         },
     )
 
     synthetic = generator.simulate(
-        n_steps=cfg.horizon,
-        n_paths=cfg.n_paths,
-        seed=cfg.seed,
+        n_steps=cfg.horizon, n_paths=cfg.n_paths, seed=cfg.seed
     )
 
-    # Family 1: pooled marginal check.
-    gates, extras = validate(
-        returns,
-        synthetic,
-        horizon=cfg.horizon,
-        acf_lags=cfg.max_acf_lag,
+    # Family 1: pooled marginal.
+    gates, diagnostics, extras = validate(
+        returns, synthetic, horizon=cfg.horizon, acf_lags=cfg.max_acf_lag
     )
 
-    # Family 2 and 3: year-level statistics estimated on equal-length blocks.
+    # Family 2: every statistic estimated inside equal-length blocks.
     print(f"Estimating year-level statistics on {cfg.horizon}-day blocks...")
+    returns_array = returns.to_numpy()
     real_stats = compute_window_stats(
-        rolling_blocks(returns.to_numpy(), cfg.horizon), acf_lags=cfg.max_acf_lag
+        rolling_blocks(returns_array, cfg.horizon), acf_lags=cfg.max_acf_lag
     )
     synthetic_stats = compute_window_stats(synthetic, acf_lags=cfg.max_acf_lag)
-    matched_gates = validate_horizon_matched(real_stats, synthetic_stats)
-    exceedances = exceedance_checks(real_stats, synthetic_stats, len(returns))
-    leave_out = explosive_path_sensitivity(synthetic, synthetic_stats.volatility)
+    mean_standard_error = pooled_context(
+        returns_array, acf_lags=cfg.max_acf_lag
+    ).mean_standard_error
+    matched_gates = validate_horizon_matched(
+        real_stats, synthetic_stats, mean_standard_error
+    )
+
+    # Family 3: the stressed region, against a record of the same length.
+    disjoint_blocks = non_overlapping_blocks(returns_array, cfg.horizon)
+    disjoint_stats = compute_window_stats(disjoint_blocks, acf_lags=cfg.max_acf_lag)
+    extremes = extreme_region_checks(disjoint_stats, synthetic_stats)
+
+    print("Simulating records of the historical length for the matched-n reference...")
+    references = matched_sample_reference(
+        generator, returns_array, cfg.horizon, cfg.n_paths
+    )
+    acf_floor_median, acf_floor_max = acf_monte_carlo_floor(
+        generator, cfg.horizon, cfg.n_paths, cfg.max_acf_lag
+    )
+
+    leave_out = leave_out_sensitivity(
+        "synthetic", synthetic, synthetic_stats.volatility, drops=(0, 1)
+    ) + leave_out_sensitivity(
+        "historical", disjoint_blocks, disjoint_stats.volatility, drops=(0, 1)
+    )
+    beyond_max = beyond_historical_max_fraction(real_stats, synthetic_stats)
     stress_episode = stress_episode_span(
         real_stats.es99, returns.index[: real_stats.n_blocks], "ES 99%", quantile=0.95
     )
@@ -113,6 +145,9 @@ def main() -> None:
             "end_exclusive": cfg.end,
             "n_closes": int(len(close)),
             "n_returns": int(len(returns)),
+            "non_overlapping_blocks": non_overlapping_block_count(
+                len(returns), cfg.horizon
+            ),
             "return_definition": "100 * log(P_t / P_{t-1})",
         },
         "model": {
@@ -129,6 +164,7 @@ def main() -> None:
                 "implied_unconditional_volatility": p.implied_unconditional_variance
                 ** 0.5,
                 "fourth_moment_coefficient": p.fourth_moment_coefficient,
+                "implied_return_tail_index": p.implied_return_tail_index,
             },
         },
         "simulation": {
@@ -146,20 +182,36 @@ def main() -> None:
             "horizon_matched": {
                 "horizon": cfg.horizon,
                 "historical_blocks": real_stats.n_blocks,
-                "independent_years": exceedances[0].independent_years,
                 "passed_gates": int(sum(g.passed for g in matched_gates)),
                 "total_gates": int(len(matched_gates)),
             },
-            "worst_year_exceedance": {
-                c.statistic: {
-                    "historical_max": c.historical_max,
-                    "model_annual_probability": c.synthetic_exceedance_probability,
-                    "expected_count_in_sample": c.implied_expected_count,
-                    "poisson_interval": [c.lower_count, c.upper_count],
-                    "passed": c.passed,
-                }
-                for c in exceedances
+            "squared_acf_monte_carlo_floor": {
+                "median": acf_floor_median,
+                "max": acf_floor_max,
             },
+            "matched_sample_reference": {
+                ref.statistic: {
+                    "historical": ref.historical,
+                    "model_median": ref.model_median,
+                    "model_p05": ref.model_p05,
+                    "model_p95": ref.model_p95,
+                    "percentile": ref.percentile,
+                    "inside_90pct_band": ref.inside,
+                }
+                for ref in references
+            },
+            "extreme_region": {
+                c.statistic: {
+                    "historical_max_non_overlapping": c.historical_max,
+                    "model_annual_exceedance_probability": c.annual_exceedance_probability,
+                    "blocks_in_record": c.n_blocks,
+                    "probability_record_contains_one": c.probability_at_least_one,
+                    "probability_model_record_max_below_observed": c.probability_below,
+                    "flagged": c.flagged,
+                }
+                for c in extremes
+            },
+            "beyond_historical_max_year_fraction": beyond_max,
         },
     }
     manifest_path = cfg.output_dir / "run_manifest.json"
@@ -171,40 +223,45 @@ def main() -> None:
         summary=diagnostic_summary,
         params=p,
         gates=gates,
+        diagnostics=diagnostics,
         matched_gates=matched_gates,
-        exceedances=exceedances,
+        extremes=extremes,
+        references=references,
         real_stats=real_stats,
         synthetic_stats=synthetic_stats,
         leave_out=leave_out,
-        real_moments=(
-            float(returns.std(ddof=1)),
-            float(returns.skew()),
-            float(returns.kurtosis()),
+        beyond_max_fraction=beyond_max,
+        acf_floor=(acf_floor_median, acf_floor_max),
+        acf_scale=(
+            float(extras["acf_scale"]),
+            float(np.mean(np.abs(real_stats.mean_squared_acf[1:]))),
         ),
-        real_max_abs_return=float(returns.abs().max()),
-        synthetic_max_abs_return=float(abs(synthetic).max()),
         stress_episode=stress_episode,
         n_returns=len(returns),
     )
 
-    print(
-        f"Pooled marginal gates:  {sum(g.passed for g in gates)}/{len(gates)} passed."
-    )
+    print(f"Pooled marginal gates: {sum(g.passed for g in gates)}/{len(gates)} passed.")
     for g in gates:
         print(f"  {'PASS' if g.passed else 'FAIL'}  {g.metric}")
     print(
-        f"Horizon-matched gates:  {sum(g.passed for g in matched_gates)}/"
+        f"Horizon-matched gates: {sum(g.passed for g in matched_gates)}/"
         f"{len(matched_gates)} passed."
     )
     for g in matched_gates:
         print(f"  {'PASS' if g.passed else 'FAIL'}  {g.metric}")
-    print("Worst-observed-year exceedance checks:")
-    for c in exceedances:
+    print("Matched-sample reference (is the observed value a plausible draw?):")
+    for ref in references:
         print(
-            f"  {'PASS' if c.passed else 'FAIL'}  {c.statistic}: "
-            f"model p={c.synthetic_exceedance_probability:.3%} per year, "
-            f"expected {c.implied_expected_count:.2f} in {c.independent_years} years "
-            f"(interval {c.lower_count:.2f}-{c.upper_count:.2f})"
+            f"  {'OK  ' if ref.inside else 'FLAG'}  {ref.statistic}: historical "
+            f"{ref.historical:.3f} at the {ref.percentile:.1f}th percentile of the "
+            f"model's own matched-length distribution"
+        )
+    print("Extreme region (worst year in a record of the same length):")
+    for c in extremes:
+        print(
+            f"  {'FLAG' if c.flagged else 'OK  '}  {c.statistic}: model annual "
+            f"p={c.annual_exceedance_probability:.2%}, "
+            f"P(record max <= observed)={c.probability_below:.1%}"
         )
     print(f"Report written to {report_path}")
     print(f"Fit summary written to {fit_summary_path}")
