@@ -22,16 +22,15 @@ Windows PowerShell:
 powershell -ExecutionPolicy Bypass -File .\run.ps1
 ```
 
-Both wrappers create `.venv`, install the exact pinned dependencies from `pyproject.toml`, run the test suite, and generate the final validation report and figures.
+The wrappers create `.venv`, install the exact pinned dependencies from `pyproject.toml`, run the test suite, generate the final submitted-model report/figures, regenerate the baseline-vs-challenger comparison, and run the 10-seed robustness analysis.
 
-For the supporting model-selection analyses:
+Individual analysis entry points are also available:
 
 ```bash
+python -m xtra_takehome
 python -m xtra_takehome.compare_models
 python -m xtra_takehome.robustness
 ```
-
-These regenerate `reports/model_comparison.md` and `reports/robustness_report.md`.
 
 ## Data and return definition
 
@@ -57,7 +56,16 @@ I first fitted **GARCH(1,1)-Student-t** because it is the smallest model that di
 
 The challenger was not selected from one favourable seed. `reports/robustness_report.md` compares both models over seeds 40–49 using identical data, horizons, path counts, initialization principles, metrics and gates. It also reports severe failures and analytical higher-moment diagnostics. This was added after rejecting an overly simplistic AI-assisted rule that initially equated “more PASS gates” with “better model.”
 
-## What the submitted model targets
+## Submitted model
+
+```text
+r_t       = mu + eps_t
+eps_t     = sigma_t z_t
+sigma_t^2 = omega + alpha eps_(t-1)^2
+            + gamma I(eps_(t-1) < 0) eps_(t-1)^2
+            + beta sigma_(t-1)^2
+z_t       ~ standardized Hansen skewed-t(eta, lambda)
+```
 
 It is intended to reproduce:
 
@@ -88,7 +96,7 @@ The final generator is checked against historical returns on:
 
 VaR and ES use **loss `L = -return`** and are reported as positive loss magnitudes.
 
-Marginal metrics pool observations across independent simulated paths. Squared-return ACF is deliberately calculated **within each path and then averaged**; independent paths are never concatenated. Drawdowns are compared like-for-like: synthetic 252-day paths versus historical rolling 252-day windows.
+Marginal metrics pool observations across independent simulated paths. Squared-return ACF is deliberately calculated **within each synthetic path and then averaged**; independent paths are never concatenated. Drawdowns are compared like-for-like: synthetic 252-day paths versus historical rolling 252-day windows.
 
 Acceptance thresholds are pragmatic engineering gates rather than hypothesis-test significance levels. Far-tail tolerances are wider because effective sample size is smaller. Thresholds are fixed in code and FAILs are retained rather than tuned away.
 
@@ -106,7 +114,9 @@ The next experiment would be **GARCH-EVT** if conditional-tail calibration is th
 
 ```text
 reports/
-├── validation_report.md        # final submitted model
+├── validation_report.md        # final submitted-model report
+├── fit_summary.txt             # arch optimizer/model summary
+├── run_manifest.json           # data/model/simulation provenance
 ├── model_comparison.md         # development baseline vs challenger
 ├── robustness_report.md        # 10-seed stability/model-risk analysis
 └── figures/
@@ -146,8 +156,8 @@ reports/
 
 ## Reproducibility and AI use
 
-Every stochastic operation is seed-controlled. The fitted model uses an explicit fit-then-simulate interface, and simulation starts from sampled historical fitted residual/variance states so paths cover empirically observed calm and stressed initial conditions.
+Every stochastic operation is seed-controlled. The fitted model uses an explicit fit-then-simulate interface, and the calibration simulations start from sampled historical fitted residual/variance states so paths cover empirically observed calm and stressed initial conditions. `run_manifest.json` records the exact data window, path count, horizon, seed, fitted parameters, effective persistence and higher-moment diagnostic for the final run.
 
 AI-assisted development is documented in `AIUSAGE.md`, including what was delegated, what was deliberately kept as human judgement, and a concrete AI-generated model-selection mistake that was detected and corrected through review.
 
-`AWS_DESIGN.md` describes an on-demand production path using API Gateway, Lambda, Step Functions, ECS Fargate, ECR, S3, DynamoDB and CloudWatch, including identity/secrets, cost and a 100× usage design.
+`AWS_DESIGN.md` describes an on-demand production path using API Gateway, Lambda, Step Functions, ECS Fargate, ECR, S3, DynamoDB and CloudWatch, including identity/secrets, conditioning state, cost and a 100× usage design.
