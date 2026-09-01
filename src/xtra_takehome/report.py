@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .challenger import GjrSkewTParams
 from .diagnostics import DiagnosticSummary
-from .model import GarchTParams
 from .validation import Gate
 
 
@@ -26,21 +26,23 @@ def interpretation(summary: DiagnosticSummary) -> str:
         f"providing a compact heavy-tailed benchmark for the QQ diagnostic.\n\n"
         f"Linear return dependence is comparatively limited: the maximum absolute return ACF "
         f"over the inspected non-zero lags is {_fmt(summary.max_abs_return_acf)}. In contrast, "
-        f"the mean absolute squared-return ACF is {_fmt(summary.mean_abs_squared_acf)}, which "
-        f"is evidence of conditional heteroskedasticity / volatility clustering. That diagnostic "
-        f"directly motivates a volatility-aware generator rather than iid Monte Carlo.\n\n"
-        f"I therefore use a **GARCH(1,1) with Student-t innovations** as a parsimonious baseline: "
-        f"GARCH targets volatility persistence while Student-t innovations target heavy marginal "
-        f"tails. The model does not claim to create genuinely new geopolitical regimes, asymmetric "
-        f"shock responses, or multivariate market dependence. Those are intentionally left as "
-        f"extensions if validation exposes material tail or regime failures."
+        f"the mean absolute squared-return ACF is {_fmt(summary.mean_abs_squared_acf)}, evidence "
+        f"of conditional heteroskedasticity / volatility clustering. That motivates a "
+        f"volatility-aware generator rather than iid Monte Carlo.\n\n"
+        f"A parsimonious GARCH(1,1)-Student-t model was used first as a development baseline. "
+        f"Its validation exposed a material asymmetry miss: the historical returns are clearly "
+        f"negatively skewed, while a symmetric innovation model cannot reproduce that feature "
+        f"reliably. I therefore made one targeted refinement rather than escalating to a neural "
+        f"generator: **GJR-GARCH(1,1,1) with Hansen skewed-t innovations**. GJR allows negative "
+        f"and positive shocks to affect future volatility differently, while skewed-t innovations "
+        f"retain heavy tails and permit conditional asymmetry."
     )
 
 
 def write_report(
     output_path: Path,
     summary: DiagnosticSummary,
-    params: GarchTParams,
+    params: GjrSkewTParams,
     gates: list[Gate],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,35 +61,21 @@ def write_report(
         )
 
     failures = [g for g in gates if not g.passed]
-    if failures:
-        fail_text = "\n".join(
-            f"- **{g.metric}** fails its declared gate. This is retained as evidence rather "
-            f"than tuned away." for g in failures
-        )
-        failure_discussion = (
-            f"{fail_text}\n\n"
-            "The first extension I would test is conditional-tail modelling of standardized "
-            "GARCH residuals using Peaks Over Threshold / Generalized Pareto tails (GARCH-EVT), "
-            "especially if the failures concentrate in 99% ES, extreme quantiles, or drawdowns. "
-            "If failures instead reflect state-dependent persistence, a regime-switching or "
-            "asymmetric volatility model would be more appropriate."
-        )
-    else:
-        failure_discussion = (
-            "All declared engineering gates pass on this run, but that should not be read as "
-            "proof of future predictive validity. The principal failure mode remains structural: "
-            "a single stationary GARCH-t process cannot represent genuinely new regimes or "
-            "geopolitical mechanisms. A regime holdout (for example pre-shock fit versus later "
-            "stress period) would be the next validation step."
-        )
+    fail_text = "\n".join(
+        f"- **{g.metric}** fails its declared gate; I retain the failure rather than "
+        f"retuning the threshold after seeing the result."
+        for g in failures
+    )
+    if not fail_text:
+        fail_text = "- No declared gate fails on this particular seeded run."
 
     text = f"""# Brent synthetic-scenario validation report
 
 ## Scope
 
-Daily Brent crude `BZ=F` close prices are fetched in code from Yahoo Finance. The analysis uses percentage log returns and a fixed historical cut-off for reproducibility.
+Daily Brent crude `BZ=F` close prices are fetched in code from Yahoo Finance. The analysis uses percentage log returns and a fixed historical cut-off for reproducibility. The submitted generator is a **GJR-GARCH(1,1,1) with Hansen skewed-t innovations**.
 
-## Statistical diagnostics
+## Statistical diagnostics and model choice
 
 {interpretation(summary)}
 
@@ -97,22 +85,26 @@ Daily Brent crude `BZ=F` close prices are fetched in code from Yahoo Finance. Th
 
 ## Fitted generative model
 
-**GARCH(1,1) + standardized Student-t innovations**
+**GJR-GARCH(1,1,1) + Hansen skewed-t innovations**
 
 | Parameter | Estimate |
 |---|---:|
 | mu | {_fmt(params.mu)} |
 | omega | {_fmt(params.omega)} |
 | alpha | {_fmt(params.alpha)} |
+| gamma (negative-shock leverage) | {_fmt(params.gamma)} |
 | beta | {_fmt(params.beta)} |
-| alpha + beta | {_fmt(params.persistence)} |
-| Student-t nu | {_fmt(params.nu)} |
+| alpha + gamma/2 + beta (approx.) | {_fmt(params.approximate_persistence)} |
+| skew-t eta | {_fmt(params.eta)} |
+| skew-t lambda | {_fmt(params.lam)} |
 
-The simulation interface is explicitly fit-then-simulate and uses a fixed random seed. Student-t draws are standardized to unit variance before entering the GARCH recursion.
+The fit-then-simulate interface is explicit and every stochastic source is seed-controlled. Simulation starts each independent path from a sampled historical fitted residual/conditional-variance state, so the calibration check represents a mixture of empirically observed calm and stressed starting conditions rather than forcing all paths into one arbitrary initial volatility state.
+
+The baseline and the selected model are compared in `reports/model_comparison.md`. A separate 10-seed check in `reports/robustness_report.md` is used to distinguish structural behaviour from one favourable Monte Carlo realization. Model selection is therefore not based on a single seed or a raw count of green gates alone.
 
 ## Validation gates
 
-These are pragmatic model acceptance gates rather than formal significance levels. Central-distribution and volatility targets have tighter tolerances; 99% tail measures and drawdowns are looser because their effective sample sizes are smaller.
+These are pragmatic engineering acceptance gates, not formal hypothesis-test significance levels. Central-distribution and volatility targets have tighter tolerances; far-tail measures and drawdowns are looser because their effective sample sizes are smaller.
 
 | Metric | Real | Synthetic | Error | Threshold | Status |
 |---|---:|---:|---:|---:|:---:|
@@ -124,14 +116,18 @@ These are pragmatic model acceptance gates rather than formal significance level
 
 ![Drawdown comparison](figures/drawdown_distribution.png)
 
-## Failure mode and next step
+## Honest failure mode
 
-{failure_discussion}
+{fail_text}
+
+The important remaining model-risk issue is the **ultra-tail / higher-moment behaviour**. Both the development baseline and the asymmetric challenger can generate very large sample kurtosis in finite simulations; the multi-seed report makes that instability visible rather than hiding it behind one realization. The models also leave residual mismatch in squared-return autocorrelation, indicating that a single stationary volatility recursion does not capture every feature of the historical volatility process.
+
+I would not address those failures by adding complexity indiscriminately. My next experiment would depend on the production objective: **GARCH-EVT** (POT/GPD on standardized residual tails) if conditional tail calibration is the priority, or a **regime-aware volatility model** if persistence and stress-state transitions remain the dominant failure. Either extension would be validated on regime/rolling holdouts before production use.
 
 ## What this validation does and does not establish
 
-This is primarily a **generative calibration / posterior-predictive-style check**: after fitting the historical process, it asks whether simulated scenarios reproduce selected properties of that process. It does **not** establish out-of-sample forecasting skill or prove adequacy for future regimes.
+This is primarily a **generative calibration / posterior-predictive-style check**: after fitting the historical process, it asks whether simulated scenarios reproduce selected properties of that process. It does **not** establish out-of-sample forecasting skill, causal geopolitical understanding, or adequacy for genuinely unprecedented future regimes.
 
-A stronger production validation would add rolling-origin or regime holdouts, parameter stability checks, stress-period analysis, and explicit model-risk governance.
+A production validation programme would add rolling-origin and regime holdouts, parameter-stability monitoring, explicit stress-period tests, sensitivity to the futures-series construction, and model-risk governance. `BZ=F` is a convenient front-month proxy, not a professionally engineered constant-maturity Brent series; roll and contract-construction effects are therefore a known data limitation.
 """
     output_path.write_text(text, encoding="utf-8")
