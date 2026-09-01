@@ -4,7 +4,8 @@ from scipy import stats
 
 from xtra_takehome.windows import (
     compute_window_stats,
-    independent_block_count,
+    non_overlapping_block_count,
+    non_overlapping_blocks,
     rolling_blocks,
 )
 
@@ -22,10 +23,40 @@ def test_rolling_blocks_rejects_short_series():
         rolling_blocks(np.arange(3, dtype=float), horizon=4)
 
 
-def test_independent_block_count_is_non_overlapping():
-    # 4158 daily returns contain only 16 independent trading years, not 3907.
-    assert independent_block_count(4158, 252) == 16
-    assert independent_block_count(251, 252) == 0
+def test_non_overlapping_block_count():
+    # 4158 daily returns contain 16 disjoint trading years, not 3907 -- and even
+    # those 16 are not 16 independent draws, which the docstring is careful about.
+    assert non_overlapping_block_count(4158, 252) == 16
+    assert non_overlapping_block_count(251, 252) == 0
+
+
+def test_non_overlapping_blocks_do_not_share_observations():
+    x = np.arange(25, dtype=float)
+    blocks = non_overlapping_blocks(x, horizon=10)
+    assert blocks.shape == (2, 10)
+    np.testing.assert_array_equal(blocks[0], np.arange(10))
+    np.testing.assert_array_equal(blocks[1], np.arange(10, 20))
+    assert not set(blocks[0]).intersection(blocks[1])
+
+
+def test_non_overlapping_blocks_rejects_short_series():
+    with pytest.raises(ValueError):
+        non_overlapping_blocks(np.arange(5, dtype=float), horizon=10)
+
+
+def test_overlapping_maximum_can_exceed_the_disjoint_maximum():
+    """Why the extreme-region threshold uses disjoint blocks.
+
+    A path-dependent statistic such as drawdown can be larger in a sliding window
+    that straddles two calendar years than in either year alone, so the sliding
+    maximum overstates the worst year actually observed.
+    """
+    rng = np.random.default_rng(3)
+    x = rng.normal(size=600)
+    x[295:305] -= 6.0  # a shock placed across a block boundary
+    sliding = compute_window_stats(rolling_blocks(x, 100), acf_lags=3)
+    disjoint = compute_window_stats(non_overlapping_blocks(x, 100), acf_lags=3)
+    assert sliding.max_drawdown.max() >= disjoint.max_drawdown.max()
 
 
 def test_window_stats_match_direct_per_block_computation():

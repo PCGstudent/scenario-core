@@ -43,9 +43,30 @@ def rolling_blocks(returns: np.ndarray, horizon: int) -> np.ndarray:
     return sliding_window_view(x, horizon)
 
 
-def independent_block_count(n_observations: int, horizon: int) -> int:
-    """Number of non-overlapping blocks, i.e. the effective sample size."""
+def non_overlapping_block_count(n_observations: int, horizon: int) -> int:
+    """How many non-overlapping blocks the sample contains.
+
+    This is an upper bound on the number of independent observations, not the
+    effective sample size: consecutive years share macro regimes and volatility
+    persistence, so 16 non-overlapping years are not 16 independent draws.
+    Everything said about the stressed region is limited by this count.
+    """
     return int(n_observations // horizon)
+
+
+def non_overlapping_blocks(returns: np.ndarray, horizon: int) -> np.ndarray:
+    """Disjoint blocks of length `horizon`, taken from the start of the sample.
+
+    Used where the analysis needs blocks that do not share observations, such as
+    the maximum of the historical record: the maximum over sliding windows is
+    inflated relative to the maximum over disjoint years for path-dependent
+    statistics such as drawdown.
+    """
+    x = np.asarray(returns, dtype=float).reshape(-1)
+    count = non_overlapping_block_count(x.size, horizon)
+    if count < 1:
+        raise ValueError("Not enough observations for one non-overlapping block.")
+    return x[: count * horizon].reshape(count, horizon)
 
 
 @dataclass(frozen=True)

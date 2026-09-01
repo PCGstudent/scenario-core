@@ -53,3 +53,14 @@ def test_var_es_match_hand_computed_values():
     # interpolation, and only the 5.0 loss lies at or above it.
     assert np.isclose(var, 4.1)
     assert np.isclose(es, 5.0)
+
+
+def test_drawdown_counts_a_fall_on_the_first_day():
+    """The running maximum must start at the initial level, not after day one."""
+    from xtra_takehome.metrics import max_drawdown_from_returns
+
+    # A single -10% day: the drawdown is that fall, not zero.
+    dd = max_drawdown_from_returns(np.array([-10.0]))
+    assert np.isclose(dd, 1.0 - np.exp(-0.10))
+    # A rise on day one leaves no drawdown at all.
+    assert max_drawdown_from_returns(np.array([5.0])) == 0.0

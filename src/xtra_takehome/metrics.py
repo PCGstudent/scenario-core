@@ -17,7 +17,9 @@ def var_es(returns_pct: np.ndarray, level: float) -> tuple[float, float]:
 def max_drawdown_from_returns(returns_pct: np.ndarray) -> float:
     """Maximum drawdown from percentage log returns."""
     r = np.asarray(returns_pct, dtype=float)
-    prices = np.exp(np.cumsum(r / 100.0))
+    # Prepend the initial level: without it the running maximum starts at the
+    # price after the first return, so a drop on day one is not counted.
+    prices = np.concatenate(([1.0], np.exp(np.cumsum(r / 100.0))))
     running_max = np.maximum.accumulate(prices)
     drawdowns = 1.0 - prices / running_max
     return float(np.max(drawdowns))
