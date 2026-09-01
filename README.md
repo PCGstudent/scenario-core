@@ -40,23 +40,24 @@ The code fetches Yahoo Finance Brent ticker `BZ=F` with `yfinance`:
 - end: `2026-09-01` (exclusive)
 - return: `100 * log(P_t / P_{t-1})`
 
-The end date is fixed rather than `today()` so a clean clone has a reproducible analysis window. Raw market data is not committed.
+The end date is fixed rather than `today()` so a clean clone has a reproducible analysis window. Raw market data is not committed. The first download is written to a gitignored `.cache/` so the three entry points in one run share a single fetch rather than hitting the API three times.
 
 `BZ=F` is a convenient continuous/front-month proxy, not a professionally engineered constant-maturity Brent series. Roll and contract-construction effects may therefore contaminate some observed returns; this is treated as a data limitation rather than silently ignored.
 
 ## Why this model
 
-Diagnostics show three features that drive the modelling decision:
+Diagnostics show four features that drive the modelling decision:
 
 1. weak linear dependence in daily returns;
 2. materially stronger autocorrelation in squared returns, indicating volatility clustering;
-3. negative skew and heavy tails, inconsistent with Gaussian iid Monte Carlo.
+3. negative skew, inconsistent with a symmetric innovation law;
+4. a Hill tail index near 3 in **both** tails, against a fitted conditional innovation with about 5.3 degrees of freedom.
 
-I first fitted **GARCH(1,1)-Student-t** because it is the smallest model that directly targets volatility clustering plus heavy tails. Validation then exposed a material asymmetry miss: the symmetric baseline did not reproduce historical negative skew reliably and overstated several positive-tail quantiles. I therefore made one targeted refinement rather than jumping to a neural generator: **GJR-GARCH + skewed-t**. GJR adds sign-dependent volatility response; Hansen's skewed-t adds conditional skew while retaining heavy tails.
+Point 4 is the one that decides the family. An unconditional tail much heavier than the conditional innovation means roughly half the unconditional tail weight is manufactured by volatility clustering rather than by fat innovations — exactly what a GARCH-type recursion with moderately heavy innovations produces. It also shows the asymmetry is not a tail-index asymmetry: the two tails decay at similar rates, and the skew lives in the body and in the volatility response, which is what GJR plus a skewed innovation targets.
 
-The challenger was not selected from one favourable seed. `reports/robustness_report.md` compares both models over seeds 40–49 using identical data, horizons, path counts, initialization principles, metrics and gates. It also reports severe failures and analytical higher-moment diagnostics. This was added after rejecting an overly simplistic AI-assisted rule that initially equated “more PASS gates” with “better model.”
+I first fitted **GARCH(1,1)-Student-t** because it is the smallest model that directly targets volatility clustering plus heavy tails. Validation exposed a material asymmetry miss. I therefore made one targeted refinement rather than jumping to a neural generator: **GJR-GARCH + skewed-t**.
 
-The selected model is **not uniformly better on every metric**. The simpler baseline is somewhat closer on some left-tail q01/VaR/ES measures, while the GJR-skew-t model materially improves negative-skew calibration, right-tail quantiles and extreme drawdowns and keeps those left-tail risk measures inside the declared gates. Its much larger kurtosis miss is retained as an explicit model-risk finding rather than hidden inside a single winner score.
+The challenger was not selected from one favourable seed. `reports/robustness_report.md` compares both models over seeds 40–49 using identical data, horizons, path counts, initialization principles, metrics and thresholds.
 
 ## Submitted model
 
@@ -73,44 +74,40 @@ It is intended to reproduce:
 
 - heavy-tailed daily return behaviour;
 - negative return asymmetry;
-- time-varying conditional volatility;
-- volatility clustering;
-- plausible one-year tail-loss and drawdown distributions.
+- time-varying conditional volatility and volatility clustering;
+- plausible one-year tail-loss and drawdown distributions for typical and moderately adverse years.
 
 It is **not** intended to reproduce:
 
 - causal geopolitical mechanisms or genuinely unprecedented shocks;
 - structural/regime changes with a single stationary recursion;
 - multivariate dependence with rates, FX, equities or other commodities;
-- a professionally constructed constant-maturity Brent futures curve.
+- a professionally constructed constant-maturity Brent futures curve;
+- the far upper tail of year severity, where the fitted recursion is not fourth-moment stationary (see the model-risk finding below).
 
-Those are deliberate scope boundaries, not implicit claims of adequacy.
+## How validation works
 
-## Validation
+Every metric is checked twice against **one shared table of thresholds** declared in `validation.THRESHOLDS`. The two families differ only in how the statistic is estimated, never in the tolerance it must meet.
 
-The final generator is checked against historical returns on:
+**Family 1, pooled marginal.** All synthetic observations pooled against the pooled historical sample. The right instrument for the unconditional marginal law.
 
-- mean, volatility, skewness and excess kurtosis;
-- 1%, 5%, 95% and 99% return quantiles;
-- VaR and Expected Shortfall at 95% and 99%;
-- squared-return ACF over lags 1–20;
-- maximum drawdown over 252-trading-day horizons.
+**Family 2, horizon-matched.** Every statistic estimated inside 252-day blocks on *both* sides — 3,907 overlapping historical windows against 1,000 independent synthetic paths — then compared at the median.
 
-VaR and ES use **loss `L = -return`** and are reported as positive loss magnitudes.
+The second family exists because several statistics are sample-size dependent, so comparing 252,000 pooled synthetic observations against ~4,158 historical ones measures the estimator rather than the model. The sample ACF of squared returns is biased toward zero in short blocks; and because the fitted recursion has no finite unconditional fourth moment, sample kurtosis has no limit to converge to and simply grows with the simulated sample size. This is the same like-for-like principle the original design already applied to drawdowns, extended to the rest of the suite.
 
-Marginal metrics pool observations across independent simulated paths. Squared-return ACF is deliberately calculated **within each synthetic path and then averaged**; independent paths are never concatenated. Drawdowns are compared like-for-like: synthetic 252-day paths versus historical rolling 252-day windows. The historical windows overlap, so that drawdown distribution is a descriptive calibration target rather than an iid sample for formal inference.
+**Family 3, worst-observed-year exceedance.** The stressed region is deliberately *not* gated on a historical percentile. With overlapping windows the top few per cent of blocks are one episode repeated — for this sample, the 195 most severe ES-99% windows all begin between April 2019 and March 2020 — so a historical "95th percentile" is not identified. There are only 16 independent trading years in the sample. What is identified is a frequency, so the model-implied annual probability of a year at least as severe as the worst observed one is checked against the exact 90% Poisson interval for having seen exactly one such year.
 
-Acceptance thresholds are pragmatic engineering gates rather than hypothesis-test significance levels. Far-tail tolerances are wider because effective sample size is smaller. Thresholds are fixed in code and FAILs are retained rather than tuned away.
+Covered metrics: mean, volatility, skewness, excess kurtosis; the 1%, 5%, 95% and 99% return quantiles; VaR and ES at 95% and 99%; squared-return ACF over lags 1–20; and maximum drawdown over 252-day horizons. VaR and ES use **loss `L = -return`** and are reported as positive loss magnitudes. Squared-return ACF is always estimated within a path and then averaged; independent paths are never concatenated.
+
+Acceptance thresholds are pragmatic engineering gates, not hypothesis-test significance levels. They are fixed in code and FAILs are retained rather than tuned away.
 
 ## Model-risk finding
 
-Higher moments remain the clearest limitation. The project evaluates the fourth-moment condition analytically rather than treating sample kurtosis as a stable target by assumption. For the skewed GJR model, effective persistence is computed using the fitted innovation law,
+The generator is well calibrated for typical and moderately adverse years and passes every horizon-matched gate. Its material limitation is at the other end: **a near-integrated variance recursion that occasionally runs away.**
 
-`alpha + beta + gamma * E[z^2 I(z<0)]`,
+Effective persistence is 0.9935 and `E[A(z)^2] = 1.0457`, so the fitted process has no finite unconditional fourth moment, and its implied unconditional volatility (2.94%/day) sits well above the sample volatility (2.34%/day). The consequence is visible directly in the scenarios: about 4% of simulated years are more volatile than anything in the historical record, and the pooled unconditional moments are hostage to a handful of paths — removing the 10 most volatile of 1,000 paths moves pooled excess kurtosis from roughly 390 to 14 against a historical 14.7. `reports/validation_report.md` quantifies this with a leave-out sensitivity table, and `reports/robustness_report.md` shows the pooled moment statistics swinging by several hundred per cent across seeds while the horizon-matched estimates of the same quantities move by ten to twenty per cent.
 
-rather than the symmetric `gamma/2` shortcut. The robustness report also evaluates the GJR fourth-moment coefficient `E[A(z)^2]` directly. Remaining higher-moment and squared-ACF failures are discussed explicitly in the final report.
-
-The next experiment would be **GARCH-EVT** if conditional-tail calibration is the priority, or a **regime-aware volatility model** if state-dependent persistence is the main residual failure. I intentionally stop before those extensions.
+That instability is reported as a model-risk finding rather than smoothed away. The next experiment would be **GARCH-EVT** if conditional-tail calibration is the priority, or a **regime-aware volatility model** if bounding the explosive paths and fitting the long-memory-like ACF profile matter more. I intentionally stop before those extensions.
 
 ## Outputs
 
@@ -118,14 +115,16 @@ The next experiment would be **GARCH-EVT** if conditional-tail calibration is th
 reports/
 ├── validation_report.md        # final submitted-model report
 ├── fit_summary.txt             # arch optimizer/model summary
-├── run_manifest.json           # data/model/simulation provenance
-├── model_comparison.md         # development baseline vs challenger
-├── robustness_report.md        # 10-seed stability/model-risk analysis
+├── run_manifest.json           # data/model/simulation/validation provenance
+├── model_comparison.md         # development baseline vs challenger, both families
+├── robustness_report.md        # 10-seed stability and model-risk analysis
 └── figures/
     ├── diagnostics_acf.png
     ├── tail_qq_student_t.png
+    ├── tail_index_and_mean_excess.png
     ├── marginal_comparison.png
     ├── squared_acf_real_vs_synthetic.png
+    ├── year_severity.png
     └── drawdown_distribution.png
 ```
 
@@ -152,14 +151,15 @@ reports/
 │   ├── plots.py
 │   ├── report.py
 │   ├── robustness.py
-│   └── validation.py
+│   ├── validation.py
+│   └── windows.py             # horizon-matched block statistics
 └── tests/
 ```
 
 ## Reproducibility and AI use
 
-Every stochastic operation is seed-controlled. The fitted model uses an explicit fit-then-simulate interface, and the calibration simulations start from sampled historical fitted residual/variance states so paths cover empirically observed calm and stressed initial conditions. `run_manifest.json` records the exact data window, path count, horizon, seed, fitted parameters, effective persistence and higher-moment diagnostic for the final run.
+Every stochastic operation is seed-controlled. Simulation draws its state-sampling and innovation streams from independent `SeedSequence(seed).spawn(2)` children, so replications in the robustness study never share a generator stream. The fitted model uses an explicit fit-then-simulate interface, and calibration simulations start from sampled historical fitted residual/variance states so paths cover empirically observed calm and stressed initial conditions. `run_manifest.json` records the data window, path count, horizon, seed, RNG scheme, fitted parameters, persistence and higher-moment diagnostics, and the results of all three validation families.
 
-AI-assisted development is documented in `AIUSAGE.md`, including what was delegated, what remained explicit human review responsibility, and a concrete AI-generated model-selection mistake that was detected and corrected through review.
+AI-assisted development is documented in `AIUSAGE.md`, including what was delegated, what remained human review responsibility, and the concrete mistakes that review caught.
 
 `AWS_DESIGN.md` describes an on-demand production path using API Gateway, Lambda, Step Functions, ECS Fargate, ECR, S3, DynamoDB and CloudWatch, including identity/secrets, conditioning state, cost and a 100× usage design.

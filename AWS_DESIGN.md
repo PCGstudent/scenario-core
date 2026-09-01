@@ -29,7 +29,7 @@ Step Functions launches an **ECS Fargate** task containing the pinned Python env
 
 ## Code, data and artefacts
 
-Source is reviewed in GitHub; CI runs tests and builds an immutable image pushed to **ECR**. Each run records image digest, model/config version, data cut-off, fitted-parameter version, seed, horizon, path count, initialization mode and output URI. Fitted parameters and approved model artefacts are versioned in **S3**; generated reports/figures/manifests are written to run-specific S3 prefixes. For production market data I would replace the take-home Yahoo dependency with an approved, versioned market-data source.
+Source is reviewed in GitHub; CI runs tests and builds an immutable image pushed to **ECR**. Each run records image digest, model/config version, data cut-off, fitted-parameter version, seed, horizon, path count, initialization mode and output URI, together with the full validation manifest: both gate families and the worst-observed-year exceedance results, so a reviewer can see which estimator a pass or fail came from. Fitted parameters and approved model artefacts are versioned in **S3**; generated reports/figures/manifests are written to run-specific S3 prefixes. For production market data I would replace the take-home Yahoo dependency with an approved, versioned market-data source.
 
 ## Identity, secrets and governance
 
@@ -37,7 +37,7 @@ Use **IAM roles**, never long-lived access keys. API callers authenticate throug
 
 ## Observability and reproducibility
 
-**CloudWatch Logs** receives structured events with `job_id`, model/image version, timings, seed and failure class. Custom metrics cover job latency, failures, queue time and compute use; alarms target abnormal failure rate/runtime. Step Functions provides execution-level state. A run manifest in S3 makes every numerical result traceable to code, data cut-off, parameters and initialization state; idempotency keys prevent accidental duplicate work.
+**CloudWatch Logs** receives structured events with `job_id`, model/image version, timings, seed and failure class. Custom metrics cover job latency, failures, queue time and compute use; alarms target abnormal failure rate/runtime. I would also emit the model-risk metric this validation surfaced — the fraction of simulated years more volatile than anything in the calibration window — and alarm on it, because a refit that quietly drifts further into the non-stationary region would otherwise show up only as unusable scenarios downstream. Step Functions provides execution-level state. A run manifest in S3 makes every numerical result traceable to code, data cut-off, parameters and initialization state; idempotency keys prevent accidental duplicate work.
 
 ## Cost and 100× usage
 

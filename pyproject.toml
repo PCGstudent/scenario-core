@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xtra-takehome"
-version = "0.2.0"
-description = "4-Xtra Senior DS/MLE take-home: Brent diagnostics, GJR-skew-t scenario generation, robustness, validation, and reporting"
+version = "0.3.0"
+description = "4-Xtra Senior DS/MLE take-home: Brent tail diagnostics, GJR-skew-t scenario generation, horizon-matched validation, robustness, and reporting"
 requires-python = ">=3.11"
 dependencies = [
   "arch==7.2.0",
