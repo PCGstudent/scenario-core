@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from pathlib import Path
-
+from .challenger import GjrSkewTGenerator
 from .config import Config
 from .data import fetch_close, log_returns_pct
 from .diagnostics import summarize
-from .model import GarchTGenerator
 from .plots import (
     plot_diagnostics_acf,
     plot_drawdown_comparison,
@@ -25,24 +23,26 @@ def main() -> None:
     print(f"Fetching {cfg.ticker}: {cfg.start} -> {cfg.end} (end exclusive)")
     close = fetch_close(cfg.ticker, cfg.start, cfg.end)
     returns = log_returns_pct(close)
-
     print(f"Loaded {len(close):,} closes and {len(returns):,} returns.")
 
     diagnostic_summary = summarize(returns, nlags=cfg.max_acf_lag)
 
-    print("Fitting GARCH(1,1)-Student-t...")
-    generator = GarchTGenerator().fit(returns)
+    print("Fitting selected GJR-GARCH(1,1,1)-skew-t generator...")
+    generator = GjrSkewTGenerator().fit(returns)
     assert generator.params_ is not None
+    p = generator.params_
 
     print(
         "Fitted params:",
         {
-            "mu": generator.params_.mu,
-            "omega": generator.params_.omega,
-            "alpha": generator.params_.alpha,
-            "beta": generator.params_.beta,
-            "nu": generator.params_.nu,
-            "persistence": generator.params_.persistence,
+            "mu": p.mu,
+            "omega": p.omega,
+            "alpha": p.alpha,
+            "gamma": p.gamma,
+            "beta": p.beta,
+            "eta": p.eta,
+            "lambda": p.lam,
+            "approx_persistence": p.approximate_persistence,
         },
     )
 
@@ -85,7 +85,7 @@ def main() -> None:
     write_report(
         report_path,
         summary=diagnostic_summary,
-        params=generator.params_,
+        params=p,
         gates=gates,
     )
 
