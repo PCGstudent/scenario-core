@@ -2,7 +2,7 @@
 
 ## Goal
 
-Allow a risk analyst to request an on-demand Brent scenario run, receive a job identifier immediately, and retrieve a versioned validation/report artefact when the computation completes.
+Allow a risk analyst to request an on-demand scenario run, receive a job identifier immediately, and retrieve a versioned report/artefact when computation completes. The production API separates **calibration mode** (historical-state mixture, used by this take-home validation) from **scenario mode** (normally condition on the latest fitted state or an explicitly requested stress state).
 
 ```mermaid
 flowchart LR
@@ -15,34 +15,32 @@ flowchart LR
     C --> H[DynamoDB job metadata]
     D --> H
     E --> H
-    I[GitLab/GitHub CI] --> J[ECR]
+    I[GitHub CI] --> J[ECR]
     J --> E
-    K[Secrets Manager] --> C
+    K[Secrets Manager / KMS] --> C
     K --> E
 ```
 
-## Invocation path
+## Invocation
 
-An authenticated internal application calls **Amazon API Gateway**. A small **Lambda** validates the request, creates a job record in **DynamoDB**, and starts an **AWS Step Functions** execution. Step Functions launches an **ECS Fargate** task containing the pinned Python environment and model code. Fargate is preferable to putting the simulation itself in Lambda because scientific Python dependencies, plotting, memory requirements, and run duration can grow beyond a comfortable serverless function envelope.
+An authenticated internal application calls **API Gateway** with a small request such as `horizon`, `n_paths`, optional `seed`, `as_of_date`, and `initial_state_mode` (`latest`, `historical_mix`, or a governed stress-state identifier). A **Lambda** validates limits and permissions, assigns a `job_id`, writes initial metadata to **DynamoDB**, and starts **Step Functions**. The API returns `202 Accepted` plus the job ID; status/result endpoints remain lightweight.
 
-The API returns a `job_id` immediately. The analyst can poll a status endpoint or the internal UI can read job state from DynamoDB. Completed markdown/HTML reports, figures, fitted-parameter artefacts, and run manifests are written to versioned **S3** prefixes keyed by job/run ID.
+Step Functions launches an **ECS Fargate** task containing the pinned Python environment and model code. Fargate is preferable to running the simulation in Lambda because scientific-Python dependencies, plotting, memory and runtime can grow beyond a comfortable function envelope. The same container supports offline validation and on-demand generation, reducing training/serving skew.
 
-## Code and artefacts
+## Code, data and artefacts
 
-Source is reviewed in GitHub/GitLab. CI runs unit tests and builds an immutable container image pushed to **Amazon ECR**. Each run records the image digest, model configuration, seed, requested horizon, ticker/date cut-off, and output S3 URI. S3 versioning and lifecycle policies preserve auditability while controlling retention cost.
+Source is reviewed in GitHub; CI runs tests and builds an immutable image pushed to **ECR**. Each run records image digest, model/config version, data cut-off, fitted-parameter version, seed, horizon, path count, initialization mode and output URI. Fitted parameters and approved model artefacts are versioned in **S3**; generated reports/figures/manifests are written to run-specific S3 prefixes. For production market data I would replace the take-home Yahoo dependency with an approved, versioned market-data source.
 
-## Identity and secrets
+## Identity, secrets and governance
 
-Use **IAM roles**, not long-lived access keys. API callers authenticate through the organisation's identity layer; API Gateway/Lambda authorization can use IAM or an OIDC/Cognito integration. Lambda and Fargate receive least-privilege execution roles. Sensitive external credentials belong in **AWS Secrets Manager** and are encrypted with **KMS**. S3, ECR, DynamoDB, and log groups are encrypted and access-controlled.
+Use **IAM roles**, never long-lived access keys. API callers authenticate through the organisation's identity layer (IAM/OIDC/Cognito as appropriate). Lambda and Fargate receive least-privilege roles. External credentials belong in **Secrets Manager**, encrypted with **KMS**. S3/ECR/DynamoDB/log groups are encrypted and access-controlled. Model promotion is a separate CI/CD approval from ad-hoc analyst execution.
 
-## Observability
+## Observability and reproducibility
 
-**CloudWatch Logs** receives structured logs containing `job_id`, model version, timings, and failure class. CloudWatch custom metrics cover job latency, failures, queue time, and compute usage. Step Functions provides execution-level tracing; alarms target elevated failure rate and abnormal runtime. A run manifest in S3 makes numerical results independently traceable to code/configuration.
+**CloudWatch Logs** receives structured events with `job_id`, model/image version, timings, seed and failure class. Custom metrics cover job latency, failures, queue time and compute use; alarms target abnormal failure rate/runtime. Step Functions provides execution-level state. A run manifest in S3 makes every numerical result traceable to code, data cut-off, parameters and initialization state; idempotency keys prevent accidental duplicate work.
 
-## Cost
+## Cost and 100× usage
 
-The workload is naturally bursty, so Fargate keeps idle cost low. S3/DynamoDB are inexpensive at this scale, Lambda/API Gateway handle lightweight control-plane work, and lifecycle policies expire non-essential intermediate artefacts. Model fits can be cached by immutable data/configuration hash rather than recomputed for identical requests.
+At low volume the workload is bursty, so Fargate avoids idle compute; S3/DynamoDB/API Gateway/Lambda remain inexpensive control-plane services, and lifecycle policies expire non-essential intermediates. Identical approved fits can be cached by immutable data/config hash.
 
-## At 100× usage
-
-I would decouple request arrival from compute with **SQS** and run a horizontally scaled Fargate or **AWS Batch** worker pool. Jobs become explicitly asynchronous and idempotent, with concurrency quotas and back-pressure. Frequently reused fitted models are cached/versioned in S3, while result caching avoids duplicate simulations for identical requests when appropriate. Autoscaling is driven by queue depth and runtime; non-urgent workloads can use Spot capacity through Batch. I would also partition S3 metadata more deliberately, introduce per-tenant/service quotas, load-test the API/control plane, and monitor numerical reproducibility across container/image changes.
+At **100× usage**, decouple arrival from compute with **SQS** and a horizontally scaled Fargate or **AWS Batch** worker pool. Add concurrency quotas, back-pressure, per-tenant limits, dead-letter handling, autoscaling on queue depth/runtime and result caching where requests are truly identical. Non-urgent Monte Carlo jobs can use Batch Spot capacity. I would load-test the control plane, monitor numerical reproducibility across image changes, and keep model/data versions immutable so scale never weakens auditability.
