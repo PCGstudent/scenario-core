@@ -84,7 +84,7 @@ def main() -> None:
         f"Baseline: **{b_pass}/{len(baseline_gates)}** gates; aggregate normalized gate error **{b_err:.3f}**; severe failures **{b_severe}**.",
         f"Challenger: **{c_pass}/{len(challenger_gates)}** gates; aggregate normalized gate error **{c_err:.3f}**; severe failures **{c_severe}**.",
         "",
-        "I deliberately do **not** declare a winner from this one realization. An early AI-assisted comparison used pass count as the primary winner rule; review of the tail errors showed that this was too simplistic. The selection decision therefore uses the multi-seed robustness analysis in `robustness_report.md`, failure severity, and model interpretability in addition to this table.",
+        "I deliberately do **not** declare a winner from this one realization. An early AI-assisted comparison used pass count as the primary winner rule; review of the tail errors showed that this was too simplistic. The selection decision therefore uses the multi-seed robustness analysis in `robustness_report.md`, failure severity, metric relevance and model interpretability in addition to this table.",
         "",
         "## Fitted challenger parameters",
         "",
@@ -109,7 +109,7 @@ def main() -> None:
         "",
         "## Selection rationale",
         "",
-        "The asymmetric challenger was retained because its improvements in negative skew, tail quantiles and drawdown behaviour persisted across seeds, while the extra parameterization remains small and interpretable. The decision is not a claim that the challenger is fully adequate: higher-moment instability and squared-return ACF mismatch remain explicit model-risk findings.",
+        "The asymmetric challenger is retained because it captures the observed negative skew materially better and improves right-tail quantiles and extreme drawdown calibration while the added structure remains small and interpretable. It is not uniformly better: the baseline is somewhat closer on some left-tail q01/VaR/ES measures, although those challenger measures remain inside the declared gates. The challenger's much larger kurtosis miss also makes its aggregate normalized error worse; that is treated as an explicit higher-moment model-risk finding rather than averaged away or used as a reason to move thresholds.",
     ]
 
     out = Path(cfg.output_dir) / "model_comparison.md"
