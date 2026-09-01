@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xtra-takehome"
+version = "0.1.0"
+description = "4-Xtra Senior DS/MLE take-home: Brent crude diagnostics, GARCH-t generation, validation, and reporting"
+requires-python = ">=3.11"
+dependencies = [
+  "arch==7.2.0",
+  "matplotlib==3.10.3",
+  "numpy==2.2.6",
+  "pandas==2.2.3",
+  "scipy==1.15.3",
+  "statsmodels==0.14.4",
+  "yfinance==0.2.61",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.5",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
