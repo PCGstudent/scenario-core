@@ -43,6 +43,12 @@ bash run.sh
 - `plots.py`: deterministic report figures (non-interactive Agg backend).
 - `report.py`: markdown report for the submitted model.
 - `__main__.py`: final end-to-end orchestration.
+- `app/`: the interactive lab. Orchestration and presentation only — it reuses the
+  modules above and never reimplements a statistic. `services.py` wires the core to
+  the interface, `risk.py` adds the lab's own risk arithmetic (every metric tagged
+  with what it is measured over), `stress.py` keeps model-generated and assumed
+  shocks apart, `charts.py`, `llm.py` and `state.py` are presentation.
+- `app.py` at the repository root is the Streamlit entry point.
 
 ## Statistical invariants
 
@@ -68,6 +74,10 @@ bash run.sh
 20. Quote statistics that have no finite population value (pooled kurtosis and skewness here) as a median across seeds, never from a single realization.
 21. Derive simulation streams from `SeedSequence(seed).spawn(...)`, never `seed + 1`, so replications do not share a generator stream.
 22. Figures are written, never displayed: select a non-interactive matplotlib backend.
+23. The lab must never present a scenario as a prediction. A fan-chart median is the middle of a distribution, not a forecast, and the interface says so wherever it could be misread.
+24. Never display a daily risk figure and a whole-horizon figure as though they were comparable. Every metric carries the horizon it was measured over.
+25. Model-generated stress carries a probability; an assumed shock sequence does not. Keep the two apart in the code and in the interface.
+26. The validation page runs at the canonical configuration regardless of the lab controls, because the tolerances were derived for it.
 
 ## Development rules for AI agents
 

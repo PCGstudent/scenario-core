@@ -21,6 +21,12 @@ dependencies = [
 dev = [
   "pytest==8.3.5",
 ]
+# The interactive lab. Kept out of the default install so the clean-clone
+# contract in run.sh / run.ps1 stays exactly as it was.
+app = [
+  "streamlit==1.41.1",
+  "plotly==5.24.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
