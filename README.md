@@ -121,6 +121,88 @@ The pooled family fails five gates and the horizon-matched family fails one. Nei
 
 The next experiment would be **GARCH-EVT** if conditional-tail calibration is the priority, or a **regime-aware volatility model** to test whether state-dependent persistence reproduces the ACF profile a single recursion misses. I intentionally stop before those extensions.
 
+## The interactive lab
+
+`Brent Scenario & Risk Lab` is a Streamlit application over the same modelling
+core. It exists to make the pipeline inspectable: what the data looks like, what
+the fitted model learned, whether the scenarios can be trusted, and what the risk
+numbers actually mean.
+
+```bash
+python -m pip install -e ".[app]"
+streamlit run app.py
+```
+
+The `[app]` extra is deliberately separate from the default install, so the
+clean-clone command above is unchanged and the modelling core has no dependency
+on Streamlit.
+
+### What this model predicts — and what it does not
+
+**It models**
+
+- conditional volatility and how it evolves day to day
+- the distribution of returns over a horizon
+- tail behaviour, drawdowns and how often severe years occur, under the fitted model
+
+**It does not predict**
+
+- tomorrow's return, or its direction
+- the Brent price at any future date
+- structural changes that have never been observed
+- anything about other assets — the model is univariate
+
+The median of a fan chart is the middle of a distribution, not a forecast. No
+individual scenario is expected to occur, and none of them happened.
+
+### The eight pages
+
+| Page | What it does |
+|---|---|
+| Overview | The pipeline end to end, current model parameters, and the scope of the claim |
+| Historical data | Prices, returns, rolling volatility, both ACFs, and the three tail diagnostics |
+| Model explainer | The equations, with an interactive demonstration of the leverage effect |
+| Model fit & validation | The repository's own validation suite, failures included |
+| Live scenario lab | Generate scenarios; fan chart, paths, terminal outcomes, single-scenario inspection |
+| Risk analysis | VaR, ES, drawdowns and threshold probabilities, plus Monte Carlo convergence |
+| Stress test lab | Model-generated stress and assumed-shock experiments, kept separate |
+| Ask AI | Optional natural-language layer over the computed results |
+
+### Two design decisions worth knowing
+
+**Validation runs at the canonical configuration, not at the sidebar settings.**
+The acceptance tolerances were derived for a 252-day horizon with 1,000 paths at
+seed 42. Running a 252-day acceptance test against 30-day scenarios would produce
+marks with no meaning, so the validation page ignores the lab controls and says so.
+
+**The lab and the validation suite start from different states, on purpose.**
+A forward-looking scenario run conditions on where the market is now — the last
+fitted conditional variance. The validation suite starts each path from a randomly
+sampled historical state, so the synthetic distribution is comparable with the whole
+record rather than with its final day. `AWS_DESIGN.md` calls these scenario mode and
+calibration mode; the interface labels which is in use and explains the difference.
+
+### Optional AI layer
+
+Set `OPENAI_API_KEY` and install `openai` to enable the last page. Without it the
+page explains that it is disabled and everything else works normally.
+
+Python computes every number. The assistant is given a structured context of
+already-computed results and instructed never to calculate, never to present
+scenarios as predictions, and to say plainly when a figure the user asked for is
+not in the context rather than inventing it. The exact system prompt and the full
+context are both visible in the interface.
+
+### Limitations of the lab
+
+- Scenario generation is vectorized across paths but loops over time, so a 10,000-path
+  convergence study takes a few seconds.
+- The validation suite takes roughly 30 seconds on first load, then is cached.
+- Realized volatility is annualized with the square-root-of-time rule, which assumes
+  serially uncorrelated returns. Their squares are not, but the returns very nearly are.
+- The stress lab's assumed-shock mode carries no probability. It answers a conditional
+  question and the interface labels it as such.
+
 ## Outputs
 
 ```text
@@ -151,22 +233,45 @@ reports/
 ├── pyproject.toml
 ├── run.ps1
 ├── run.sh
-├── src/xtra_takehome/
-│   ├── __main__.py
-│   ├── challenger.py          # submitted GJR-skew-t generator
-│   ├── compare_models.py
-│   ├── config.py
-│   ├── data.py
-│   ├── diagnostics.py
-│   ├── metrics.py
-│   ├── model.py               # development GARCH-t baseline
-│   ├── plots.py
-│   ├── report.py
-│   ├── robustness.py
-│   ├── validation.py
-│   └── windows.py             # horizon-matched block statistics
+├── app.py                     # Streamlit entry point for the lab
+├── docs/architecture/
+│   └── IMPLEMENTATION_PLAN.md # target AWS production platform design
+├── requirements/               # Phase 0: locked worker/control/dev dependency sets
+├── .github/workflows/          # Phase 0: CI (see "Development tooling" below)
+├── src/
+│   ├── xtra_takehome/
+│   │   ├── app/                # lab layer: services, risk, stress, charts, llm, state
+│   │   ├── __main__.py
+│   │   ├── challenger.py       # submitted GJR-skew-t generator
+│   │   ├── compare_models.py
+│   │   ├── config.py
+│   │   ├── data.py
+│   │   ├── diagnostics.py
+│   │   ├── metrics.py
+│   │   ├── model.py            # development GARCH-t baseline
+│   │   ├── plots.py
+│   │   ├── report.py
+│   │   ├── robustness.py
+│   │   ├── validation.py
+│   │   └── windows.py          # horizon-matched block statistics
+│   └── scenario_platform/      # empty in Phase 0; Phase 1 adds the domain layer here
 └── tests/
 ```
+
+## Development tooling (platform work)
+
+The commands above are the frozen, unaffected clean-clone contract for the submitted model. Building the production AWS platform described in `docs/architecture/IMPLEMENTATION_PLAN.md` on top of it starts with an engineering baseline that does not touch any statistical code:
+
+```bash
+pip install --require-hashes -r requirements/dev.lock   # ruff, mypy, pytest, pip-audit
+ruff check .                                             # new platform code + newly added tests
+ruff format --check .                                    # same scope
+mypy                                                      # src/scenario_platform (empty until Phase 1)
+pytest -m invariants                                      # tests enforcing a numbered AGENTS.md invariant
+pytest -m negative_controls                               # tests proving a gate/check can actually fail
+```
+
+`requirements/worker.lock`, `requirements/control.lock` and `requirements/dev.lock` are hash-locked with `uv pip compile --universal`, which resolves one file that pins the same dependency *versions* for Windows and Linux and records the hash of the correct platform-specific wheel for each; installing the same lock on either platform therefore always resolves to the same pinned version set with verified, tamper-evident artifacts, not to a byte-identical set of files on disk (a Windows wheel and a manylinux wheel for the same version are different compiled binaries). `worker.lock` pins the exact versions already declared in `pyproject.toml`'s dependencies, never drifted independently. `tests/test_no_aws_in_core.py` and `tests/test_control_plane_purity.py` enforce the boundary the architecture plan depends on: no `boto3`/`botocore` in the quantitative core or future domain layer, and no scientific/UI dependency in the thin control-plane lock.
 
 ## Reproducibility and AI use
 
@@ -176,4 +281,4 @@ One caveat, verified rather than assumed. The committed reports were reproduced 
 
 AI-assisted development is documented in `AIUSAGE.md`, including what was delegated, what remained human review responsibility, and the concrete mistakes that review caught.
 
-`AWS_DESIGN.md` describes an on-demand production path using API Gateway, Lambda, Step Functions, ECS Fargate, ECR, S3, DynamoDB and CloudWatch, including identity/secrets, conditioning state, cost and a 100× usage design.
+`AWS_DESIGN.md` describes an on-demand production path using API Gateway, Lambda, Step Functions, ECS Fargate, ECR, S3, DynamoDB and CloudWatch, including identity/secrets, conditioning state, cost and a 100× usage design. `docs/architecture/IMPLEMENTATION_PLAN.md` is the current, detailed version of that design and the authoritative plan for the production platform now being built on top of this model; "Development tooling" above documents Phase 0 of it.

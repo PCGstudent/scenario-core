@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from xtra_takehome.challenger import GjrSkewTParams
 from xtra_takehome.diagnostics import DiagnosticSummary
@@ -144,6 +145,7 @@ def test_report_documents_both_estimator_families(tmp_path):
     assert "Family 2: horizon-matched year-level gates" in text
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 12: a tolerance correction must be disclosed
 def test_report_discloses_the_scale_dependent_tolerances(tmp_path):
     """The unfailable-gate defect must be stated, not silently fixed."""
     text = _fixture(tmp_path)
@@ -152,6 +154,7 @@ def test_report_discloses_the_scale_dependent_tolerances(tmp_path):
     assert "standard errors of the historical mean" in text
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 16: don't gate on an unidentified quantile
 def test_report_explains_why_the_stressed_region_is_not_gated(tmp_path):
     text = _fixture(tmp_path)
     assert "window overlap" in text
@@ -166,6 +169,7 @@ def test_report_carries_the_matched_length_reference(tmp_path):
     assert "Model 5-95% band" in text
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 18: a convicting diagnostic needs the comparator
 def test_leave_out_table_includes_the_historical_comparator(tmp_path):
     """Without the historical rows the table would convict the model unfairly."""
     text = _fixture(tmp_path)

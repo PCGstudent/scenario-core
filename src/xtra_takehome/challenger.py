@@ -155,6 +155,26 @@ class GjrSkewTGenerator:
         self._residuals: np.ndarray | None = None
         self._variances: np.ndarray | None = None
 
+    @property
+    def fitted_states(self) -> tuple[np.ndarray, np.ndarray]:
+        """The fitted (residual, conditional variance) pairs, one per historical day."""
+        if self._residuals is None or self._variances is None:
+            raise RuntimeError("Call fit() before reading fitted states.")
+        return self._residuals, self._variances
+
+    @property
+    def latest_state(self) -> tuple[float, float]:
+        """The most recent fitted (residual, conditional variance).
+
+        This is where the market actually is at the end of the sample. Conditioning
+        a simulation on it answers "what might happen next, from here", which is a
+        different question from the calibration check, which deliberately starts
+        from a mixture of historical states so that the synthetic distribution is
+        comparable with the whole historical record rather than with its final day.
+        """
+        residuals, variances = self.fitted_states
+        return float(residuals[-1]), float(variances[-1])
+
     def fit(self, returns: pd.Series) -> "GjrSkewTGenerator":
         from arch import arch_model
 
@@ -192,7 +212,70 @@ class GjrSkewTGenerator:
             raise RuntimeError("No valid fitted states were produced by the GJR model.")
         return self
 
-    def simulate(self, n_steps: int, n_paths: int, seed: int) -> np.ndarray:
+    def _initial_states(
+        self,
+        initial_state: str | tuple[float, float],
+        n_paths: int,
+        state_seed,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Resolve the starting (residual, variance) for every path.
+
+        The three modes answer different questions and are never interchangeable:
+
+        ``historical_mix``
+            Sample a fitted state per path. Every path starts somewhere the market
+            actually was, so the pooled synthetic distribution is comparable with
+            the whole historical record. This is what the validation suite uses,
+            and it stays the default so that behaviour is unchanged.
+        ``latest``
+            Every path starts from the final fitted state. This conditions on where
+            the market is now, which is what a forward-looking scenario run wants.
+        explicit ``(residual, variance)``
+            A stated starting point, for stress experiments.
+        """
+        residuals, variances = self.fitted_states
+
+        if isinstance(initial_state, str):
+            if initial_state == "historical_mix":
+                rng = np.random.default_rng(state_seed)
+                idx = rng.integers(0, residuals.size, size=n_paths)
+                return residuals[idx].copy(), variances[idx].copy()
+            if initial_state == "latest":
+                eps0, var0 = self.latest_state
+                return (
+                    np.full(n_paths, eps0, dtype=float),
+                    np.full(n_paths, var0, dtype=float),
+                )
+            raise ValueError(
+                f"Unknown initial_state {initial_state!r}; expected "
+                "'historical_mix', 'latest', or an explicit (residual, variance)."
+            )
+
+        eps0, var0 = initial_state
+        if float(var0) <= 0.0:
+            raise ValueError("An explicit initial variance must be positive.")
+        return (
+            np.full(n_paths, float(eps0), dtype=float),
+            np.full(n_paths, float(var0), dtype=float),
+        )
+
+    def simulate(
+        self,
+        n_steps: int,
+        n_paths: int,
+        seed: int,
+        *,
+        initial_state: str | tuple[float, float] = "historical_mix",
+        return_variance: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        """Simulate return paths from the fitted model.
+
+        Defaults reproduce the original behaviour exactly, so every existing caller
+        -- the validation suite included -- is unaffected. The keyword arguments
+        exist for the interactive lab: `initial_state` selects what the run is
+        conditioned on, and `return_variance` also returns the conditional variance
+        path, which is what makes a single scenario inspectable.
+        """
         if self.params_ is None or self._residuals is None or self._variances is None:
             raise RuntimeError("Call fit() before simulate().")
         if n_steps <= 0 or n_paths <= 0:
@@ -207,16 +290,14 @@ class GjrSkewTGenerator:
         # so replications in the robustness study would not be independent.
         state_seed, innovation_seed = np.random.SeedSequence(seed).spawn(2)
 
-        rng = np.random.default_rng(state_seed)
-        state_idx = rng.integers(0, self._residuals.size, size=n_paths)
-        eps_prev = self._residuals[state_idx].copy()
-        var_prev = self._variances[state_idx].copy()
+        eps_prev, var_prev = self._initial_states(initial_state, n_paths, state_seed)
 
         dist = SkewStudent(seed=np.random.default_rng(innovation_seed))
         draw = dist.simulate(np.array([self.params_.eta, self.params_.lam]))
         z = np.asarray(draw((n_paths, n_steps)), dtype=float)
 
         out = np.empty((n_paths, n_steps), dtype=float)
+        variances = np.empty((n_paths, n_steps), dtype=float) if return_variance else None
         p = self.params_
         for t in range(n_steps):
             leverage = (eps_prev < 0.0).astype(float)
@@ -229,7 +310,11 @@ class GjrSkewTGenerator:
             variance = np.maximum(variance, 1e-12)
             eps = np.sqrt(variance) * z[:, t]
             out[:, t] = p.mu + eps
+            if variances is not None:
+                variances[:, t] = variance
             eps_prev = eps
             var_prev = variance
 
+        if variances is not None:
+            return out, variances
         return out

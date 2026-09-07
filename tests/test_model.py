@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from xtra_takehome.model import GarchTParams, simulate_garch_t
 
@@ -14,6 +15,7 @@ def _params():
     )
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 8: every stochastic operation seed-controlled
 def test_simulation_is_reproducible():
     a = simulate_garch_t(_params(), horizon=50, n_paths=4, seed=42)
     b = simulate_garch_t(_params(), horizon=50, n_paths=4, seed=42)

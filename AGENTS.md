@@ -43,6 +43,12 @@ bash run.sh
 - `plots.py`: deterministic report figures (non-interactive Agg backend).
 - `report.py`: markdown report for the submitted model.
 - `__main__.py`: final end-to-end orchestration.
+- `app/`: the interactive lab. Orchestration and presentation only — it reuses the
+  modules above and never reimplements a statistic. `services.py` wires the core to
+  the interface, `risk.py` adds the lab's own risk arithmetic (every metric tagged
+  with what it is measured over), `stress.py` keeps model-generated and assumed
+  shocks apart, `charts.py`, `llm.py` and `state.py` are presentation.
+- `app.py` at the repository root is the Streamlit entry point.
 
 ## Statistical invariants
 
@@ -68,6 +74,16 @@ bash run.sh
 20. Quote statistics that have no finite population value (pooled kurtosis and skewness here) as a median across seeds, never from a single realization.
 21. Derive simulation streams from `SeedSequence(seed).spawn(...)`, never `seed + 1`, so replications do not share a generator stream.
 22. Figures are written, never displayed: select a non-interactive matplotlib backend.
+23. The lab must never present a scenario as a prediction. A fan-chart median is the middle of a distribution, not a forecast, and the interface says so wherever it could be misread.
+24. Never display a daily risk figure and a whole-horizon figure as though they were comparable. Every metric carries the horizon it was measured over.
+25. Model-generated stress carries a probability; an assumed shock sequence does not. Keep the two apart in the code and in the interface.
+26. The validation page runs at the canonical configuration regardless of the lab controls, because the tolerances were derived for it.
+
+The following three are adopted from `docs/architecture/IMPLEMENTATION_PLAN.md` for the AWS production platform now being built on top of this model. 28 gets executable enforcement starting in Phase 0 (`tests/test_no_aws_in_core.py`, plus Ruff's TID251 rule where lint scope covers a file); 27 and 29 describe objects that do not exist until Phase 1 creates `ModelArtifact` and become executable then, not before.
+
+27. Model artifacts must carry the fitted state arrays required by `historical_mix` (the residual/variance pairs `GjrSkewTGenerator.fit` produces), not just the seven fitted parameters. A params-only artifact silently changes the initialization law and cannot reproduce the committed validation.
+28. The quantitative core and the pure domain layer must remain infrastructure-independent: no `boto3`/`botocore` import, and no reading of AWS or other infrastructure configuration from the environment. Nothing here may know it is being deployed anywhere.
+29. Artifact identity is semantic and canonical, derived from the decoded parameter and array values, independent of storage-format bytes (a `.npz`'s container encoding, a JSON serializer's float/key ordering). A `save -> load -> save` round trip must yield the same identity even when the underlying bytes differ.
 
 ## Development rules for AI agents
 

@@ -1,0 +1,18 @@
+# Quantitative worker runtime dependencies.
+#
+# These MUST stay in lockstep with the direct dependency versions pinned in
+# pyproject.toml's [project.dependencies] -- that pin is what the committed
+# reports under reports/ were generated against, and drifting it here would be
+# a silent statistical change. Bump both together, never one alone.
+#
+# Deliberately excludes streamlit/plotly/pyarrow (the interactive lab's `app`
+# extra): the worker never renders a UI, so those ~300MB of transitive
+# dependencies do not belong in the execution image that Phase 2 builds from
+# this lock (architecture plan Section 11.3, "slim the image").
+arch==7.2.0
+matplotlib==3.10.3
+numpy==2.2.6
+pandas==2.2.3
+scipy==1.15.3
+statsmodels==0.14.4
+yfinance==0.2.61

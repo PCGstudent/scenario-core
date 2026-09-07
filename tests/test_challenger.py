@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from xtra_takehome.challenger import GjrSkewTGenerator, GjrSkewTParams
 
@@ -19,6 +20,7 @@ def _fitted_like_generator() -> GjrSkewTGenerator:
     return g
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 8: every stochastic operation seed-controlled
 def test_challenger_simulation_is_reproducible():
     g = _fitted_like_generator()
     a = g.simulate(n_steps=50, n_paths=8, seed=42)
@@ -33,6 +35,7 @@ def test_challenger_shape_and_finite_values():
     assert np.isfinite(x).all()
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 11: lower partial second moment, not gamma/2
 def test_symmetric_skewt_recovers_half_negative_second_moment():
     p = GjrSkewTParams(
         mu=0.0,
@@ -59,6 +62,7 @@ def test_fourth_moment_coefficient_is_positive_and_finite_when_eta_gt_four():
     assert p.fourth_moment_coefficient > 0.0
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 21: SeedSequence(seed).spawn, never seed+1
 def test_consecutive_seeds_do_not_share_a_generator_stream():
     """Replications must be independent.
 

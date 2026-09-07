@@ -44,6 +44,7 @@ def test_non_overlapping_blocks_rejects_short_series():
         non_overlapping_blocks(np.arange(5, dtype=float), horizon=10)
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 17: never compare maxima across sample sizes
 def test_overlapping_maximum_can_exceed_the_disjoint_maximum():
     """Why the extreme-region threshold uses disjoint blocks.
 
@@ -75,6 +76,7 @@ def test_window_stats_match_direct_per_block_computation():
     assert np.all(ws.max_drawdown >= 0.0)
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 5: never concatenate paths before ACF
 def test_window_stats_acf_is_averaged_not_concatenated():
     """Lag 0 is 1 in every block, so the average must be exactly 1."""
     rng = np.random.default_rng(1)

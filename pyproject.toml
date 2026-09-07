@@ -19,7 +19,18 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest==8.3.5",
+  # 9.0.3 fixes PYSEC-2026-1845 / CVE-2025-71176 (a local tmp-directory naming
+  # issue on Unix). Pytest is test tooling, not part of the scientific
+  # dependency stack above, so this pin has no effect on the fetched data, the
+  # fitted model, or any committed report -- run.sh/run.ps1's clean-clone
+  # command installs this extra, so it must carry the fixed version too.
+  "pytest==9.0.3",
+]
+# The interactive lab. Kept out of the default install so the clean-clone
+# contract in run.sh / run.ps1 stays exactly as it was.
+app = [
+  "streamlit==1.41.1",
+  "plotly==5.24.1",
 ]
 
 [tool.setuptools.packages.find]
@@ -28,4 +39,70 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-q"
+addopts = "-q --strict-markers"
+markers = [
+  "invariants: directly enforces a numbered statistical invariant in AGENTS.md",
+  "negative_controls: proves a gate/check rejects a generator lacking the property it claims to test (AGENTS.md invariant 14)",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 92
+# Phase 0 scope: lint and format-check new platform code and newly added
+# tests. The existing quantitative core, the Streamlit lab, and the
+# pre-existing test files are EXCLUDED entirely -- from lint and from format
+# -- rather than bulk-reformatted to satisfy a new tool. AGENTS.md forbids
+# refactoring the statistical implementation for style, and "Ruff format
+# --check passes for the intended scope" (Phase 0 acceptance criteria) means
+# this scope, not the whole repository.
+#
+# Consequence: Ruff's TID251 banned-import rule below therefore does not scan
+# src/xtra_takehome for boto3/botocore either. That is intentional, not an
+# oversight -- the architecture plan's own Phase 0 brief allows it explicitly
+# ("if Ruff cannot express every rule safely, enforce the remainder through
+# tests"), and tests/test_no_aws_in_core.py is the primary, always-active
+# enforcement for the core via AST inspection, independent of lint scope. Once
+# src/scenario_platform/domain exists (Phase 1) it is linted normally and
+# carries the same guard test.
+extend-exclude = [
+  "src/xtra_takehome",
+  "app.py",
+  # ruff format's default file selection also formats fenced Python code
+  # blocks inside Markdown; this repo's docs (including the architecture
+  # plan) and generated reports must never be touched by it.
+  "*.md",
+  "tests/test_app_risk.py",
+  "tests/test_app_stress.py",
+  "tests/test_challenger.py",
+  "tests/test_data.py",
+  "tests/test_diagnostics.py",
+  "tests/test_end_to_end.py",
+  "tests/test_metrics.py",
+  "tests/test_model.py",
+  "tests/test_report.py",
+  "tests/test_robustness.py",
+  "tests/test_validation.py",
+  "tests/test_windows.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "TID251"]
+
+# Architectural boundary (architecture plan Section 7.3 / AGENTS.md invariant 28):
+# no boto3/botocore import, in any file this configuration actually lints.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"boto3".msg = "AWS SDK is forbidden in the quantitative core and domain layer (AGENTS.md invariant 28)."
+"botocore".msg = "AWS SDK is forbidden in the quantitative core and domain layer (AGENTS.md invariant 28)."
+
+[tool.mypy]
+python_version = "3.13"
+# src/scenario_platform is an empty placeholder package in Phase 0 (see its
+# __init__.py) -- this section establishes the strict-typing rule now so
+# Phase 1's domain layer is typed from its first commit rather than
+# retrofitted later. There is intentionally nothing to check yet. The
+# existing research package (src/xtra_takehome) is explicitly out of scope
+# for Phase 0 -- see the Ruff note above for the same reasoning.
+files = ["src/scenario_platform"]
+strict = true
+warn_unused_configs = true
+disallow_untyped_defs = true

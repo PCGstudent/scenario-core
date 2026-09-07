@@ -1,0 +1,16 @@
+# Development/CI dependencies: testing, lint, formatting, typing, dependency
+# auditing. Never installed into a production image (worker or control-plane).
+#
+# pytest is pinned to 9.0.3, the fixed release for PYSEC-2026-1845 /
+# CVE-2025-71176 (a local tmp-directory naming issue on Unix), matching
+# pyproject.toml's `dev` extra. Pytest is test tooling, not part of the
+# scientific dependency stack in [project.dependencies]: it has no effect on
+# the fetched data, the fitted model, or any committed report, so this pin
+# carries no reproducibility risk. The full suite, both marker lanes, Ruff,
+# mypy and pip-audit were all re-run clean against 9.0.3 with no regression.
+# The others are Phase 0 tooling, left to resolve to their latest compatible
+# release.
+pytest==9.0.3
+ruff>=0.8,<1
+mypy>=1.13,<2
+pip-audit>=2.7,<3

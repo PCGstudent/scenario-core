@@ -53,6 +53,8 @@ def _context(returns: pd.Series):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.invariants
+@pytest.mark.negative_controls  # AGENTS.md invariant 14: a gate must be provably able to fail
 def test_horizon_matched_acf_gate_rejects_a_generator_with_no_clustering():
     """Regression test for a gate that could not fail.
 
@@ -81,6 +83,7 @@ def test_horizon_matched_acf_gate_rejects_a_generator_with_no_clustering():
     )
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 15: scale-derived tolerances re-derived per estimator
 def test_acf_tolerance_tracks_the_estimator_scale():
     """The tolerance must move with the statistic it is applied to."""
     returns = _clustered_returns()
@@ -98,6 +101,7 @@ def test_acf_tolerance_tracks_the_estimator_scale():
     assert matched.acf_threshold < pooled.acf_threshold
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 15: scale-derived tolerances re-derived per estimator
 def test_mean_tolerance_is_expressed_in_standard_errors():
     returns = _clustered_returns()
     context = _context(returns)
@@ -119,6 +123,7 @@ def test_mean_tolerance_is_expressed_in_standard_errors():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 15: scale-derived tolerances re-derived per estimator
 def test_scale_free_tolerances_are_identical_across_families():
     returns = _clustered_returns()
     paths = _iid_bootstrap(returns, n_paths=200, seed=3)
@@ -173,6 +178,7 @@ def test_drawdowns_are_reported_once_not_duplicated_across_families():
     assert "drawdown p95" in {d.name for d in diagnostics}
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 13: equal-length blocks on both sides
 def test_horizon_matched_requires_equal_block_lengths():
     real = compute_window_stats(np.zeros((5, 30)) + np.arange(30), ACF_LAGS)
     synthetic = compute_window_stats(np.zeros((5, 20)) + np.arange(20), ACF_LAGS)
@@ -185,6 +191,8 @@ def test_horizon_matched_requires_equal_block_lengths():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.invariants
+@pytest.mark.negative_controls  # AGENTS.md invariant 14: the extreme-region check must be able to flag
 def test_extreme_region_flags_a_generator_that_cannot_reach_the_record():
     returns = _clustered_returns(seed=5)
     disjoint = compute_window_stats(
@@ -209,6 +217,7 @@ def test_extreme_region_flags_a_generator_that_cannot_reach_the_record():
         assert c.flagged
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 17: matched-length record plausibility, not max-vs-max
 def test_extreme_region_does_not_flag_a_generator_from_the_same_process():
     """A second realization of the same process must look plausible.
 
@@ -228,6 +237,7 @@ def test_extreme_region_does_not_flag_a_generator_from_the_same_process():
     assert any(not c.flagged for c in checks)
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 17: matched-length record plausibility, not max-vs-max
 def test_extreme_region_probabilities_are_internally_consistent():
     returns = _clustered_returns(seed=9)
     disjoint = compute_window_stats(
@@ -250,6 +260,7 @@ def test_extreme_region_probabilities_are_internally_consistent():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 18: a convicting diagnostic needs the comparator
 def test_leave_out_collapses_pooled_moments_for_history_too():
     """The comparator that keeps the diagnostic honest.
 
@@ -297,6 +308,7 @@ class _RecordingGenerator:
         return np.random.default_rng(seed).standard_t(df=5, size=(n_paths, n_steps))
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 5: never build records by concatenating paths
 def test_matched_reference_simulates_whole_records_not_stitched_years():
     """The section claims records of the historical length; it must build them.
 
