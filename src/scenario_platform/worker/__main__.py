@@ -5,10 +5,11 @@ Phase 2 implements only ``simulate`` -- the request-flow step (Section 6.1,
 step 4) that loads a frozen :class:`~scenario_platform.domain.artifacts.ModelArtifact`,
 verifies it, calls the existing Phase-1 ``services.simulate``/``services.risk``
 functions unchanged, and atomically publishes ``returns.npy``,
-``risk_report.json`` and ``manifest.json``. ``calibrate`` and ``validate`` are
-Phase 3b's addition (their own Files bullet names them explicitly); this
-module is structured as a subcommand dispatcher precisely so adding them
-later is a new subparser, not a redesign.
+``risk_report.json`` and ``manifest.json`` (plus ``variances.npy`` when the
+request asks for it). ``calibrate`` and ``validate`` are Phase 3b's addition
+(their own Files bullet names them explicitly); this module is structured as
+a subcommand dispatcher precisely so adding them later is a new subparser,
+not a redesign.
 
 **Local substitution for the AWS-shaped contract, not a competing one.**
 Section 6.1 step 4a reads the canonical resolved request from DynamoDB and
@@ -17,44 +18,63 @@ inputs as plain local paths (``--request`` a JSON file, ``--artifact-dir`` a
 :func:`~scenario_platform.domain.serialization.load_artifact` directory).
 Every field in the request document maps directly onto the existing
 ``ScenarioRequest``/``RiskConfig`` domain types (``requests.py``) -- nothing
-here is a new domain model, only a thin JSON transport over one.
+here is a new domain model, only a thin, strict JSON transport over one. The
+transport never coerces (no bare ``int()``/``float()``/``bool()`` on
+caller-supplied values): a fractional, string, or boolean value where an
+integer is required is rejected, not silently reinterpreted.
 
 **Fail-closed, in order:**
 
-1. malformed/incomplete request JSON -> ``WorkerInputError`` (INPUT)
-2. artifact missing, unreadable, structurally invalid, or self-inconsistent
+1. the actual, loaded numerical thread pools exceed the single-thread
+   contract -> ``WorkerThreadContractError`` (INTERNAL)
+2. malformed/incomplete/unknown-field request JSON, an out-of-range or
+   wrong-typed field, or a risk level policy rejects -> ``WorkerInputError``
+   (INPUT)
+3. artifact missing, unreadable, structurally invalid, or self-inconsistent
    -> ``ArtifactIntegrityError``/``ArtifactValidationError`` (ARTIFACT_INTEGRITY)
-3. the loaded artifact is not the one the request named
+4. the loaded artifact is not the one the request named
    -> ``WorkerArtifactMismatchError`` (ARTIFACT_INTEGRITY, Section 8.3)
-4. the request's ``model_version`` does not match the artifact's
+5. the request's ``model_version`` does not match the artifact's
    -> ``RequestArtifactMismatchError`` (ARTIFACT_INTEGRITY, raised inside
    ``services.simulate`` itself)
-5. an unsupported ``rng_scheme`` -> ``NotImplementedError`` (INPUT)
-6. anything else unexpected -> INTERNAL
+6. an unsupported ``rng_scheme`` -> ``NotImplementedError`` (INPUT)
+7. another invocation is already publishing to the same ``--output-dir``
+   -> ``WorkerConcurrentPublishError`` (INPUT)
+8. anything else unexpected -> INTERNAL
 
 No result file is ever written until every one of the steps above has
 already succeeded (see ``_write_outputs_atomically``): all computation runs
 to completion in memory first, and only a fully-formed result is ever
-staged to disk and atomically published.
+staged to disk and atomically published, with ``manifest.json`` written
+last as this worker's own definition of "the result is complete."
+**A consumer must never trust ``returns.npy``/``risk_report.json`` present
+without ``manifest.json`` also present** -- a killed or interrupted process
+can still leave partially-staged files behind (the staging directory itself,
+or -- in the narrow window between two ``os.replace`` calls -- a published
+data file with no manifest yet); this worker cleans up everything it can on
+a *handled* exception, but cannot clean up after its own hard kill.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
+import math
 import os
 import platform
 import shutil
 import sys
 import tempfile
 import time
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import numpy.typing as npt
+import threadpoolctl
 
 from scenario_platform.adapters.logging import configure_worker_logging
 from scenario_platform.adapters.metrics import emit_duration_ms
@@ -64,41 +84,210 @@ from scenario_platform.domain.artifacts import (
     ArtifactValidationError,
     ModelArtifact,
 )
+from scenario_platform.domain.policies import (
+    GovernanceCap,
+    PolicyRejection,
+    check_metric_request,
+)
 from scenario_platform.domain.reports import RiskReport
 from scenario_platform.domain.requests import RiskConfig, ScenarioRequest
+from scenario_platform.domain.serialization import TransportSchemaError
 from scenario_platform.domain.services import RequestArtifactMismatchError
 from scenario_platform.domain.services import risk as compute_risk
 from scenario_platform.domain.services import simulate as run_simulate
 
-from .errors import ExitCode, WorkerArtifactMismatchError, WorkerInputError
+from .errors import (
+    ExitCode,
+    WorkerArtifactMismatchError,
+    WorkerConcurrentPublishError,
+    WorkerInputError,
+    WorkerThreadContractError,
+)
 
 LOGGER = configure_worker_logging()
 
-#: Verified and logged at the start of every invocation (Phase-2 acceptance
-#: criterion 3: "Threads are pinned and verified at runtime"). This module
-#: does not *set* these -- the Dockerfile/entrypoint does, before Python
-#: (and therefore numpy/BLAS) ever starts -- it only reads and reports them,
-#: because a value logged after the fact is worthless if nothing upstream
-#: actually enforced it.
+#: Logged for provenance (Phase-2 acceptance criterion 3's "logs the
+#: effective thread counts"), but -- unlike Phase 2's original cut -- no
+#: longer trusted as the *verification*: an env var can be stale, ignored by
+#: the BLAS build, or overridden at `docker run` time without the library
+#: that reads it ever re-reading it. See `_verify_thread_contract` below for
+#: the actual check.
 THREAD_ENV_VARS: tuple[str, ...] = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
     "MKL_NUM_THREADS",
 )
 
+#: Every field this worker's request transport recognises. Anything else is
+#: rejected rather than silently ignored -- a typo'd field name (`"horizonn"`)
+#: must fail loudly, not be dropped on the floor while the request quietly
+#: falls back to defaults.
+_KNOWN_REQUEST_FIELDS = frozenset(
+    {
+        "artifact_id",
+        "model_version",
+        "horizon",
+        "n_paths",
+        "seed",
+        "initial_state",
+        "rng_scheme",
+        "return_variance",
+        "risk_levels",
+        "governance",
+    }
+)
 
-def _effective_thread_counts() -> dict[str, str | None]:
+_KNOWN_INITIAL_STATE_LITERALS = ("historical_mix", "latest")
+
+
+def _effective_thread_env() -> dict[str, str | None]:
     return {name: os.environ.get(name) for name in THREAD_ENV_VARS}
 
 
+def _verify_thread_contract() -> list[dict[str, object]]:
+    """Inspect the *actually loaded* BLAS/OpenMP thread pools and fail closed
+    if any resolved to more than one thread.
+
+    ``threadpoolctl.threadpool_info()`` introspects the real libraries NumPy/
+    SciPy loaded into this process -- this is what makes the single-thread
+    contract *verified* rather than merely *logged*. Confirmed directly: with
+    ``OMP_NUM_THREADS=1``/``OPENBLAS_NUM_THREADS=1``/``MKL_NUM_THREADS=1`` set
+    this reports 1 thread; with them overridden to 4 (simulating a
+    ``docker run -e`` override of the Dockerfile's baked-in values) it
+    correctly reports 4.
+    """
+    pools: list[dict[str, object]] = list(threadpoolctl.threadpool_info())
+
+    def _num_threads(pool: dict[str, object]) -> int:
+        value = pool.get("num_threads")
+        return int(value) if isinstance(value, int) else 1
+
+    violations = [pool for pool in pools if _num_threads(pool) > 1]
+    if violations:
+        raise WorkerThreadContractError(
+            "the single-thread contract is violated by the actually loaded "
+            f"numerical runtime: {violations}"
+        )
+    return pools
+
+
+def _require_field(data: dict[str, object], key: str) -> object:
+    if key not in data:
+        raise WorkerInputError(f"request is missing required field: {key!r}")
+    return data[key]
+
+
+def _require_strict_int(data: dict[str, object], key: str, *, minimum: int) -> int:
+    """A JSON value that is a genuine integer (never a bool, never a float
+    that merely happens to be integral, never a numeric string) and at
+    least ``minimum``. No ``int()`` coercion anywhere: ``horizon: 5.5`` or
+    ``horizon: "5"`` must be rejected, not silently truncated or parsed.
+    """
+    value = _require_field(data, key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise WorkerInputError(f"request.{key} must be an integer, got {value!r}")
+    if value < minimum:
+        raise WorkerInputError(f"request.{key} must be >= {minimum}, got {value}")
+    return value
+
+
+def _require_strict_bool(data: dict[str, object], key: str, *, default: bool) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise WorkerInputError(f"request.{key} must be a boolean, got {value!r}")
+    return value
+
+
+def _require_finite_number(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise WorkerInputError(f"{label} must be a number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise WorkerInputError(f"{label} must be finite, got {number}")
+    return number
+
+
+def _parse_initial_state(data: dict[str, object]) -> str | tuple[float, float]:
+    raw = data.get("initial_state", "historical_mix")
+    if isinstance(raw, str):
+        if raw not in _KNOWN_INITIAL_STATE_LITERALS:
+            raise WorkerInputError(
+                f"request.initial_state {raw!r} is not supported; expected one "
+                f"of {_KNOWN_INITIAL_STATE_LITERALS} or a [residual, variance] array"
+            )
+        return raw
+    if isinstance(raw, list):
+        if len(raw) != 2:
+            raise WorkerInputError(
+                "request.initial_state as an array must have exactly 2 elements "
+                "(residual, variance)"
+            )
+        residual = _require_finite_number(raw[0], "request.initial_state[0] (residual)")
+        variance = _require_finite_number(raw[1], "request.initial_state[1] (variance)")
+        if not variance > 0.0:
+            raise WorkerInputError(
+                f"request.initial_state variance must be strictly positive, got {variance}"
+            )
+        return (residual, variance)
+    raise WorkerInputError(
+        f"request.initial_state must be a string or a 2-element array, got {raw!r}"
+    )
+
+
+def _parse_governance(data: dict[str, object]) -> GovernanceCap | None:
+    raw = data.get("governance")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or "cap" not in raw or "approver" not in raw:
+        raise WorkerInputError(
+            "request.governance must be an object with 'cap' and 'approver' string fields"
+        )
+    cap, approver = raw["cap"], raw["approver"]
+    if not isinstance(cap, str) or not cap or not isinstance(approver, str) or not approver:
+        raise WorkerInputError(
+            "request.governance.cap and .approver must be non-empty strings"
+        )
+    return GovernanceCap(cap=cap, approver=approver)
+
+
+def _parse_risk_levels(
+    data: dict[str, object], governance: GovernanceCap | None
+) -> tuple[float, ...]:
+    raw = data.get("risk_levels", [0.95, 0.99])
+    if not isinstance(raw, list) or not raw:
+        raise WorkerInputError("request.risk_levels must be a non-empty array")
+    levels: list[float] = []
+    for entry in raw:
+        level = _require_finite_number(entry, "request.risk_levels entry")
+        if not (0.0 < level < 1.0):
+            raise WorkerInputError(
+                f"request.risk_levels entries must be strictly between 0 and 1, got {level}"
+            )
+        levels.append(level)
+    # Reuse Phase 1's own policy module (never re-derive its rule): a level
+    # the tail-metric policy restricts (Section 8.5) must be rejected here,
+    # deliberately, as a normal INPUT rejection -- not left to fall through
+    # to the generic internal-error handler as an "unexpected" exception.
+    for level in levels:
+        try:
+            check_metric_request("tail expectation", level=level, governance=governance)
+        except PolicyRejection as exc:
+            raise WorkerInputError(f"risk level {level} rejected by policy: {exc}") from exc
+    return tuple(levels)
+
+
 def _parse_request(path: Path) -> tuple[str, ScenarioRequest, RiskConfig]:
-    """Read and validate the worker's request document.
+    """Read and strictly validate the worker's request document.
 
     Returns ``(expected_artifact_id, scenario_request, risk_config)``.
     Every failure here is a :class:`WorkerInputError` -- this function never
     lets a bare ``KeyError``/``TypeError``/``json.JSONDecodeError`` escape,
     because those would be misclassified as INTERNAL by the top-level
-    handler rather than the INPUT failure they actually are.
+    handler rather than the INPUT failure they actually are. Nothing here
+    duplicates a quantitative formula: every check is a transport-level
+    shape/type/range check, and the actual domain rules
+    (``ScenarioRequest.__post_init__``, ``policies.check_metric_request``)
+    still run, unchanged, on the values this function produces.
     """
     try:
         raw_text = path.read_text(encoding="utf-8")
@@ -112,49 +301,64 @@ def _parse_request(path: Path) -> tuple[str, ScenarioRequest, RiskConfig]:
     if not isinstance(data, dict):
         raise WorkerInputError(f"request file {path} must contain a JSON object")
 
-    required = ("artifact_id", "model_version", "horizon", "n_paths", "seed")
-    missing = [field for field in required if field not in data]
-    if missing:
-        raise WorkerInputError(f"request is missing required field(s): {missing}")
+    unknown = set(data) - _KNOWN_REQUEST_FIELDS
+    if unknown:
+        raise WorkerInputError(f"request contains unsupported field(s): {sorted(unknown)}")
 
-    artifact_id = data["artifact_id"]
+    artifact_id = _require_field(data, "artifact_id")
     if not isinstance(artifact_id, str) or not artifact_id:
         raise WorkerInputError("request.artifact_id must be a non-empty string")
 
-    initial_state: object = data.get("initial_state", "historical_mix")
-    if isinstance(initial_state, list):
-        if len(initial_state) != 2:
-            raise WorkerInputError(
-                "request.initial_state as an array must have exactly 2 elements "
-                "(residual, variance)"
-            )
-        try:
-            initial_state = (float(initial_state[0]), float(initial_state[1]))
-        except (TypeError, ValueError) as exc:
-            raise WorkerInputError(f"invalid request.initial_state: {exc}") from exc
+    model_version = _require_field(data, "model_version")
+    if not isinstance(model_version, str) or not model_version:
+        raise WorkerInputError("request.model_version must be a non-empty string")
+
+    horizon = _require_strict_int(data, "horizon", minimum=1)
+    n_paths = _require_strict_int(data, "n_paths", minimum=1)
+    seed = _require_strict_int(data, "seed", minimum=0)
+    return_variance = _require_strict_bool(data, "return_variance", default=False)
+    initial_state = _parse_initial_state(data)
+
+    rng_scheme = data.get("rng_scheme", "single")
+    if not isinstance(rng_scheme, str):
+        raise WorkerInputError(f"request.rng_scheme must be a string, got {rng_scheme!r}")
+
+    governance = _parse_governance(data)
+    risk_levels = _parse_risk_levels(data, governance)
 
     try:
         scenario_request = ScenarioRequest(
-            model_version=data["model_version"],
-            horizon=int(data["horizon"]),
-            n_paths=int(data["n_paths"]),
-            seed=int(data["seed"]),
+            model_version=model_version,
+            horizon=horizon,
+            n_paths=n_paths,
+            seed=seed,
             initial_state=initial_state,  # type: ignore[arg-type]
-            rng_scheme=data.get("rng_scheme", "single"),
-            return_variance=bool(data.get("return_variance", False)),
+            rng_scheme=rng_scheme,  # type: ignore[arg-type]
+            return_variance=return_variance,
         )
     except (TypeError, ValueError) as exc:
         raise WorkerInputError(f"invalid request: {exc}") from exc
 
-    risk_levels = data.get("risk_levels", [0.95, 0.99])
-    if not isinstance(risk_levels, list) or not risk_levels:
-        raise WorkerInputError("request.risk_levels must be a non-empty array")
-    try:
-        risk_config = RiskConfig(levels=tuple(float(x) for x in risk_levels))
-    except (TypeError, ValueError) as exc:
-        raise WorkerInputError(f"invalid request.risk_levels: {exc}") from exc
-
+    risk_config = RiskConfig(levels=risk_levels)
     return artifact_id, scenario_request, risk_config
+
+
+#: Exceptions load_artifact (or the metadata/state parsing inside it) is
+#: known to raise for a malformed-but-present artifact, narrowly scoped to
+#: that one call so an unrelated bug elsewhere is never relabelled as an
+#: artifact problem. Confirmed empirically against real malformed inputs
+#: (bad JSON, bad encoding, a missing metadata key, a missing dataclass
+#: field, an unsupported transport schema, a truncated/empty .npz).
+_MALFORMED_ARTIFACT_EXCEPTIONS: tuple[type[Exception], ...] = (
+    OSError,
+    json.JSONDecodeError,
+    UnicodeDecodeError,
+    KeyError,
+    TypeError,
+    TransportSchemaError,
+    zipfile.BadZipFile,
+    EOFError,
+)
 
 
 def _load_and_verify_artifact(
@@ -163,16 +367,25 @@ def _load_and_verify_artifact(
     """Load the artifact and enforce Section 8.3's two integrity checks.
 
     ``serialization.load_artifact`` already calls ``artifact.verify_identity()``
-    unconditionally (fail-closed on the artifact disagreeing with *itself*);
-    this function adds the second check Section 8.3 names explicitly --
-    "compares [the recomputed id] with the id named in the job request" --
-    which is a caller/loader-scoped check, not an artifact-scoped one.
+    unconditionally (fail-closed on the artifact disagreeing with *itself*,
+    raising :class:`ArtifactIntegrityError`, and
+    :class:`ArtifactValidationError` for structurally invalid fitted state
+    -- both propagate through this function untouched, already correctly
+    classified). This function additionally normalises every other
+    *malformed-artifact* failure mode load_artifact can raise -- invalid
+    JSON, invalid encoding, a missing metadata/state field, an unsupported
+    transport schema, a truncated/empty NPZ -- to
+    :class:`ArtifactIntegrityError` too, and adds the second check Section
+    8.3 names explicitly: "compares [the recomputed id] with the id named
+    in the job request."
     """
     try:
         artifact = serialization.load_artifact(artifact_dir)
-    except OSError as exc:
+    except (ArtifactIntegrityError, ArtifactValidationError):
+        raise
+    except _MALFORMED_ARTIFACT_EXCEPTIONS as exc:
         raise ArtifactIntegrityError(
-            f"artifact could not be read from {artifact_dir}: {exc}"
+            f"artifact could not be read from {artifact_dir}: {type(exc).__name__}: {exc}"
         ) from exc
 
     if artifact.artifact_id != expected_artifact_id:
@@ -198,9 +411,10 @@ def _risk_report_to_dict(report: RiskReport) -> dict[str, Any]:
 
 def _write_outputs_atomically(
     output_dir: Path,
-    returns: npt.NDArray[np.float64],
+    returns_npy_bytes: bytes,
     risk_report: RiskReport,
     manifest: dict[str, Any],
+    variances_npy_bytes: bytes | None,
 ) -> None:
     """Stage every output file, then publish them with atomic per-file renames.
 
@@ -213,30 +427,77 @@ def _write_outputs_atomically(
     Staging inside the (already-writable, contract-guaranteed-empty)
     ``output_dir`` sidesteps both problems.
 
-    ``os.replace`` on a POSIX filesystem is an atomic ``rename(2)``; renaming
-    a file within the same directory is always same-filesystem and therefore
-    always atomic. The three files are published in a fixed order with
-    ``manifest.json`` **last**, deliberately: it is this worker's own
-    definition of "the result is complete," so a consumer (or a test) that
-    checks for its presence before trusting ``returns.npy``/``risk_report.json``
-    can never observe a half-published result. Any failure while staging or
-    publishing removes the staging directory and re-raises.
+    **Single-writer enforcement.** An exclusive lock file
+    (``os.O_CREAT | os.O_EXCL``, atomic on POSIX -- including over NFS on
+    modern kernels, though older NFS versions are a documented exception to
+    ``O_EXCL`` atomicity) is claimed in ``output_dir`` before any staging
+    happens, and released in a ``finally`` regardless of outcome. This is
+    what actually *prevents* two concurrent invocations from interleaving
+    their publications into a mixed result -- the "output directory must
+    already be empty" check the caller performs earlier is necessary but not
+    sufficient on its own (two processes can both pass that check before
+    either has written anything).
+
+    **Publication order and manifest-last.** ``os.replace`` on a POSIX
+    filesystem is an atomic ``rename(2)``; renaming a file within the same
+    directory is always same-filesystem and therefore always atomic *per
+    file*. Files are published in a fixed order with ``manifest.json``
+    **last**, deliberately: it is this worker's own definition of "the
+    result is complete," so a consumer that checks for its presence before
+    trusting the other files can never observe a half-published result as
+    complete.
+
+    **On a handled failure**, every file *this invocation* already
+    published is removed again (best-effort) before re-raising -- a
+    pre-existing, unrelated file in ``output_dir`` is never touched, and
+    ``manifest.json`` in particular can never be left behind by a failure,
+    because it is only ever added to the rollback-tracked list after its
+    own ``os.replace`` has already succeeded, at which point there is
+    nothing left to fail. This cannot protect against the process being
+    killed outright (no Python code runs to clean up after a SIGKILL) --
+    that residual risk is why consumers must gate on ``manifest.json``,
+    not on this function's best effort alone.
     """
-    staging = Path(tempfile.mkdtemp(prefix=".worker-staging-", dir=output_dir))
+    lock_path = output_dir / ".worker-lock"
     try:
-        np.save(staging / "returns.npy", returns, allow_pickle=False)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except FileExistsError as exc:
+        raise WorkerConcurrentPublishError(
+            f"another invocation is already publishing to {output_dir} "
+            f"({lock_path.name} already exists)"
+        ) from exc
+
+    staging = Path(tempfile.mkdtemp(prefix=".worker-staging-", dir=output_dir))
+    published: list[Path] = []
+    try:
+        (staging / "returns.npy").write_bytes(returns_npy_bytes)
         (staging / "risk_report.json").write_text(
             json.dumps(_risk_report_to_dict(risk_report), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        if variances_npy_bytes is not None:
+            (staging / "variances.npy").write_bytes(variances_npy_bytes)
         (staging / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        os.replace(staging / "returns.npy", output_dir / "returns.npy")
-        os.replace(staging / "risk_report.json", output_dir / "risk_report.json")
-        os.replace(staging / "manifest.json", output_dir / "manifest.json")
+
+        publish_order = ["returns.npy", "risk_report.json"]
+        if variances_npy_bytes is not None:
+            publish_order.append("variances.npy")
+        publish_order.append("manifest.json")
+
+        for name in publish_order:
+            destination = output_dir / name
+            os.replace(staging / name, destination)
+            published.append(destination)
+    except BaseException:
+        for path in published:
+            path.unlink(missing_ok=True)
+        raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+        lock_path.unlink(missing_ok=True)
 
 
 def _cmd_simulate(args: argparse.Namespace) -> int:
@@ -252,12 +513,14 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
             "artifact_dir": str(artifact_dir),
             "request_path": str(request_path),
             "output_dir": str(output_dir),
-            "thread_env": _effective_thread_counts(),
+            "thread_env": _effective_thread_env(),
         },
     )
 
     error_class: str | None = None
     try:
+        thread_pools = _verify_thread_contract()
+
         if output_dir.exists() and any(output_dir.iterdir()):
             raise WorkerInputError(
                 f"output directory {output_dir} already exists and is not empty"
@@ -269,15 +532,42 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         scenario_set = run_simulate(artifact, scenario_request)
         risk_report = compute_risk(scenario_set, risk_config)
 
-        returns_digest = (
-            "sha256:"
-            + hashlib.sha256(
-                np.ascontiguousarray(scenario_set.returns).tobytes()
-            ).hexdigest()
-        )
+        # Two distinct digests, deliberately never confused (see the
+        # manifest field comments below): the ARRAY digest is sha256 of the
+        # contiguous float64 array bytes alone (`ndarray.tobytes()`) -- this
+        # is what the Phase-1 golden value is defined over, and what every
+        # replay test compares. The FILE digest is sha256 of the complete
+        # .npy file (a small header -- magic bytes, version, a dtype/shape/
+        # order descriptor -- prepended to those same array bytes); recorded
+        # separately because it is what a consumer fetching the file from
+        # storage and hashing it as-is would actually get, and the two must
+        # never be silently treated as interchangeable.
+        returns_array_bytes = np.ascontiguousarray(scenario_set.returns).tobytes()
+        returns_digest = "sha256:" + hashlib.sha256(returns_array_bytes).hexdigest()
+        returns_npy_buffer = io.BytesIO()
+        np.save(returns_npy_buffer, scenario_set.returns, allow_pickle=False)
+        returns_npy_bytes = returns_npy_buffer.getvalue()
+        returns_npy_file_digest = "sha256:" + hashlib.sha256(returns_npy_bytes).hexdigest()
+
+        variances_digest = None
+        variances_npy_bytes = None
+        if scenario_set.variances is not None:
+            variances_array_bytes = np.ascontiguousarray(scenario_set.variances).tobytes()
+            variances_digest = "sha256:" + hashlib.sha256(variances_array_bytes).hexdigest()
+            variances_npy_buffer = io.BytesIO()
+            np.save(variances_npy_buffer, scenario_set.variances, allow_pickle=False)
+            variances_npy_bytes = variances_npy_buffer.getvalue()
 
         finished_at = datetime.now(tz=UTC)
         duration_ms = (time.monotonic() - t0) * 1000.0
+
+        outputs: dict[str, str] = {
+            "returns": "returns.npy",
+            "risk_report": "risk_report.json",
+            "manifest": "manifest.json",
+        }
+        if scenario_set.variances is not None:
+            outputs["variances"] = "variances.npy"
 
         manifest: dict[str, Any] = {
             "schema_version": "scenario-core/worker-manifest/v1",
@@ -298,13 +588,24 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
                 "return_variance": scenario_request.return_variance,
             },
             "risk_levels": list(risk_config.levels),
-            "outputs": {
-                "returns": "returns.npy",
-                "risk_report": "risk_report.json",
-                "manifest": "manifest.json",
-            },
+            "outputs": outputs,
             "returns_shape": list(scenario_set.returns.shape),
-            "returns_sha256": returns_digest,
+            # "Scenario array digest" == sha256 of the contiguous float64
+            # ARRAY BYTES (`ndarray.tobytes()`), never of the complete .npy
+            # file (which additionally carries a header: magic bytes,
+            # version, a dtype/shape/order descriptor, and padding). The two
+            # are deliberately different digests -- see
+            # `returns_npy_file_sha256` -- and only the array-bytes digest
+            # is ever compared against the Phase-1 golden value
+            # (sha256:637920e5...fb3c255).
+            "returns_array_sha256": returns_digest,
+            "returns_npy_file_sha256": returns_npy_file_digest,
+            "variances_shape": (
+                list(scenario_set.variances.shape)
+                if scenario_set.variances is not None
+                else None
+            ),
+            "variances_array_sha256": variances_digest,
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
             "duration_ms": duration_ms,
@@ -312,7 +613,8 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
                 "python_version": platform.python_version(),
                 "platform_machine": platform.machine(),
                 "platform_system": platform.system(),
-                "thread_env": _effective_thread_counts(),
+                "thread_env": _effective_thread_env(),
+                "thread_pools": thread_pools,
                 "worker_image_ref": os.environ.get("WORKER_IMAGE_REF"),
                 "worker_git_sha": os.environ.get("WORKER_GIT_SHA"),
             },
@@ -324,14 +626,16 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         # a pre-existing bind-mounted volume) holds no result files until
         # every one of them is atomically published into it.
         output_dir.mkdir(parents=True, exist_ok=True)
-        _write_outputs_atomically(output_dir, scenario_set.returns, risk_report, manifest)
+        _write_outputs_atomically(
+            output_dir, returns_npy_bytes, risk_report, manifest, variances_npy_bytes
+        )
 
         LOGGER.info(
             "simulate succeeded",
             extra={
                 "artifact_id": artifact.artifact_id,
                 "model_version": artifact.model_version,
-                "returns_sha256": returns_digest,
+                "returns_array_sha256": returns_digest,
                 "returns_shape": list(scenario_set.returns.shape),
                 "duration_ms": duration_ms,
             },

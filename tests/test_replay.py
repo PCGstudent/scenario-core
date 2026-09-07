@@ -32,6 +32,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,7 +52,12 @@ GOLDEN_SCENARIO_DIGEST = (
     "sha256:637920e584b8e82449a67b84bfc39b73528256aa6518d8ca8280087b9fb3c255"
 )
 
-IMAGE_TAG = "scenario-core-worker:phase2"
+# Overridable so the acceptance script (scripts/run_container_acceptance.sh)
+# can point these tests at the exact immutable image ID it just built
+# (`sha256:...`), not just whatever the mutable tag currently resolves to --
+# `docker` accepts an image ID anywhere a tag is accepted, so no other
+# change is needed for that to work.
+IMAGE_TAG = os.environ.get("SCENARIO_WORKER_IMAGE", "scenario-core-worker:phase2")
 DOCKERFILE = Path(__file__).parent.parent / "docker" / "worker.Dockerfile"
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -103,6 +109,15 @@ def _run_worker(argv: list[str]) -> tuple[int, list[dict[str, object]]]:
 
     lines = [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
     return exit_code, lines
+
+
+# Thread pinning for this whole test session is set in tests/conftest.py, at
+# import time, before numpy is first imported anywhere in the process -- see
+# that file's docstring for why a per-test monkeypatch.setenv cannot work
+# here (OpenBLAS reads these env vars once, at first load, not per-call).
+# Every ordinary test below therefore runs with the same single-thread
+# contract the production container's Dockerfile ENV provides, without
+# needing its own fixture.
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +387,264 @@ def test_nonempty_output_directory_is_rejected(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 2b. Strict request validation: no coercion, no unknown fields, finite
+#     numeric ranges, and policy handled deliberately (not as INTERNAL).
+# ---------------------------------------------------------------------------
+
+
+def _assert_request_rejected(tmp_path, request: dict[str, object]) -> str:
+    request_path = tmp_path / "request.json"
+    _write_request(request_path, request)
+    exit_code, logs = _run_worker(
+        [
+            "simulate",
+            "--artifact-dir",
+            str(FIXTURE_DIR),
+            "--request",
+            str(request_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    assert exit_code == ExitCode.INPUT
+    assert not (tmp_path / "output").exists()
+    error_logs = [line for line in logs if line["level"] == "ERROR"]
+    assert error_logs
+    return str(error_logs[0]["error"])
+
+
+def test_unknown_request_field_is_rejected(tmp_path):
+    """A typo'd field name must fail loudly, not be silently ignored."""
+    error = _assert_request_rejected(tmp_path, _golden_request(horizonn=252))
+    assert "horizonn" in error
+
+
+def test_fractional_horizon_is_rejected(tmp_path):
+    """No int() coercion: 252.5 is not silently truncated to 252."""
+    error = _assert_request_rejected(tmp_path, _golden_request(horizon=252.5))
+    assert "horizon" in error
+
+
+def test_string_n_paths_is_rejected(tmp_path):
+    """No int() coercion: "1000" is not silently parsed."""
+    error = _assert_request_rejected(tmp_path, _golden_request(n_paths="1000"))
+    assert "n_paths" in error
+
+
+def test_boolean_seed_is_rejected(tmp_path):
+    """bool is an int subclass in Python -- must be explicitly excluded."""
+    error = _assert_request_rejected(tmp_path, _golden_request(seed=True))
+    assert "seed" in error
+
+
+def test_negative_seed_is_rejected(tmp_path):
+    error = _assert_request_rejected(tmp_path, _golden_request(seed=-1))
+    assert "seed" in error
+
+
+def test_zero_horizon_is_rejected(tmp_path):
+    error = _assert_request_rejected(tmp_path, _golden_request(horizon=0))
+    assert "horizon" in error
+
+
+def test_zero_n_paths_is_rejected(tmp_path):
+    error = _assert_request_rejected(tmp_path, _golden_request(n_paths=0))
+    assert "n_paths" in error
+
+
+def test_non_boolean_return_variance_is_rejected(tmp_path):
+    """No bool() coercion: 1 is not silently accepted as True."""
+    error = _assert_request_rejected(tmp_path, _golden_request(return_variance=1))
+    assert "return_variance" in error
+
+
+def test_non_finite_initial_state_value_is_rejected(tmp_path):
+    error = _assert_request_rejected(
+        tmp_path, _golden_request(initial_state=[float("nan"), 1.0])
+    )
+    assert "initial_state" in error
+
+
+def test_non_positive_initial_state_variance_is_rejected(tmp_path):
+    error = _assert_request_rejected(tmp_path, _golden_request(initial_state=[0.5, 0.0]))
+    assert "variance" in error
+
+
+def test_unsupported_initial_state_literal_is_rejected(tmp_path):
+    error = _assert_request_rejected(tmp_path, _golden_request(initial_state="bogus_mode"))
+    assert "initial_state" in error
+
+
+def test_risk_level_at_or_beyond_boundary_is_rejected(tmp_path):
+    """Strictly between 0 and 1 -- 1.0 itself is out of range."""
+    error = _assert_request_rejected(tmp_path, _golden_request(risk_levels=[1.0]))
+    assert "risk_levels" in error
+
+
+def test_non_finite_risk_level_is_rejected(tmp_path):
+    error = _assert_request_rejected(tmp_path, _golden_request(risk_levels=[float("inf")]))
+    assert "risk_levels" in error
+
+
+def test_policy_restricted_risk_level_is_rejected_as_input_not_internal(tmp_path):
+    """A 99.9% tail-expectation risk level is restricted by Phase 1's own
+    policy module (policies.check_metric_request) -- this must be handled
+    deliberately as an ordinary INPUT rejection, never fall through to the
+    generic internal-error handler as though it were unexpected."""
+    error = _assert_request_rejected(tmp_path, _golden_request(risk_levels=[0.999]))
+    assert "policy" in error.lower()
+
+
+def test_policy_restricted_risk_level_is_permitted_with_governance(tmp_path):
+    """The same restricted level, with an explicit governance cap, must
+    succeed -- proving the rejection above is a real, working policy check
+    and not a blanket ban on anything past 0.99."""
+    request_path = tmp_path / "request.json"
+    _write_request(
+        request_path,
+        _golden_request(
+            risk_levels=[0.999],
+            governance={"cap": "stress-review-2026", "approver": "risk-committee"},
+        ),
+    )
+    exit_code, _logs = _run_worker(
+        [
+            "simulate",
+            "--artifact-dir",
+            str(FIXTURE_DIR),
+            "--request",
+            str(request_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    assert exit_code == ExitCode.SUCCESS
+
+
+def test_return_variance_true_writes_variances_npy(tmp_path):
+    """return_variance=true must produce a real variances.npy, not silently
+    discard the requested output."""
+    request_path = tmp_path / "request.json"
+    _write_request(
+        request_path, _golden_request(horizon=30, n_paths=10, return_variance=True)
+    )
+    output_dir = tmp_path / "output"
+    exit_code, _logs = _run_worker(
+        [
+            "simulate",
+            "--artifact-dir",
+            str(FIXTURE_DIR),
+            "--request",
+            str(request_path),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+    assert exit_code == ExitCode.SUCCESS
+    assert (output_dir / "variances.npy").exists()
+    variances = np.load(output_dir / "variances.npy")
+    assert variances.shape == (10, 30)
+    assert np.isfinite(variances).all()
+    assert (variances > 0).all()
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["outputs"]["variances"] == "variances.npy"
+    assert manifest["variances_array_sha256"] is not None
+
+
+def test_return_variance_false_writes_no_variances_npy(tmp_path):
+    """The negative control for the test above: without return_variance,
+    no variances.npy is written at all (not an empty/placeholder one)."""
+    request_path = tmp_path / "request.json"
+    _write_request(request_path, _golden_request(horizon=30, n_paths=10))
+    output_dir = tmp_path / "output"
+    exit_code, _logs = _run_worker(
+        [
+            "simulate",
+            "--artifact-dir",
+            str(FIXTURE_DIR),
+            "--request",
+            str(request_path),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+    assert exit_code == ExitCode.SUCCESS
+    assert not (output_dir / "variances.npy").exists()
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert "variances" not in manifest["outputs"]
+
+
+# ---------------------------------------------------------------------------
+# 2c. Artifact-loading boundary: every malformed-artifact exception is
+#     normalised to ARTIFACT_INTEGRITY, narrowly, at that one boundary.
+# ---------------------------------------------------------------------------
+
+
+def _assert_artifact_rejected(tmp_path, artifact_dir: Path) -> None:
+    request_path = tmp_path / "request.json"
+    _write_request(request_path, _golden_request())
+    exit_code, logs = _run_worker(
+        [
+            "simulate",
+            "--artifact-dir",
+            str(artifact_dir),
+            "--request",
+            str(request_path),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    assert exit_code == ExitCode.ARTIFACT_INTEGRITY
+    assert not (tmp_path / "output").exists()
+    error_logs = [line for line in logs if line["level"] == "ERROR"]
+    assert error_logs
+    assert error_logs[0]["error_class"] == "ARTIFACT_INTEGRITY"
+
+
+def test_invalid_json_artifact_metadata_is_artifact_integrity(tmp_path):
+    artifact_dir = _copy_fixture(tmp_path)
+    (artifact_dir / "artifact.json").write_text("not json{{{", encoding="utf-8")
+    _assert_artifact_rejected(tmp_path, artifact_dir)
+
+
+def test_invalid_encoding_artifact_metadata_is_artifact_integrity(tmp_path):
+    artifact_dir = _copy_fixture(tmp_path)
+    (artifact_dir / "artifact.json").write_bytes(b"\xff\xfe\x00not utf8")
+    _assert_artifact_rejected(tmp_path, artifact_dir)
+
+
+def test_missing_metadata_key_is_artifact_integrity(tmp_path):
+    artifact_dir = _copy_fixture(tmp_path)
+    metadata_path = artifact_dir / "artifact.json"
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    del data["params"]
+    metadata_path.write_text(json.dumps(data), encoding="utf-8")
+    _assert_artifact_rejected(tmp_path, artifact_dir)
+
+
+def test_missing_dataclass_field_is_artifact_integrity(tmp_path):
+    artifact_dir = _copy_fixture(tmp_path)
+    metadata_path = artifact_dir / "artifact.json"
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+    del data["params"]["mu"]
+    metadata_path.write_text(json.dumps(data), encoding="utf-8")
+    _assert_artifact_rejected(tmp_path, artifact_dir)
+
+
+def test_truncated_npz_is_artifact_integrity(tmp_path):
+    artifact_dir = _copy_fixture(tmp_path)
+    state_path = artifact_dir / "state.npz"
+    state_path.write_bytes(state_path.read_bytes()[:50])
+    _assert_artifact_rejected(tmp_path, artifact_dir)
+
+
+def test_empty_npz_is_artifact_integrity(tmp_path):
+    artifact_dir = _copy_fixture(tmp_path)
+    (artifact_dir / "state.npz").write_bytes(b"")
+    _assert_artifact_rejected(tmp_path, artifact_dir)
+
+
+# ---------------------------------------------------------------------------
 # 3. Exit-code / error_class table and structured logging
 # ---------------------------------------------------------------------------
 
@@ -440,6 +713,224 @@ def test_effective_thread_counts_are_logged_at_startup(tmp_path, monkeypatch):
         "OPENBLAS_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
     }
+
+
+# ---------------------------------------------------------------------------
+# 3b. Runtime thread contract (direct lane): the worker must detect, not
+#     just log, a numerical runtime that resolved to more than one thread.
+# ---------------------------------------------------------------------------
+
+
+def test_thread_contract_violation_is_detected_and_rejected(tmp_path):
+    """Env-var overrides cannot be simulated mid-process -- OpenBLAS reads
+    OMP_NUM_THREADS/OPENBLAS_NUM_THREADS/MKL_NUM_THREADS exactly once, at
+    first load (see tests/conftest.py's docstring) -- so this uses
+    threadpoolctl's own dynamic limiter (the same introspection layer the
+    worker's ``_verify_thread_contract`` itself calls) to make the loaded
+    runtime genuinely report >1 threads, proving detection independent of
+    *why* the violation occurred. The container test below proves the
+    specific ``docker run -e`` env-var-override scenario end-to-end, where
+    env vars *do* still work (each container run is a fresh process).
+    """
+    import threadpoolctl
+
+    request_path = tmp_path / "request.json"
+    _write_request(request_path, _golden_request())
+
+    with threadpoolctl.threadpool_limits(limits=4):
+        exit_code, logs = _run_worker(
+            [
+                "simulate",
+                "--artifact-dir",
+                str(FIXTURE_DIR),
+                "--request",
+                str(request_path),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+    assert exit_code == ExitCode.INTERNAL
+    assert not (tmp_path / "output").exists()
+    error_logs = [line for line in logs if line["level"] == "ERROR"]
+    assert error_logs
+    assert error_logs[0]["error_type"] == "WorkerThreadContractError"
+
+
+# ---------------------------------------------------------------------------
+# 3c. Publication mechanism (white-box): the CLI's own "--output-dir must be
+# empty" precondition makes a pre-existing-unrelated-file scenario
+# unreachable through main() (test_nonempty_output_directory_is_rejected
+# above already proves that whole-request rejection preserves such a file);
+# these tests instead call _write_outputs_atomically directly to prove the
+# narrower, lower-level mechanism itself -- rollback on a handled failure,
+# and the single-writer lock -- exactly as documented in that function's
+# own docstring. Deliberately below the CLI boundary: these are internal
+# mechanisms with no other way to construct the scenario.
+# ---------------------------------------------------------------------------
+
+
+def _minimal_risk_report():
+    from scenario_platform.domain.reports import RiskReport
+
+    return RiskReport(
+        artifact_id=GOLDEN_ARTIFACT_ID,
+        horizon=10,
+        n_paths=4,
+        var_es={0.95: (1.0, 1.5)},
+        max_drawdown_median=0.1,
+    )
+
+
+def test_failure_during_staging_leaves_no_manifest_and_preserves_unrelated_files(
+    tmp_path, monkeypatch
+):
+    """A failure while *staging* (before any file has even been published
+    into ``output_dir``) must still leave the pre-existing unrelated file
+    alone and publish nothing at all."""
+    import scenario_platform.worker.__main__ as worker_main
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "unrelated.txt").write_text("keep me", encoding="utf-8")
+
+    real_write_text = Path.write_text
+
+    def flaky_write_text(self, *args, **kwargs):
+        if self.name == "risk_report.json":
+            raise OSError("simulated staging failure")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write_text)
+
+    with pytest.raises(OSError, match="simulated staging failure"):
+        worker_main._write_outputs_atomically(
+            output_dir,
+            b"\x93NUMPY fake returns bytes",
+            _minimal_risk_report(),
+            {"schema_version": "test"},
+            None,
+        )
+
+    assert (output_dir / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
+    assert not (output_dir / "manifest.json").exists()
+    assert not (output_dir / "returns.npy").exists()
+    remaining = {p.name for p in output_dir.iterdir()}
+    assert remaining == {"unrelated.txt"}
+
+
+def test_failure_between_file_publications_rolls_back_and_preserves_unrelated_files(
+    tmp_path, monkeypatch
+):
+    """returns.npy publishes successfully; risk_report.json's publish is
+    then made to fail. Must prove: returns.npy is rolled back (no partial
+    result), manifest.json never appears, and the pre-existing unrelated
+    file is untouched."""
+    import scenario_platform.worker.__main__ as worker_main
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "unrelated.txt").write_text("keep me", encoding="utf-8")
+
+    real_replace = worker_main.os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the second publish call: risk_report.json
+            raise OSError("simulated failure between file publications")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(worker_main.os, "replace", flaky_replace)
+
+    with pytest.raises(OSError, match="simulated failure between file publications"):
+        worker_main._write_outputs_atomically(
+            output_dir,
+            b"\x93NUMPY fake returns bytes",
+            _minimal_risk_report(),
+            {"schema_version": "test"},
+            None,
+        )
+
+    assert (output_dir / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
+    assert not (output_dir / "manifest.json").exists()
+    assert not (output_dir / "returns.npy").exists()  # rolled back
+    assert not (output_dir / "risk_report.json").exists()
+    remaining = {p.name for p in output_dir.iterdir()}
+    assert remaining == {"unrelated.txt"}
+
+
+def test_concurrent_publish_to_the_same_output_dir_is_rejected(tmp_path):
+    """Enforces the single-writer assumption: a lock file already present
+    (as if another invocation's _write_outputs_atomically were mid-flight)
+    must cause an immediate, atomic rejection -- not a race where both
+    writers proceed and interleave their files."""
+    from scenario_platform.worker.__main__ import _write_outputs_atomically
+    from scenario_platform.worker.errors import WorkerConcurrentPublishError
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / ".worker-lock").touch()
+
+    with pytest.raises(WorkerConcurrentPublishError):
+        _write_outputs_atomically(
+            output_dir,
+            b"\x93NUMPY fake returns bytes",
+            _minimal_risk_report(),
+            {"schema_version": "test"},
+            None,
+        )
+    # The pre-existing lock file (simulating the other writer's) is left
+    # alone -- this call never owned it, so it must not remove it.
+    assert (output_dir / ".worker-lock").exists()
+
+
+# ---------------------------------------------------------------------------
+# 3d. Digest terminology: array-bytes digest vs. complete-.npy-file digest
+#     are genuinely different values, never confused.
+# ---------------------------------------------------------------------------
+
+
+def test_array_digest_and_npy_file_digest_are_different_and_both_correct(tmp_path):
+    request_path = tmp_path / "request.json"
+    _write_request(request_path, _golden_request())
+    output_dir = tmp_path / "output"
+
+    exit_code, _logs = _run_worker(
+        [
+            "simulate",
+            "--artifact-dir",
+            str(FIXTURE_DIR),
+            "--request",
+            str(request_path),
+            "--output-dir",
+            str(output_dir),
+        ]
+    )
+    assert exit_code == ExitCode.SUCCESS
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+
+    array_digest = manifest["returns_array_sha256"]
+    file_digest = manifest["returns_npy_file_sha256"]
+    assert array_digest != file_digest  # the .npy header makes them genuinely different
+
+    # The array digest -- and only the array digest -- is the one ever
+    # compared against the Phase-1 golden value.
+    assert array_digest == GOLDEN_SCENARIO_DIGEST
+
+    returns = np.load(output_dir / "returns.npy")
+    recomputed_array_digest = (
+        "sha256:"
+        + __import__("hashlib").sha256(np.ascontiguousarray(returns).tobytes()).hexdigest()
+    )
+    assert recomputed_array_digest == array_digest
+
+    recomputed_file_digest = (
+        "sha256:"
+        + __import__("hashlib")
+        .sha256((output_dir / "returns.npy").read_bytes())
+        .hexdigest()
+    )
+    assert recomputed_file_digest == file_digest
 
 
 # ---------------------------------------------------------------------------
@@ -652,13 +1143,150 @@ def _parse_docker_size(text: str) -> float:
 
 @_requires_built_image
 def test_image_size_is_at_most_700mb():
+    # ``docker images <ref>``'s positional filter only matches a
+    # repository[:tag] reference, never an image ID -- it silently returns
+    # no rows (confirmed directly) when IMAGE_TAG is instead a raw
+    # "sha256:..." ID, which SCENARIO_WORKER_IMAGE deliberately sets it to
+    # for acceptance runs (see scripts/run_container_acceptance.sh), so
+    # that this suite tests the exact immutable image just built rather
+    # than whatever a mutable tag happens to currently point at. Listing
+    # every image with --no-trunc and matching the full ID text works for
+    # both a tag and an ID.
     result = subprocess.run(
-        ["docker", "images", IMAGE_TAG, "--format", "{{.Size}}"],
+        ["docker", "images", "--no-trunc", "--format", "{{.ID}} {{.Size}}"],
         capture_output=True,
         text=True,
         check=True,
     )
-    size_bytes = _parse_docker_size(result.stdout.strip().splitlines()[0])
+    matches = [
+        line.split(" ", 1)[1]
+        for line in result.stdout.strip().splitlines()
+        if line.split(" ", 1)[0] in (IMAGE_TAG, f"sha256:{IMAGE_TAG}")
+    ]
+    if not matches:
+        # Fall back to a direct tag/reference filter for the common case of
+        # a human tag such as "scenario-core-worker:phase2".
+        tag_result = subprocess.run(
+            ["docker", "images", IMAGE_TAG, "--format", "{{.Size}}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        matches = tag_result.stdout.strip().splitlines()
+    assert matches, f"no `docker images` row found for {IMAGE_TAG!r}"
+    size_bytes = _parse_docker_size(matches[0])
     assert size_bytes <= 700 * 1000 * 1000, (
         f"image is {size_bytes / 1_000_000:.1f} MB, over the 700 MB ceiling"
     )
+
+
+@_requires_built_image
+def test_container_actual_thread_counts_are_single_threaded(tmp_path):
+    """Not the env vars -- the *actual* threadpoolctl-reported thread pools
+    inside the container, matching the check the worker itself performs."""
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            "linux/amd64",
+            "--entrypoint",
+            "python",
+            IMAGE_TAG,
+            "-c",
+            "import numpy, scipy, threadpoolctl, json; "
+            "print(json.dumps(threadpoolctl.threadpool_info()))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    pools = json.loads(result.stdout.strip().splitlines()[-1])
+    assert pools, "expected at least one BLAS/OpenMP pool to be reported"
+    for pool in pools:
+        assert pool["num_threads"] == 1, pool
+
+
+@_requires_built_image
+def test_container_runtime_thread_override_cannot_silently_violate_the_contract(tmp_path):
+    """The specific ``docker run -e`` scenario: a caller overrides the
+    Dockerfile's baked-in ``OMP_NUM_THREADS=1`` at container-start time.
+    Because each ``docker run`` is a fresh process, the override *does* take
+    effect (unlike the in-process direct-lane test above) -- and the worker
+    must detect it and fail closed rather than silently computing
+    multi-threaded."""
+    request_path = tmp_path / "request.json"
+    _write_request(request_path, _golden_request())
+    output_dir = tmp_path / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            "linux/amd64",
+            "-e",
+            "OMP_NUM_THREADS=4",
+            "-e",
+            "OPENBLAS_NUM_THREADS=4",
+            "-v",
+            f"{FIXTURE_DIR}:/artifact:ro",
+            "-v",
+            f"{request_path}:/request.json:ro",
+            "-v",
+            f"{output_dir}:/output",
+            IMAGE_TAG,
+            "simulate",
+            "--artifact-dir",
+            "/artifact",
+            "--request",
+            "/request.json",
+            "--output-dir",
+            "/output",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == ExitCode.INTERNAL, result.stdout + result.stderr
+    assert "WorkerThreadContractError" in result.stdout
+    assert not any(output_dir.iterdir())
+
+
+@_requires_built_image
+def test_container_cold_import_time_is_recorded():
+    """Records (does not gate on) the time to import the worker's entry
+    point module inside the container -- a budget per Phase 2's own Files
+    bullet ("cold-import time recorded as budgets"), printed for the
+    acceptance script/report to pick up rather than asserted against an
+    arbitrary threshold this test would otherwise have to invent."""
+    result = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--platform",
+            "linux/amd64",
+            "--entrypoint",
+            "python",
+            IMAGE_TAG,
+            "-c",
+            "import time; t0 = time.monotonic(); "
+            "import scenario_platform.worker.__main__; "
+            "print(f'cold_import_seconds={time.monotonic() - t0:.3f}')",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    line = next(
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith("cold_import_seconds=")
+    )
+    seconds = float(line.split("=", 1)[1])
+    print(f"\ncold-import time: {seconds:.3f}s")
+    assert seconds > 0

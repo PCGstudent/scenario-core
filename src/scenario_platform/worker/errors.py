@@ -61,12 +61,26 @@ class ExitCode(IntEnum):
 #: infrastructure-classified (see module docstring) and listed here only so
 #: this table is the single, complete reference the architecture plan's
 #: vocabulary maps onto -- not because this process can produce them.
+#:
+#: ``137`` in particular is **not, by itself, proof of an OOM kill** -- it is
+#: only "this process was terminated by signal 9 (128 + SIGKILL)." A cgroup
+#: OOM kill is the most common cause on ECS/Fargate, but 9 is also what an
+#: operator's own ``docker kill``, an orchestrator eviction, or a health-check
+#: timeout sends. Section 6.3's own classifier does not take 137 as
+#: sufficient either: it additionally requires ``OutOfMemoryError`` in the
+#: task's ``stoppedReason`` before assigning ``RESOURCE``. Phase 2 has no
+#: such corroborating signal available (no orchestrator), so this table
+#: records 137 -> RESOURCE as the *documented mapping once that evidence
+#: exists*, not as a claim this process -- or Phase 2 -- can make on exit
+#: code alone.
 ERROR_CLASS_BY_EXIT_CODE: dict[int, str | None] = {
     ExitCode.SUCCESS: None,
     ExitCode.INPUT: "INPUT",
     ExitCode.ARTIFACT_INTEGRITY: "ARTIFACT_INTEGRITY",
     ExitCode.INTERNAL: "INTERNAL",
-    # Infrastructure-classified; never emitted by this process (see above).
+    # Infrastructure-classified; never emitted by this process (see above),
+    # and never assigned from the exit code alone even once an orchestrator
+    # exists -- see the paragraph above.
     137: "RESOURCE",
 }
 
@@ -106,4 +120,38 @@ class WorkerArtifactMismatchError(RuntimeError):
     later, in S3) holds another.
 
     Maps to :attr:`ExitCode.ARTIFACT_INTEGRITY`.
+    """
+
+
+class WorkerThreadContractError(RuntimeError):
+    """A loaded numerical thread pool resolved to more than one thread.
+
+    Raised by the runtime-contract check in ``worker/__main__.py``, which
+    inspects the *actual* BLAS/OpenMP thread pools NumPy/SciPy loaded (via
+    ``threadpoolctl``) rather than trusting the ``OMP_NUM_THREADS``/
+    ``OPENBLAS_NUM_THREADS``/``MKL_NUM_THREADS`` environment variables the
+    Dockerfile sets -- a stale value, a BLAS build that ignores the
+    variable, or a ``docker run -e`` override at container-start time would
+    otherwise leave the worker silently running multi-threaded, which
+    threatens the same determinism the whole artifact/identity design
+    exists to protect (thread count affects floating-point reduction
+    order). No mapped exit code of its own: this is an unexpected runtime
+    misconfiguration, not a request or artifact problem, so it falls
+    through to the generic handler and maps to :attr:`ExitCode.INTERNAL`.
+    """
+
+
+class WorkerConcurrentPublishError(WorkerInputError):
+    """Another invocation is already publishing to this ``--output-dir``.
+
+    Enforces the single-writer assumption documented in
+    ``_write_outputs_atomically``'s docstring: an exclusive lock file
+    (``os.O_CREAT | os.O_EXCL``, atomic on POSIX) is claimed before any
+    output is staged, so two concurrent invocations targeting the same
+    directory can never interleave their publications into a mixed result.
+    A subclass of :class:`WorkerInputError` (not a bare ``RuntimeError``)
+    specifically so it maps to :attr:`ExitCode.INPUT` through the same
+    handler, with no separate except-clause needed: pointing two concurrent
+    jobs at the same output directory is a caller/orchestration error, not
+    something this process can recover from on its own.
     """
