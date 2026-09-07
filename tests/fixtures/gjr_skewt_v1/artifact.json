@@ -1,0 +1,37 @@
+{
+  "artifact_id": "sha256:240a70185846dceae611110679961b7f50da865434d63b9664dc793de431bb51",
+  "diagnostics": {
+    "effective_persistence": 0.9934537319779158,
+    "finite_fourth_moment": false,
+    "finite_second_moment": true,
+    "finite_third_moment": false,
+    "fourth_moment_coefficient": 1.0457287681804976,
+    "hill_tail_index": 2.938267777315983,
+    "implied_return_tail_index": 2.696406312923382,
+    "implied_unconditional_variance": 8.621320441342538
+  },
+  "family": "gjr-skewt",
+  "model_version": "gjr-skewt-20260907-1",
+  "params": {
+    "alpha": 0.06533542086737432,
+    "beta": 0.9092331920019019,
+    "eta": 5.293353706608654,
+    "gamma": 0.03443493520764589,
+    "lam": -0.1214611662580453,
+    "mu": -0.0002602721641458575,
+    "omega": 0.05643747431330189
+  },
+  "policy_set_version": "v1",
+  "provenance": {
+    "calibration_timestamp": "2026-09-07T07:33:21.103989+00:00",
+    "calibration_window_end": "2026-09-01",
+    "calibration_window_start": "2010-01-01",
+    "dataset_id": "sha256:e3c44c9e347067bce31a0f644d17fdac62414aa1a65e8885b5de431eb36c74cf",
+    "dataset_uri": "local://.cache/BZF_2010-01-01_2026-09-01",
+    "dependency_lock_hash": null,
+    "git_sha": null
+  },
+  "schema_version": "scenario-core/artifact/v1",
+  "threshold_set_version": "v1",
+  "transport_schema": "scenario-core/artifact-transport/v1"
+}

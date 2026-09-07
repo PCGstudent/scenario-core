@@ -2486,8 +2486,14 @@ destroyable milestone where the network and storage substrate can be proved corr
   * Stored structural diagnostics match a live recomputation to 1e-10.
   * **Policy tests:** VaR 95/99 and ES 95/99 are **not** restricted; a 99.9 % tail expectation **is**
     restricted; pooled skewness/kurtosis cannot be returned as point estimates.
-* **Acceptance.** One artifact reproduces every number in `reports/run_manifest.json` for the pinned
-  dataset, and its `artifact_id` is stable across re-serialisation.
+* **Acceptance.** The frozen artifact reproduces every *deterministic, seed-controlled* number in
+  `reports/run_manifest.json` for the pinned dataset bit-for-bit — simulation, validation gate counts,
+  and matched-reference percentiles (Tier 1, §16.2). The fitted parameters themselves are Tier 3:
+  refitting the same `dataset_id` within one image digest reproduces them to the documented ≤ 1e-9
+  relative bound, but the committed manifest was not produced within this repository's current image
+  digest, so no bit-level parameter claim is made against it (§16.2's "across image digests" case) —
+  compared under that explicit contract, not an ad-hoc tolerance. The artifact's `artifact_id` is
+  stable across re-serialisation.
 * **Rollback.** Delete the package; the core is untouched.
 * **Complexity.** Medium (4–6 days). The serialisation is easy; the identity scheme and the proofs are
   the work.

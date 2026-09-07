@@ -106,3 +106,15 @@ files = ["src/scenario_platform"]
 strict = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+
+# pandas 2.2.3 (the pinned scientific-stack version, [project.dependencies])
+# ships without inline type information mypy strict mode accepts, and adding
+# `pandas-stubs` would be a new dev dependency purely for this. The domain
+# layer's own use of pandas is limited to one parameter type
+# (`pd.Series` in fit()/validate()'s signatures) and the values inside it are
+# converted to plain numpy immediately -- so ignoring pandas' own missing
+# stubs costs no real type-safety here, unlike ignoring xtra_takehome's own
+# code would.
+[[tool.mypy.overrides]]
+module = "pandas.*"
+ignore_missing_imports = true
