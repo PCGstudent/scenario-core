@@ -7,6 +7,52 @@ preparing this PR (see "What has and has not been verified" below) --
 `tests/test_terraform_policy.py` are static analysis, not a deployment
 plan or a deployment.
 
+## Deployment-readiness corrections applied since the first draft
+
+A review pass found five concrete gaps between `gha-ci-dev`'s IAM policy
+and what `envs/dev` actually manages, plus one workflow injection risk.
+All are fixed, with structural regression tests
+(`tests/test_terraform_policy.py`) that would have caught each one:
+
+1. **ECR image layers were unreachable.** The S3 gateway endpoint policy
+   only allowed the two project buckets; ECR stores every image layer in
+   its own AWS-managed bucket, reached over that same endpoint. Added the
+   exact, minimal `s3:GetObject` grant AWS's own ECR documentation
+   specifies (`arn:aws:s3:::prod-{region}-starport-layer-bucket/*`).
+2. **The permissions boundary would have blocked its own probe role and
+   silently denied unrelated IAM calls.** `iam:PermissionsBoundary` was
+   applied to `GetRole`/policy reads that do not carry that condition key
+   (AWS's own IAM User Guide example places those in a separate,
+   unconditioned statement) -- as written, this would have denied those
+   calls outright. Separately, the runtime boundary was missing
+   `ecr:DescribeRepositories`, which the probe task role's own policy
+   grants -- the boundary would have capped it below its own policy,
+   failing the connectivity probe's ECR check with `AccessDenied` despite
+   looking correctly authorised. Both probe roles were also missing the
+   `permissions_boundary` argument entirely, which would have made
+   `gha-ci-dev`'s own boundary-conditioned `CreateRole` grant refuse to
+   create them at all. Also added: explicit denies preventing `gha-ci-dev`
+   from modifying its own policies/trust policy, replacing/removing a
+   role's boundary, or rewriting the boundary policy's own content
+   (AWS's own example calls this last one "NoBoundaryPolicyEdit"). Also
+   corrected an inaccurate claim that EC2 VPC-family *create* actions
+   lack resource-level permission support -- verified against AWS's own
+   documentation, they don't; only pure `Describe`/`List` actions do.
+   Added ECS cluster/task-definition and CloudWatch Logs management for
+   the probe resources, which `gha-ci-dev` could not previously touch.
+3. **`s3:DeleteObject` was granted across the whole state bucket.**
+   Restricted to exactly the `.tflock` lock object HashiCorp's own S3
+   native-locking documentation specifies; the state object itself now
+   only ever gets `GetObject`/`PutObject`.
+4. **The workflow's confirmation input was interpolated directly into
+   shell source** -- a documented GitHub Actions script-injection vector.
+   Moved through a step `env:` variable instead. `id-token: write` was
+   also workflow-wide; it is now job-scoped to the two jobs that actually
+   authenticate to AWS.
+
+None of these required a broader service wildcard to fix -- each is a
+narrowly scoped addition, restriction, or explicit deny.
+
 ## Region and accounts
 
 | | Value | Source |
@@ -29,7 +75,7 @@ architecture document alone.
 | `modules/job_store` | 2 DynamoDB tables (scenario-jobs, model-registry) |
 | `modules/worker_image` | 1 ECR repository + lifecycle policy |
 | `modules/network` | 1 VPC, 2 private subnets, 1 route table, 2 security groups, 1 locked-down default security group, 2 gateway endpoints (S3, DynamoDB), 3 interface endpoints (ecr.api, ecr.dkr, logs), 1 flow-log S3 bucket + `aws_flow_log` |
-| `modules/ci_oidc` | 1 OIDC provider, 1 IAM role (`gha-ci-dev`) + 5 inline policies, 1 permissions-boundary IAM policy |
+| `modules/ci_oidc` | 1 OIDC provider, 1 IAM role (`gha-ci-dev`) + 7 inline policies, 1 permissions-boundary IAM policy |
 | `envs/dev/probe.tf` | 1 ECS cluster, 2 IAM roles (probe execution/task), 1 CloudWatch log group, 1 ECS task definition (Phase 3a acceptance tooling -- see below) |
 
 Nothing from Phase 3b (ECS *service*/task launched as a standing

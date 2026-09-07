@@ -37,6 +37,12 @@ locals {
   # Deterministic, matching bootstrap/main.tf's naming exactly -- see
   # backend.tf's comment for why this is duplicated rather than looked up.
   state_bucket_arn = "arn:aws:s3:::4xtra-${var.environment}-tfstate-${data.aws_caller_identity.current.account_id}"
+
+  # Duplicated from backend.tf's own `key` argument, for the same reason:
+  # a `backend` block cannot reference a variable or module output, so
+  # this is the one other place that value must be repeated literally.
+  # Keep the two in sync by hand if the backend key ever changes.
+  state_object_key = "envs/dev/terraform.tfstate"
 }
 
 # --- KMS -------------------------------------------------------------------
@@ -117,6 +123,7 @@ module "ci_oidc" {
   github_ref              = var.github_ref
   resource_name_prefix    = "4xtra-${var.environment}"
   state_bucket_arn        = local.state_bucket_arn
+  state_object_key        = local.state_object_key
   bootstrap_kms_key_arn   = data.aws_kms_alias.tfstate.target_key_arn
   environment_kms_key_arn = module.kms.key_arn
   artifacts_bucket_arn    = module.artifact_store.artifacts_bucket_arn

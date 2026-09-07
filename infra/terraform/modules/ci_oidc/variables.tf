@@ -26,6 +26,11 @@ variable "state_bucket_arn" {
   description = "ARN of the Terraform state bucket (bootstrap output) -- read/write access, plus the deny-delete protection."
 }
 
+variable "state_object_key" {
+  type        = string
+  description = "The exact S3 key this environment's Terraform state lives at (matches envs/dev/backend.tf's `key` argument exactly). State read/write and the lock-object's read/write/delete are both scoped to this one key (plus \".tflock\" for the lock object) -- never a bucket-wide wildcard."
+}
+
 variable "bootstrap_kms_key_arn" {
   type        = string
   description = "ARN of the bootstrap CMK that encrypts the state bucket (bootstrap output) -- decrypt/encrypt access for state I/O, plus the deny-delete protection."

@@ -100,6 +100,12 @@ data "aws_iam_policy_document" "runtime_role_boundary" {
       "ecr:GetDownloadUrlForLayer",
       "ecr:BatchGetImage",
       "ecr:BatchCheckLayerAvailability",
+      # Confirmed against the probe task role's own inline policy
+      # (envs/dev/probe.tf, "EcrReachability"): without this action here,
+      # the boundary would cap that role below what its own policy grants
+      # it, and the connectivity probe's ECR reachability check would
+      # fail with AccessDenied despite appearing correctly authorised.
+      "ecr:DescribeRepositories",
       "states:StartExecution",
       "states:DescribeExecution",
       "states:StopExecution",

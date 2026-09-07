@@ -34,6 +34,23 @@ name: Deploy DEV
 # the AWS trust decision: OIDC authorises this GitHub Actions job by its
 # repository and ref (Section 13.2's `sub` condition), never by anything
 # about the machine executing it.
+#
+# JOB ORDERING AND ITS FIRST-BOOTSTRAP PREREQUISITE: `build-and-push` and
+# `terraform-apply` both depend only on `guard` and run IN PARALLEL with
+# each other -- nothing in Phase 3a's Terraform resource graph consumes
+# the pushed image (see above), so there is no data dependency between
+# them today, and running them concurrently is strictly faster. This is
+# safe ONLY because `build-and-push` pushes into an ECR repository that
+# must already exist before this workflow can run at all: `gha-ci-dev`
+# (which both jobs authenticate as) is created by the SAME first-time,
+# human-credentialed `envs/dev` apply that also creates the
+# `worker_image` module's repository (infra/terraform/bootstrap/README.md,
+# step 3) -- by construction, this workflow never gets to run for the
+# very first time before that repository exists. If a future phase makes
+# `terraform-apply` responsible for creating the repository on an
+# ordinary (non-bootstrap) run -- which Phase 3a's design does not do --
+# `build-and-push` would need an explicit `needs: terraform-apply`
+# instead of running in parallel.
 
 on:
   workflow_dispatch:
@@ -51,13 +68,14 @@ concurrency:
   group: deploy-dev
   cancel-in-progress: false
 
+# Workflow-level default: read-only, nothing else. `id-token: write` (the
+# permission that lets `aws-actions/configure-aws-credentials` mint an
+# OIDC token at all) is granted per-job below, only on the two jobs that
+# actually authenticate to AWS -- `guard` runs no AWS action and gets no
+# OIDC permission at all, following the same least-privilege discipline
+# Section 13.1 applies to IAM roles, applied here to workflow permissions.
 permissions:
   contents: read
-  # The one permission this workflow needs beyond `contents: read`: GitHub
-  # mints the OIDC token `aws-actions/configure-aws-credentials` exchanges
-  # for temporary AWS credentials (Section 13.2). No AWS access key exists
-  # in this repository's secrets, in DEV or PROD.
-  id-token: write
 
 env:
   AWS_REGION: eu-west-1
@@ -67,10 +85,24 @@ jobs:
   guard:
     name: Confirm deliberate dispatch
     runs-on: [self-hosted, linux, x64, scenario-core]
+    permissions:
+      contents: read
     steps:
       - name: Require the exact confirmation phrase
+        # inputs.confirm is caller-supplied text. Interpolating
+        # ${{ inputs.confirm }} directly into the shell script source
+        # (as an earlier version of this workflow did) is a documented
+        # GitHub Actions script-injection vector: GitHub substitutes the
+        # literal value into the YAML before bash ever runs it, so a
+        # value containing shell metacharacters (backticks, `$(...)`)
+        # would execute as code on this runner. Passing it through `env:`
+        # and comparing the resulting environment variable is the
+        # GitHub-documented mitigation -- the value is then just data to
+        # the shell, never source text.
+        env:
+          CONFIRM_INPUT: ${{ inputs.confirm }}
         run: |
-          if [ "${{ inputs.confirm }}" != "deploy" ]; then
+          if [ "$CONFIRM_INPUT" != "deploy" ]; then
             echo "::error::Input 'confirm' must be exactly \"deploy\" -- refusing to proceed." >&2
             exit 1
           fi
@@ -79,6 +111,12 @@ jobs:
     name: Build worker image, push to DEV ECR
     needs: guard
     runs-on: [self-hosted, linux, x64, scenario-core]
+    permissions:
+      contents: read
+      # GitHub mints the OIDC token `aws-actions/configure-aws-credentials`
+      # exchanges for temporary AWS credentials (Section 13.2). No AWS
+      # access key exists in this repository's secrets, in DEV or PROD.
+      id-token: write
     outputs:
       image_digest: ${{ steps.push.outputs.image_digest }}
       image_ref: ${{ steps.push.outputs.image_ref }}
@@ -136,6 +174,9 @@ jobs:
     name: terraform apply (envs/dev)
     needs: guard
     runs-on: [self-hosted, linux, x64, scenario-core]
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

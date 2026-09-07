@@ -21,22 +21,41 @@ locals {
 # --- 1. Terraform state I/O ------------------------------------------------
 
 data "aws_iam_policy_document" "state_access" {
+  # Bucket-level listing only -- needed for Terraform's own backend
+  # initialisation/state-existence checks, and carries no ability to read
+  # or write any object's content.
   statement {
-    sid    = "StateBucketReadWrite"
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:PutObject",
-      "s3:ListBucket",
-      # S3 native locking (Terraform 1.10+, `use_lockfile = true`) writes
-      # and later removes a `.tflock` object per state key -- Terraform
-      # itself needs delete on that one object, not on the state object.
-      "s3:DeleteObject",
-    ]
-    resources = [
-      var.state_bucket_arn,
-      "${var.state_bucket_arn}/*",
-    ]
+    sid       = "StateBucketList"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [var.state_bucket_arn]
+  }
+
+  # The state object itself: read/write, never delete. Scoped to the
+  # EXACT key this environment's backend.tf uses
+  # (envs/dev/backend.tf: key = "envs/dev/terraform.tfstate") -- not a
+  # `/*` wildcard across the whole bucket, since nothing else is ever
+  # meant to live at another key in this environment's state bucket.
+  statement {
+    sid       = "StateObjectReadWrite"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${var.state_bucket_arn}/${var.state_object_key}"]
+  }
+
+  # The lock object only: HashiCorp's own S3-native-locking documentation
+  # ("If use_lockfile is set, s3:GetObject, s3:PutObject, and
+  # s3:DeleteObject are required on the lock file, e.g.
+  # arn:aws:s3:::mybucket/path/to/my/key.tflock") is explicit that
+  # s3:DeleteObject belongs on the LOCK file -- literally the state key
+  # with ".tflock" appended -- never on the state object itself. Deleting
+  # the actual state object is not a Terraform operation this role
+  # performs, ever.
+  statement {
+    sid       = "StateLockObjectReadWriteDelete"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+    resources = ["${var.state_bucket_arn}/${var.state_object_key}.tflock"]
   }
 
   statement {
@@ -65,6 +84,12 @@ data "aws_iam_policy_document" "resource_management" {
     effect = "Allow"
     actions = [
       "s3:CreateBucket",
+      # Needed for `terraform destroy` (Phase 3a acceptance criterion 1:
+      # "terraform apply and terraform destroy are both clean"). The
+      # guardrails statement below explicitly denies this same action on
+      # the state and artifacts buckets specifically, so this broad grant
+      # never actually reaches those two.
+      "s3:DeleteBucket",
       "s3:PutBucketVersioning",
       "s3:PutBucketPolicy",
       "s3:GetBucketPolicy",
@@ -127,6 +152,10 @@ data "aws_iam_policy_document" "resource_management" {
       "kms:GetKeyRotationStatus",
       "kms:TagResource",
       "kms:UntagResource",
+      # The read counterpart to TagResource -- KMS tag listing is its own
+      # action, not implied by TagResource (unlike some services where a
+      # single action covers both directions).
+      "kms:ListResourceTags",
       "kms:ScheduleKeyDeletion",
       "kms:CancelKeyDeletion",
       "kms:EnableKey",
@@ -165,6 +194,7 @@ data "aws_iam_policy_document" "resource_management" {
       "ecr:PutImageScanningConfiguration",
       "ecr:TagResource",
       "ecr:UntagResource",
+      "ecr:ListTagsForResource",
     ]
     resources = [
       "arn:aws:ecr:${var.region}:${local.account_id}:repository/${local.prefix}-*",
@@ -180,56 +210,89 @@ resource "aws_iam_role_policy" "resource_management" {
 
 # --- 3. Networking (VPC, subnets, endpoints, flow logs, security groups) --
 #
-# EC2's VPC-family resources are the well-documented exception to
-# resource-level IAM scoping: most Describe*/Create* actions for VPCs,
-# subnets, route tables, security groups and VPC endpoints do not support
-# resource-level permissions at all (AWS service-authorization reference),
-# and a create-time condition cannot name an ARN that does not exist yet.
-# Every action below is enumerated in
-# infra/terraform/policy/resource-star-allowlist.yaml, deployment-role
-# section, with this same justification -- never granted to any runtime
-# role.
+# Corrected from an earlier, inaccurate claim that EC2's VPC-family
+# actions "do not support resource-level permissions at all." Verified
+# directly against the AWS Service Authorization Reference and AWS's own
+# guidance on tag-based EC2 access control: EC2 Create* actions in this
+# family DO have documented resource types (e.g. CreateVpc -> `vpc`,
+# CreateSecurityGroup -> `security-group` and `vpc`) and DO support
+# resource-level ARN scoping and tag-on-create condition keys
+# (`aws:RequestTag`) -- the true, narrower exception is the pure
+# Describe*/List* actions, which read across an unbounded set of
+# resources and genuinely have no resource-level support in EC2, the
+# same as in most AWS services. The statement below is split
+# accordingly: resource-type-scoped ARNs for every action that supports
+# them, and a separate, honestly-labelled Resource="*" statement only for
+# the Describe*/List* actions that do not. Tag-on-create condition
+# enforcement (`aws:RequestTag`) is deliberately not added on top of the
+# resource-type scoping in this pass -- its interaction with the
+# provider's own `default_tags` merge behaviour is not something this
+# repository can verify without a real `terraform apply`, and getting it
+# wrong risks breaking the very deployment this PR is trying to make
+# possible, which is a worse outcome than the narrower, already-real
+# improvement of resource-type scoping alone.
 data "aws_iam_policy_document" "network_management" {
-  #checkov:skip=CKV_AWS_111:EC2 VPC-family actions (VPC/subnet/route-table/security-group/endpoint create and describe) do not support resource-level IAM permissions per the AWS service authorization reference; a create-time condition cannot name an ARN that does not exist yet. Enumerated in infra/terraform/policy/resource-star-allowlist.yaml, deployment-role section. Never granted to a runtime role.
-  #checkov:skip=CKV_AWS_356:Same EC2 resource-level-permission limitation as above.
   statement {
-    sid    = "Ec2NetworkManagement"
+    sid    = "Ec2ResourceScopedManagement"
     effect = "Allow"
     actions = [
       "ec2:CreateVpc",
       "ec2:DeleteVpc",
-      "ec2:DescribeVpcs",
       "ec2:ModifyVpcAttribute",
-      "ec2:DescribeVpcAttribute",
       "ec2:CreateSubnet",
       "ec2:DeleteSubnet",
-      "ec2:DescribeSubnets",
       "ec2:ModifySubnetAttribute",
       "ec2:CreateRouteTable",
       "ec2:DeleteRouteTable",
-      "ec2:DescribeRouteTables",
       "ec2:CreateRoute",
       "ec2:DeleteRoute",
       "ec2:AssociateRouteTable",
       "ec2:DisassociateRouteTable",
       "ec2:CreateSecurityGroup",
       "ec2:DeleteSecurityGroup",
-      "ec2:DescribeSecurityGroups",
       "ec2:AuthorizeSecurityGroupIngress",
       "ec2:RevokeSecurityGroupIngress",
       "ec2:AuthorizeSecurityGroupEgress",
       "ec2:RevokeSecurityGroupEgress",
       "ec2:CreateVpcEndpoint",
       "ec2:DeleteVpcEndpoints",
-      "ec2:DescribeVpcEndpoints",
       "ec2:ModifyVpcEndpoint",
-      "ec2:DescribeAvailabilityZones",
-      "ec2:DescribePrefixLists",
       "ec2:CreateFlowLogs",
       "ec2:DeleteFlowLogs",
-      "ec2:DescribeFlowLogs",
       "ec2:CreateTags",
       "ec2:DeleteTags",
+    ]
+    resources = [
+      "arn:aws:ec2:${var.region}:${local.account_id}:vpc/*",
+      "arn:aws:ec2:${var.region}:${local.account_id}:subnet/*",
+      "arn:aws:ec2:${var.region}:${local.account_id}:route-table/*",
+      "arn:aws:ec2:${var.region}:${local.account_id}:security-group/*",
+      "arn:aws:ec2:${var.region}:${local.account_id}:vpc-endpoint/*",
+      "arn:aws:ec2:${var.region}:${local.account_id}:vpc-flow-log/*",
+    ]
+  }
+
+  # Genuinely resource-level-permission-free: pure Describe*/List*
+  # actions that read across an unbounded resource set rather than
+  # acting on one identified resource. This is the true, narrower
+  # exception -- enumerated in
+  # infra/terraform/policy/resource-star-allowlist.yaml, deployment-role
+  # section. Never granted to a runtime role.
+  #checkov:skip=CKV_AWS_111:Describe*/List* EC2 actions have no resource-level IAM support (they read across an unbounded resource set, not one identified resource) -- the true, narrower exception, distinct from the Create/Modify actions above which ARE now resource-type scoped. Enumerated in infra/terraform/policy/resource-star-allowlist.yaml.
+  #checkov:skip=CKV_AWS_356:Same Describe/List limitation as above.
+  statement {
+    sid    = "Ec2DescribeOnly"
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeVpcs",
+      "ec2:DescribeVpcAttribute",
+      "ec2:DescribeSubnets",
+      "ec2:DescribeRouteTables",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeVpcEndpoints",
+      "ec2:DescribeAvailabilityZones",
+      "ec2:DescribePrefixLists",
+      "ec2:DescribeFlowLogs",
       "ec2:DescribeTags",
       # Explicitly NOT granted, anywhere, to any role: ec2:CreateInternetGateway,
       # ec2:AttachInternetGateway, ec2:CreateNatGateway,
@@ -248,6 +311,85 @@ resource "aws_iam_role_policy" "network_management" {
   name   = "network-management"
   role   = aws_iam_role.gha_ci_dev.id
   policy = data.aws_iam_policy_document.network_management.json
+}
+
+# --- 3b. Probe ECS cluster/task definition + CloudWatch Logs management --
+#
+# envs/dev/probe.tf's one-off connectivity-probe plumbing (Phase 3a
+# acceptance criterion 3) is not itself one of the six documented Phase
+# 3a modules, but gha-ci-dev still has to be able to create, refresh and
+# destroy exactly what it defines: one ECS cluster, one task definition,
+# one CloudWatch log group, plus the two IAM roles already covered by
+# section 5 below.
+data "aws_iam_policy_document" "probe_and_observability_management" {
+  statement {
+    sid    = "EcsClusterManagement"
+    effect = "Allow"
+    actions = [
+      "ecs:CreateCluster",
+      "ecs:DeleteCluster",
+      "ecs:DescribeClusters",
+      "ecs:TagResource",
+      "ecs:UntagResource",
+      "ecs:ListTagsForResource",
+    ]
+    resources = [
+      "arn:aws:ecs:${var.region}:${local.account_id}:cluster/${local.prefix}-*",
+      "arn:aws:ecs:${var.region}:${local.account_id}:task-definition/${local.prefix}-*",
+    ]
+  }
+
+  statement {
+    # Confirmed against AWS's own ECS IAM documentation and a tracked
+    # containers-roadmap feature request (aws/containers-roadmap#929):
+    # task-definition actions have NO resource-level permission support
+    # at all today -- Resource must be "*" for exactly these three
+    # actions. A genuinely different limitation from EC2's (corrected
+    # above): ECS's own docs state this explicitly as a still-open gap,
+    # not an assumption. Enumerated in
+    # infra/terraform/policy/resource-star-allowlist.yaml.
+    sid    = "EcsTaskDefinitionRegistration"
+    effect = "Allow"
+    actions = [
+      "ecs:RegisterTaskDefinition",
+      "ecs:DeregisterTaskDefinition",
+      "ecs:DescribeTaskDefinition",
+      "ecs:ListTaskDefinitions",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "ProbeLogGroupManagement"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:DeleteLogGroup",
+      "logs:DescribeLogGroups",
+      "logs:PutRetentionPolicy",
+      "logs:AssociateKmsKey",
+      # Both the pre- and post-migration CloudWatch Logs tagging action
+      # names are granted here since this repository has not run a real
+      # `terraform apply` to observe which one the pinned provider
+      # version (~> 6.63) actually calls -- granting both is the accurate
+      # response to that uncertainty, not a guess dressed up as either.
+      "logs:TagResource",
+      "logs:UntagResource",
+      "logs:ListTagsForResource",
+      "logs:TagLogGroup",
+      "logs:UntagLogGroup",
+      "logs:ListTagsLogGroup",
+    ]
+    resources = [
+      "arn:aws:logs:${var.region}:${local.account_id}:log-group:/4xtra/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "probe_and_observability_management" {
+  name   = "probe-and-observability-management"
+  role   = aws_iam_role.gha_ci_dev.id
+  policy = data.aws_iam_policy_document.probe_and_observability_management.json
 }
 
 # --- 4. Worker image push (BUILD ONCE step of deploy-dev.yml) -------------
@@ -290,23 +432,80 @@ resource "aws_iam_role_policy" "image_push" {
 # --- 5. IAM: create later phases' runtime roles, boundary-enforced --------
 
 data "aws_iam_policy_document" "iam_management" {
+  # Boundary-conditioned. Verified against AWS's own IAM User Guide
+  # ("Permissions boundaries for IAM entities", the worked
+  # `CreateOrChangeOnlyWithBoundary` example): the `iam:PermissionsBoundary`
+  # condition key checks "the specified policy is attached as permissions
+  # boundary on the IAM principal resource" -- for a role that does not
+  # yet carry that boundary (or carries none at all), the key is absent
+  # from the request context and `StringEquals` on a missing key evaluates
+  # false, so the statement simply does not match. AWS's own example
+  # bundles exactly this action set -- Create*/PutPolicy/Attach/Detach/
+  # DeletePolicy -- under one such condition; Get/Update/Delete/List/Tag
+  # actions are deliberately NOT included here (see the next statement)
+  # because AWS's own example puts those in a separate, unconditioned
+  # statement instead, and there is no basis to assume they carry this
+  # context key reliably.
+  #
+  # gha-ci-dev's own role is explicitly excluded below (guardrails'
+  # "DenySelfPolicyModification"), belt-and-suspenders on top of the
+  # structural fact that gha-ci-dev itself carries no boundary and so
+  # could never satisfy this condition against itself anyway.
   statement {
-    sid    = "CreateProjectScopedRoles"
+    sid    = "CreateOrModifyRolePoliciesOnlyWithBoundary"
     effect = "Allow"
     actions = [
       "iam:CreateRole",
-      "iam:DeleteRole",
-      "iam:GetRole",
-      "iam:UpdateRole",
       "iam:PutRolePolicy",
-      "iam:GetRolePolicy",
-      "iam:DeleteRolePolicy",
       "iam:AttachRolePolicy",
       "iam:DetachRolePolicy",
+      "iam:DeleteRolePolicy",
+    ]
+    resources = [
+      "arn:aws:iam::${local.account_id}:role/${local.prefix}-*",
+    ]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PermissionsBoundary"
+      values   = [aws_iam_policy.runtime_role_boundary.arn]
+    }
+  }
+
+  # Unconditioned: reads and role lifecycle that do not carry (or cannot
+  # be relied on to carry) the iam:PermissionsBoundary context key,
+  # matching where AWS's own worked example places their user-resource
+  # equivalents (GetRolePolicy, ListRolePolicies, UpdateUser, DeleteUser
+  # all sit in that example's separate, unconditioned statement).
+  # iam:DeleteRole is included here rather than with the boundary-gated
+  # actions above because AWS's example places DeleteUser here too;
+  # gha-ci-dev deleting its OWN role is separately, explicitly denied
+  # below regardless of this Allow's resource match.
+  statement {
+    sid    = "RoleReadAndLifecycle"
+    effect = "Allow"
+    actions = [
+      "iam:GetRole",
+      "iam:UpdateRole",
+      "iam:DeleteRole",
       "iam:TagRole",
       "iam:UntagRole",
+      "iam:GetRolePolicy",
       "iam:ListRolePolicies",
       "iam:ListAttachedRolePolicies",
+    ]
+    resources = [
+      "arn:aws:iam::${local.account_id}:role/${local.prefix}-*",
+    ]
+  }
+
+  # Policy OBJECTS (not role-boundary attachment) -- the
+  # iam:PermissionsBoundary condition key is about what is attached to a
+  # PRINCIPAL, not about a managed policy resource itself, so it has no
+  # bearing on these actions at all.
+  statement {
+    sid    = "PolicyObjectManagement"
+    effect = "Allow"
+    actions = [
       "iam:CreatePolicy",
       "iam:DeletePolicy",
       "iam:GetPolicy",
@@ -315,22 +514,11 @@ data "aws_iam_policy_document" "iam_management" {
       "iam:DeletePolicyVersion",
       "iam:ListPolicyVersions",
       "iam:TagPolicy",
+      "iam:UntagPolicy",
     ]
     resources = [
-      "arn:aws:iam::${local.account_id}:role/${local.prefix}-*",
       "arn:aws:iam::${local.account_id}:policy/${local.prefix}-*",
     ]
-
-    # A role created or reconfigured through this statement MUST carry the
-    # project permissions boundary -- this is the enforcement half of
-    # Section 13.1/17's "permissions boundaries are attached to all
-    # runtime roles the deployment identity creates"; without this
-    # condition the boundary policy in main.tf would be advisory only.
-    condition {
-      test     = "StringEquals"
-      variable = "iam:PermissionsBoundary"
-      values   = [aws_iam_policy.runtime_role_boundary.arn]
-    }
   }
 
   statement {
@@ -440,6 +628,72 @@ data "aws_iam_policy_document" "guardrails" {
       var.bootstrap_kms_key_arn,
       var.environment_kms_key_arn,
     ]
+  }
+
+  # Closes the self-escalation path a compromised (or carelessly edited)
+  # gha-ci-dev could otherwise use even though every Allow statement
+  # above is scoped to project-prefixed resources: gha-ci-dev's own ARN
+  # DOES match that prefix, and iam_management's boundary-conditioned
+  # statement structurally cannot match against it (gha-ci-dev carries no
+  # boundary of its own -- see that statement's comment) -- but this Deny
+  # makes that guarantee explicit and independent of that reasoning, not
+  # reliant on it alone. If gha-ci-dev's own trust policy or inline
+  # policies ever need to change, that is exactly the kind of change the
+  # bootstrap/README.md ordering already reserves for a human running
+  # Terraform with direct account credentials, never for CI acting on
+  # itself.
+  statement {
+    sid    = "DenySelfPolicyModification"
+    effect = "Deny"
+    actions = [
+      "iam:PutRolePolicy",
+      "iam:AttachRolePolicy",
+      "iam:DetachRolePolicy",
+      "iam:DeleteRolePolicy",
+      "iam:DeleteRole",
+      "iam:UpdateAssumeRolePolicy",
+    ]
+    resources = [aws_iam_role.gha_ci_dev.arn]
+  }
+
+  # No statement anywhere grants iam:PutRolePermissionsBoundary or
+  # iam:DeleteRolePermissionsBoundary, so a boundary set at iam:CreateRole
+  # time is already, structurally, permanent for as long as the role
+  # exists (only delete-and-recreate can change it, which re-runs the
+  # same boundary-conditioned CreateRole check). This Deny makes that
+  # explicit and unconditional rather than leaving it as an absence that
+  # a future edit could silently fill in.
+  statement {
+    sid    = "DenyBoundaryReplacementOrRemoval"
+    effect = "Deny"
+    actions = [
+      "iam:PutRolePermissionsBoundary",
+      "iam:DeleteRolePermissionsBoundary",
+    ]
+    resources = ["*"]
+  }
+
+  # AWS's own IAM User Guide worked example ("Permissions boundaries for
+  # IAM entities", the Maria/Zhang delegation walkthrough) includes
+  # exactly this guardrail under the name "NoBoundaryPolicyEdit": denying
+  # CreatePolicyVersion/DeletePolicy/DeletePolicyVersion/
+  # SetDefaultPolicyVersion on the boundary policy itself. Without it,
+  # gha-ci-dev's own "PolicyObjectManagement" statement above (scoped to
+  # every project-prefixed policy, including the boundary policy, since
+  # it also carries the project prefix) would let it rewrite the
+  # boundary's content to be maximally permissive -- defeating the
+  # boundary requirement on iam:CreateRole entirely without ever touching
+  # a Put/DeleteRolePermissionsBoundary call.
+  statement {
+    sid    = "DenyBoundaryPolicyEdit"
+    effect = "Deny"
+    actions = [
+      "iam:CreatePolicyVersion",
+      "iam:DeletePolicy",
+      "iam:DeletePolicyVersion",
+      "iam:SetDefaultPolicyVersion",
+    ]
+    resources = [aws_iam_policy.runtime_role_boundary.arn]
   }
 }
 

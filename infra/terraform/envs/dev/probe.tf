@@ -51,6 +51,15 @@ data "aws_iam_policy_document" "probe_execution_trust" {
 resource "aws_iam_role" "probe_execution" {
   name               = "4xtra-${var.environment}-probe-execution"
   assume_role_policy = data.aws_iam_policy_document.probe_execution_trust.json
+  # Required for gha-ci-dev to be able to create this role at all: its own
+  # iam:CreateRole grant (modules/ci_oidc) is conditioned on the caller
+  # requesting exactly this boundary. Omitting this argument would mean
+  # the CreateRole API call carries no PermissionsBoundary parameter, the
+  # iam:PermissionsBoundary condition key would be absent from the
+  # request, and gha-ci-dev's boundary-conditioned statement would not
+  # match -- creation would fail closed with AccessDenied, not silently
+  # succeed unboundaried.
+  permissions_boundary = module.ci_oidc.runtime_role_boundary_arn
 }
 
 data "aws_iam_policy_document" "probe_execution" {
@@ -107,6 +116,8 @@ data "aws_iam_policy_document" "probe_task_trust" {
 resource "aws_iam_role" "probe_task" {
   name               = "4xtra-${var.environment}-probe-task"
   assume_role_policy = data.aws_iam_policy_document.probe_task_trust.json
+  # See probe_execution's identical comment above.
+  permissions_boundary = module.ci_oidc.runtime_role_boundary_arn
 }
 
 data "aws_iam_policy_document" "probe_task" {

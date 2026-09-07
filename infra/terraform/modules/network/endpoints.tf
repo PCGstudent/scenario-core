@@ -40,6 +40,33 @@ data "aws_iam_policy_document" "s3_endpoint" {
       [for arn in var.s3_bucket_arns : "${arn}/*"],
     )
   }
+
+  # ECR stores every image layer in an AWS-managed S3 bucket outside this
+  # account, and layer downloads flow over this same S3 gateway endpoint
+  # (docker.io/AWS: "Amazon ECR uses Amazon S3 to store your image
+  # layers... they must access Amazon ECR to get the image manifest and
+  # then Amazon S3 to download the actual image layers"). Without this
+  # statement, ECR manifest calls (over the ecr.api/ecr.dkr interface
+  # endpoints) succeed but every layer pull fails -- the endpoint policy
+  # would otherwise reject it before IAM is even consulted. Verified
+  # directly against AWS's official ECR VPC-endpoints documentation
+  # ("Minimum Amazon S3 Bucket Permissions for Amazon ECR"), which
+  # specifies exactly this action and exactly this ARN pattern -- no
+  # object-level prefix narrower than "/*" is documented as sufficient,
+  # and no other action (e.g. s3:ListBucket) is required or granted here.
+  # This is AWS's own managed bucket, never a third-party or
+  # customer-controlled one; it is the only resource outside the project
+  # prefix this endpoint policy ever names.
+  statement {
+    sid    = "AllowEcrLayerBucketReadOnly"
+    effect = "Allow"
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+    actions   = ["s3:GetObject"]
+    resources = ["arn:aws:s3:::prod-${var.region}-starport-layer-bucket/*"]
+  }
 }
 
 resource "aws_vpc_security_group_egress_rule" "task_to_s3_gateway" {
