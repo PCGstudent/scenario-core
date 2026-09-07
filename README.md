@@ -234,23 +234,44 @@ reports/
 ├── run.ps1
 ├── run.sh
 ├── app.py                     # Streamlit entry point for the lab
-├── src/xtra_takehome/
-│   ├── app/                   # lab layer: services, risk, stress, charts, llm, state
-│   ├── __main__.py
-│   ├── challenger.py          # submitted GJR-skew-t generator
-│   ├── compare_models.py
-│   ├── config.py
-│   ├── data.py
-│   ├── diagnostics.py
-│   ├── metrics.py
-│   ├── model.py               # development GARCH-t baseline
-│   ├── plots.py
-│   ├── report.py
-│   ├── robustness.py
-│   ├── validation.py
-│   └── windows.py             # horizon-matched block statistics
+├── docs/architecture/
+│   └── IMPLEMENTATION_PLAN.md # target AWS production platform design
+├── requirements/               # Phase 0: locked worker/control/dev dependency sets
+├── .github/workflows/          # Phase 0: CI (see "Development tooling" below)
+├── src/
+│   ├── xtra_takehome/
+│   │   ├── app/                # lab layer: services, risk, stress, charts, llm, state
+│   │   ├── __main__.py
+│   │   ├── challenger.py       # submitted GJR-skew-t generator
+│   │   ├── compare_models.py
+│   │   ├── config.py
+│   │   ├── data.py
+│   │   ├── diagnostics.py
+│   │   ├── metrics.py
+│   │   ├── model.py            # development GARCH-t baseline
+│   │   ├── plots.py
+│   │   ├── report.py
+│   │   ├── robustness.py
+│   │   ├── validation.py
+│   │   └── windows.py          # horizon-matched block statistics
+│   └── scenario_platform/      # empty in Phase 0; Phase 1 adds the domain layer here
 └── tests/
 ```
+
+## Development tooling (platform work)
+
+The commands above are the frozen, unaffected clean-clone contract for the submitted model. Building the production AWS platform described in `docs/architecture/IMPLEMENTATION_PLAN.md` on top of it starts with an engineering baseline that does not touch any statistical code:
+
+```bash
+pip install --require-hashes -r requirements/dev.lock   # ruff, mypy, pytest, pip-audit
+ruff check .                                             # new platform code + newly added tests
+ruff format --check .                                    # same scope
+mypy                                                      # src/scenario_platform (empty until Phase 1)
+pytest -m invariants                                      # tests enforcing a numbered AGENTS.md invariant
+pytest -m negative_controls                               # tests proving a gate/check can actually fail
+```
+
+`requirements/worker.lock`, `requirements/control.lock` and `requirements/dev.lock` are hash-locked with `uv pip compile --universal`, which resolves one file that pins the same dependency *versions* for Windows and Linux and records the hash of the correct platform-specific wheel for each; installing the same lock on either platform therefore always resolves to the same pinned version set with verified, tamper-evident artifacts, not to a byte-identical set of files on disk (a Windows wheel and a manylinux wheel for the same version are different compiled binaries). `worker.lock` pins the exact versions already declared in `pyproject.toml`'s dependencies, never drifted independently. `tests/test_no_aws_in_core.py` and `tests/test_control_plane_purity.py` enforce the boundary the architecture plan depends on: no `boto3`/`botocore` in the quantitative core or future domain layer, and no scientific/UI dependency in the thin control-plane lock.
 
 ## Reproducibility and AI use
 
@@ -260,4 +281,4 @@ One caveat, verified rather than assumed. The committed reports were reproduced 
 
 AI-assisted development is documented in `AIUSAGE.md`, including what was delegated, what remained human review responsibility, and the concrete mistakes that review caught.
 
-`AWS_DESIGN.md` describes an on-demand production path using API Gateway, Lambda, Step Functions, ECS Fargate, ECR, S3, DynamoDB and CloudWatch, including identity/secrets, conditioning state, cost and a 100× usage design.
+`AWS_DESIGN.md` describes an on-demand production path using API Gateway, Lambda, Step Functions, ECS Fargate, ECR, S3, DynamoDB and CloudWatch, including identity/secrets, conditioning state, cost and a 100× usage design. `docs/architecture/IMPLEMENTATION_PLAN.md` is the current, detailed version of that design and the authoritative plan for the production platform now being built on top of this model; "Development tooling" above documents Phase 0 of it.

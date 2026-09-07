@@ -143,6 +143,7 @@ def test_expected_shortfall_is_at_least_var_terminal(level):
     assert es >= var
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 4: VaR/ES are positive loss magnitudes
 def test_var_is_reported_as_a_positive_loss():
     """Losing money must produce a positive VaR, matching the repo convention."""
     losing = _flat(50, 10, -3.0)
@@ -150,6 +151,7 @@ def test_var_is_reported_as_a_positive_loss():
     assert var > 0 and es > 0
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 24: a daily figure and a horizon figure
 def test_daily_and_terminal_var_are_different_quantities():
     rng = np.random.default_rng(3)
     paths = rng.normal(0, 2, size=(500, 100))
@@ -194,6 +196,7 @@ def test_probability_drawdown_exceeds_is_a_share():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 24: every metric carries its horizon
 def test_every_reported_metric_declares_what_it_is_measured_over():
     rng = np.random.default_rng(6)
     metrics = risk.risk_report(rng.normal(0, 2, size=(200, 60)), 90.0)

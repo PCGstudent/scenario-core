@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from xtra_takehome.metrics import (
     max_drawdown_from_returns,
@@ -28,6 +29,7 @@ def test_path_acf_shape():
     assert np.isclose(result[0], 1.0)
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 6: equal-horizon drawdown comparisons
 def test_pooled_and_block_drawdown_paths_agree():
     """The two code paths that produce historical drawdowns must not diverge.
 
@@ -45,6 +47,7 @@ def test_pooled_and_block_drawdown_paths_agree():
     np.testing.assert_allclose(pooled, blocks.max_drawdown)
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 4: VaR/ES are positive loss magnitudes
 def test_var_es_match_hand_computed_values():
     """Pin the sign convention: VaR/ES are positive loss magnitudes."""
     returns = np.array([-5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0])

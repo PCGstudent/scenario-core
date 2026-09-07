@@ -28,6 +28,7 @@ def test_extract_close_multiindex_price_ticker():
     assert list(close) == [70.5, 72.0]
 
 
+@pytest.mark.invariants  # AGENTS.md invariants 1-2: returns, 100*log(P_t/P_{t-1})
 def test_log_returns_pct():
     close = pd.Series([100.0, 101.0, 99.0])
     r = log_returns_pct(close)

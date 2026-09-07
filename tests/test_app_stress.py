@@ -27,6 +27,7 @@ def _generator() -> GjrSkewTGenerator:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.invariants  # AGENTS.md invariant 8: every stochastic operation seed-controlled
 def test_default_simulate_is_unchanged_and_reproducible():
     """The validation suite calls simulate() positionally. That must not move."""
     g = _generator()

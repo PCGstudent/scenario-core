@@ -1,0 +1,14 @@
+# Thin control-plane runtime dependencies (future Lambda handlers, Phase 3+).
+#
+# No scientific stack: numpy, scipy, pandas, statsmodels, arch, matplotlib,
+# streamlit and plotly are all forbidden here (architecture plan Section 7.3,
+# enforced by tests/test_control_plane_purity.py). A control-plane cold start
+# has no reason to pay for a scientific dependency closure.
+#
+# Only one dependency is currently justified: pydantic, for the request/response
+# schemas shared with scenario_platform.domain (architecture plan Section 7.4,
+# "shared contract without shared runtime"). boto3 is deliberately NOT pinned
+# here yet -- no control-plane or adapter code exists before Phase 3a, and this
+# lock should not carry a dependency nothing in the repository uses. It is
+# added when Phase 3a's adapters first import it.
+pydantic>=2,<3

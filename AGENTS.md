@@ -79,6 +79,12 @@ bash run.sh
 25. Model-generated stress carries a probability; an assumed shock sequence does not. Keep the two apart in the code and in the interface.
 26. The validation page runs at the canonical configuration regardless of the lab controls, because the tolerances were derived for it.
 
+The following three are adopted from `docs/architecture/IMPLEMENTATION_PLAN.md` for the AWS production platform now being built on top of this model. 28 gets executable enforcement starting in Phase 0 (`tests/test_no_aws_in_core.py`, plus Ruff's TID251 rule where lint scope covers a file); 27 and 29 describe objects that do not exist until Phase 1 creates `ModelArtifact` and become executable then, not before.
+
+27. Model artifacts must carry the fitted state arrays required by `historical_mix` (the residual/variance pairs `GjrSkewTGenerator.fit` produces), not just the seven fitted parameters. A params-only artifact silently changes the initialization law and cannot reproduce the committed validation.
+28. The quantitative core and the pure domain layer must remain infrastructure-independent: no `boto3`/`botocore` import, and no reading of AWS or other infrastructure configuration from the environment. Nothing here may know it is being deployed anywhere.
+29. Artifact identity is semantic and canonical, derived from the decoded parameter and array values, independent of storage-format bytes (a `.npz`'s container encoding, a JSON serializer's float/key ordering). A `save -> load -> save` round trip must yield the same identity even when the underlying bytes differ.
+
 ## Development rules for AI agents
 
 - Read the assessment requirements and this file before editing.
