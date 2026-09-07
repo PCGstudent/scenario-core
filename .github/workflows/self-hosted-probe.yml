@@ -1,0 +1,19 @@
+name: Self-hosted probe
+
+on:
+  push:
+    branches:
+      - ci/self-hosted-probe
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: [self-hosted, linux, x64, scenario-core]
+    steps:
+      - name: Probe
+        run: |
+          echo "runner works"
+          uname -a
+          id
