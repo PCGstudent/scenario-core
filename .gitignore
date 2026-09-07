@@ -12,3 +12,12 @@ build/
 .cache/
 .acceptance-scratch/
 .acceptance-pytest-tmp/
+
+# Terraform: downloaded provider binaries and plan/plan-cache artifacts are
+# machine-local and never committed. .terraform.lock.hcl IS committed (per
+# root configuration -- bootstrap, envs/dev, envs/prod) and is therefore
+# NOT listed here.
+**/.terraform/
+*.tfplan
+*.tfstate
+*.tfstate.*
