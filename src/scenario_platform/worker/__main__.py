@@ -38,7 +38,10 @@ integer is required is rejected, not silently reinterpreted.
    -> ``RequestArtifactMismatchError`` (ARTIFACT_INTEGRITY, raised inside
    ``services.simulate`` itself)
 6. an unsupported ``rng_scheme`` -> ``NotImplementedError`` (INPUT)
-7. another invocation is already publishing to the same ``--output-dir``
+7. another invocation is already publishing to, or has already published
+   into, the same ``--output-dir`` (checked again *after* this invocation
+   holds the publish lock, closing the race where two invocations both
+   pass the cheap pre-lock check before either has written anything)
    -> ``WorkerConcurrentPublishError`` (INPUT)
 8. anything else unexpected -> INTERNAL
 
@@ -431,12 +434,31 @@ def _write_outputs_atomically(
     (``os.O_CREAT | os.O_EXCL``, atomic on POSIX -- including over NFS on
     modern kernels, though older NFS versions are a documented exception to
     ``O_EXCL`` atomicity) is claimed in ``output_dir`` before any staging
-    happens, and released in a ``finally`` regardless of outcome. This is
-    what actually *prevents* two concurrent invocations from interleaving
-    their publications into a mixed result -- the "output directory must
-    already be empty" check the caller performs earlier is necessary but not
-    sufficient on its own (two processes can both pass that check before
-    either has written anything).
+    happens, and released in a ``finally`` regardless of outcome. This
+    alone is not sufficient: it stops two invocations from interleaving
+    writes *concurrently*, but not a *sequential* race -- writer A and
+    writer B can both pass the caller's own "output directory must already
+    be empty" precondition before either has written anything, A then
+    fully publishes and releases its lock, and B (running later, not at
+    the same instant) then acquires the now-free lock with nothing to stop
+    it from overwriting A's already-complete result while A's manifest is
+    still visible mid-overwrite. Closing that requires a second check taken
+    *after* this invocation holds the lock, not just the lock itself --
+    see the next paragraph.
+
+    **Recheck under the lock, before staging.** Immediately after
+    acquiring the lock (and before the staging directory is even created),
+    ``output_dir`` is listed again and anything present other than the
+    lock file this invocation just created -- another invocation's
+    already-published result, a leftover staging directory from a killed
+    invocation, or ordinary unrelated content -- causes an immediate
+    :class:`~scenario_platform.worker.errors.WorkerConcurrentPublishError`
+    (``INPUT``). Nothing found this way is ever touched, moved, or
+    deleted: rejecting is the only action taken, so whatever is already
+    there is preserved byte-for-byte. This is what actually closes the
+    sequential race above -- by the time B holds the lock, A's published
+    files are already visible to this recheck, so B rejects instead of
+    overwriting.
 
     **Publication order and manifest-last.** ``os.replace`` on a POSIX
     filesystem is an atomic ``rename(2)``; renaming a file within the same
@@ -448,15 +470,21 @@ def _write_outputs_atomically(
     complete.
 
     **On a handled failure**, every file *this invocation* already
-    published is removed again (best-effort) before re-raising -- a
-    pre-existing, unrelated file in ``output_dir`` is never touched, and
+    published is removed again (best-effort) before re-raising -- this
+    invocation never touches anything it did not itself create, and
     ``manifest.json`` in particular can never be left behind by a failure,
     because it is only ever added to the rollback-tracked list after its
     own ``os.replace`` has already succeeded, at which point there is
-    nothing left to fail. This cannot protect against the process being
-    killed outright (no Python code runs to clean up after a SIGKILL) --
-    that residual risk is why consumers must gate on ``manifest.json``,
-    not on this function's best effort alone.
+    nothing left to fail. Staging-directory creation itself happens inside
+    this same protected region (after the lock is held, after the recheck
+    above passes): if ``mkdtemp`` itself fails, the lock this invocation
+    holds is still released in ``finally`` rather than leaking -- a
+    directory-creation failure unrelated to contention must never
+    permanently block every future invocation against this
+    ``output_dir``. This cannot protect against the process being killed
+    outright (no Python code runs to clean up after a SIGKILL) -- that
+    residual risk is why consumers must gate on ``manifest.json``, not on
+    this function's best effort alone.
     """
     lock_path = output_dir / ".worker-lock"
     try:
@@ -468,9 +496,25 @@ def _write_outputs_atomically(
             f"({lock_path.name} already exists)"
         ) from exc
 
-    staging = Path(tempfile.mkdtemp(prefix=".worker-staging-", dir=output_dir))
+    staging: Path | None = None
     published: list[Path] = []
     try:
+        # Recheck under the lock: the caller's own pre-lock emptiness check
+        # can pass for two invocations before either has written anything.
+        # Only a check performed after this invocation holds the lock
+        # exclusively can actually see a prior invocation's completed
+        # result (or any other pre-existing content) and refuse to
+        # overwrite it -- see the docstring above.
+        existing = [entry for entry in output_dir.iterdir() if entry != lock_path]
+        if existing:
+            raise WorkerConcurrentPublishError(
+                f"output directory {output_dir} already contains content "
+                f"({sorted(entry.name for entry in existing)!r}) -- refusing "
+                "to publish over it"
+            )
+
+        staging = Path(tempfile.mkdtemp(prefix=".worker-staging-", dir=output_dir))
+
         (staging / "returns.npy").write_bytes(returns_npy_bytes)
         (staging / "risk_report.json").write_text(
             json.dumps(_risk_report_to_dict(risk_report), indent=2, sort_keys=True) + "\n",
@@ -496,7 +540,8 @@ def _write_outputs_atomically(
             path.unlink(missing_ok=True)
         raise
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
         lock_path.unlink(missing_ok=True)
 
 

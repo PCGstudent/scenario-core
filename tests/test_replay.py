@@ -758,14 +758,18 @@ def test_thread_contract_violation_is_detected_and_rejected(tmp_path):
 
 # ---------------------------------------------------------------------------
 # 3c. Publication mechanism (white-box): the CLI's own "--output-dir must be
-# empty" precondition makes a pre-existing-unrelated-file scenario
-# unreachable through main() (test_nonempty_output_directory_is_rejected
-# above already proves that whole-request rejection preserves such a file);
-# these tests instead call _write_outputs_atomically directly to prove the
-# narrower, lower-level mechanism itself -- rollback on a handled failure,
-# and the single-writer lock -- exactly as documented in that function's
-# own docstring. Deliberately below the CLI boundary: these are internal
-# mechanisms with no other way to construct the scenario.
+# empty" precondition makes a pre-existing-content scenario unreachable
+# through main() (test_nonempty_output_directory_is_rejected above already
+# proves that whole-request rejection preserves such content); these tests
+# instead call _write_outputs_atomically directly to prove the narrower,
+# lower-level mechanism itself -- rollback on a handled failure, the
+# single-writer lock, and the recheck taken *under* that lock (which closes
+# the sequential race the lock alone does not: two writers can both pass
+# the CLI's cheap pre-lock check before either has written anything, then
+# run one after the other rather than at the same instant) -- exactly as
+# documented in that function's own docstring. Deliberately below the CLI
+# boundary: these are internal mechanisms with no other way to construct
+# the scenario.
 # ---------------------------------------------------------------------------
 
 
@@ -781,17 +785,25 @@ def _minimal_risk_report():
     )
 
 
-def test_failure_during_staging_leaves_no_manifest_and_preserves_unrelated_files(
+def test_failure_during_staging_leaves_no_manifest_and_leaves_directory_empty(
     tmp_path, monkeypatch
 ):
     """A failure while *staging* (before any file has even been published
-    into ``output_dir``) must still leave the pre-existing unrelated file
-    alone and publish nothing at all."""
+    into ``output_dir``) must publish nothing at all and leave the
+    directory exactly as this invocation found it.
+
+    Deliberately starts from a genuinely *empty* ``output_dir`` -- not one
+    pre-seeded with an unrelated file -- because the stricter
+    recheck-under-the-lock contract (see
+    ``test_preexisting_content_is_rejected_and_preserved_under_the_lock``
+    below) now rejects any pre-existing content before staging is ever
+    reached, which would prevent this test from ever exercising the
+    staging-failure rollback path it targets.
+    """
     import scenario_platform.worker.__main__ as worker_main
 
     output_dir = tmp_path / "output"
     output_dir.mkdir()
-    (output_dir / "unrelated.txt").write_text("keep me", encoding="utf-8")
 
     real_write_text = Path.write_text
 
@@ -811,25 +823,26 @@ def test_failure_during_staging_leaves_no_manifest_and_preserves_unrelated_files
             None,
         )
 
-    assert (output_dir / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
     assert not (output_dir / "manifest.json").exists()
     assert not (output_dir / "returns.npy").exists()
-    remaining = {p.name for p in output_dir.iterdir()}
-    assert remaining == {"unrelated.txt"}
+    assert list(output_dir.iterdir()) == []
 
 
-def test_failure_between_file_publications_rolls_back_and_preserves_unrelated_files(
+def test_failure_between_file_publications_rolls_back_to_an_empty_directory(
     tmp_path, monkeypatch
 ):
     """returns.npy publishes successfully; risk_report.json's publish is
     then made to fail. Must prove: returns.npy is rolled back (no partial
-    result), manifest.json never appears, and the pre-existing unrelated
-    file is untouched."""
+    result), manifest.json never appears, and the directory ends up
+    exactly as this invocation found it.
+
+    Starts from a genuinely empty ``output_dir`` for the same reason as
+    the staging-failure test above.
+    """
     import scenario_platform.worker.__main__ as worker_main
 
     output_dir = tmp_path / "output"
     output_dir.mkdir()
-    (output_dir / "unrelated.txt").write_text("keep me", encoding="utf-8")
 
     real_replace = worker_main.os.replace
     calls = {"n": 0}
@@ -851,12 +864,117 @@ def test_failure_between_file_publications_rolls_back_and_preserves_unrelated_fi
             None,
         )
 
-    assert (output_dir / "unrelated.txt").read_text(encoding="utf-8") == "keep me"
     assert not (output_dir / "manifest.json").exists()
     assert not (output_dir / "returns.npy").exists()  # rolled back
     assert not (output_dir / "risk_report.json").exists()
+    assert list(output_dir.iterdir()) == []
+
+
+def test_mkdtemp_failure_after_lock_acquisition_leaves_no_owned_lock_or_files(
+    tmp_path, monkeypatch
+):
+    """A failure creating the staging directory itself (e.g. disk full, a
+    permission error) happens *after* this invocation has already
+    exclusively acquired the lock. The lock this invocation created must
+    still be released on this failure path -- otherwise a
+    directory-creation failure with nothing to do with contention would
+    permanently block every future invocation against this
+    ``output_dir``."""
+    import scenario_platform.worker.__main__ as worker_main
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    def flaky_mkdtemp(*args, **kwargs):
+        raise OSError("simulated mkdtemp failure")
+
+    monkeypatch.setattr(worker_main.tempfile, "mkdtemp", flaky_mkdtemp)
+
+    with pytest.raises(OSError, match="simulated mkdtemp failure"):
+        worker_main._write_outputs_atomically(
+            output_dir,
+            b"\x93NUMPY fake returns bytes",
+            _minimal_risk_report(),
+            {"schema_version": "test"},
+            None,
+        )
+
+    assert not (output_dir / ".worker-lock").exists()
+    assert list(output_dir.iterdir()) == []
+
+
+def test_preexisting_content_is_rejected_and_preserved_under_the_lock(tmp_path):
+    """Ordinary pre-existing content (not a prior writer's result, not a
+    lock file) is rejected by the recheck taken under the lock, and left
+    untouched -- the recheck's job is only ever to reject, never to clean
+    up or reconcile what it finds."""
+    from scenario_platform.worker.__main__ import _write_outputs_atomically
+    from scenario_platform.worker.errors import WorkerConcurrentPublishError
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "unrelated.txt").write_bytes(b"keep me byte-for-byte")
+
+    with pytest.raises(WorkerConcurrentPublishError):
+        _write_outputs_atomically(
+            output_dir,
+            b"\x93NUMPY fake returns bytes",
+            _minimal_risk_report(),
+            {"schema_version": "test"},
+            None,
+        )
+
+    assert (output_dir / "unrelated.txt").read_bytes() == b"keep me byte-for-byte"
+    assert not (output_dir / ".worker-lock").exists()  # this invocation's own lock released
     remaining = {p.name for p in output_dir.iterdir()}
     assert remaining == {"unrelated.txt"}
+
+
+def test_delayed_second_writer_after_first_writer_completed_is_rejected(tmp_path):
+    """The race the single lock alone does not close: writer A and writer
+    B can both pass the caller's own "output directory must already be
+    empty" precondition before either has written anything, then run
+    *sequentially* rather than concurrently -- A fully publishes and
+    releases its lock, then B (running later, not at the same instant)
+    acquires the now-free lock. Without a recheck taken under that lock,
+    B would freely overwrite A's already-complete, already-manifested
+    result. Proves the fix: B must reject with INPUT, and every one of A's
+    published files -- including its manifest -- must be byte-for-byte
+    unchanged afterward."""
+    from scenario_platform.worker.__main__ import _write_outputs_atomically
+    from scenario_platform.worker.errors import WorkerConcurrentPublishError
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    # Writer A: a real, complete, successful publish.
+    _write_outputs_atomically(
+        output_dir,
+        b"\x93NUMPY writer A returns",
+        _minimal_risk_report(),
+        {"schema_version": "test", "writer": "A"},
+        None,
+    )
+    published_by_a = {p.name for p in output_dir.iterdir()}
+    assert published_by_a == {"returns.npy", "risk_report.json", "manifest.json"}
+    snapshot_before = {p.name: p.read_bytes() for p in output_dir.iterdir()}
+
+    # Writer B: arrives later (the lock A held is long gone), targeting
+    # the same directory with different content.
+    with pytest.raises(WorkerConcurrentPublishError):
+        _write_outputs_atomically(
+            output_dir,
+            b"\x93NUMPY writer B returns -- must never land",
+            _minimal_risk_report(),
+            {"schema_version": "test", "writer": "B"},
+            None,
+        )
+
+    snapshot_after = {p.name: p.read_bytes() for p in output_dir.iterdir()}
+    # Every file from A, including its manifest, is byte-for-byte unchanged.
+    assert snapshot_after == snapshot_before
+    assert not (output_dir / ".worker-lock").exists()  # B's own lock released, not leaked
+    assert not any(name.startswith(".worker-staging-") for name in snapshot_after)
 
 
 def test_concurrent_publish_to_the_same_output_dir_is_rejected(tmp_path):

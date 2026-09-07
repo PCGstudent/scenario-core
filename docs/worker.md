@@ -67,11 +67,22 @@ is ever mistaken for a complete result by a consumer that correctly gates
 on `manifest.json`.
 
 **Single-writer assumption.** Exactly one invocation may publish into a
-given `--output-dir` at a time. This is enforced, not merely documented: an
-exclusive lock file (`os.O_CREAT | os.O_EXCL`, atomic on POSIX) is claimed
-before any staging happens; a second concurrent invocation targeting the
-same directory fails closed with `WorkerConcurrentPublishError` (exit
-`INPUT`) rather than interleaving its writes with the first.
+given `--output-dir`, ever. This is enforced, not merely documented, and by
+two checks, not one: an exclusive lock file (`os.O_CREAT | os.O_EXCL`,
+atomic on POSIX) is claimed before any staging happens, so a second,
+truly concurrent invocation fails immediately; and — because two
+invocations can both pass the caller's cheap "output directory must
+already be empty" precondition before either has written anything, then
+run *sequentially* rather than at the same instant — `output_dir` is
+listed again immediately after this invocation acquires the lock, and
+anything present other than the lock file it just created (a prior
+invocation's already-published result, a leftover staging directory from
+a killed process, or any other pre-existing content) causes an immediate
+rejection instead of an overwrite. Both paths fail closed with
+`WorkerConcurrentPublishError` (exit `INPUT`), and neither ever touches,
+moves, or deletes what it finds — rejecting is the only action taken, so a
+first writer's complete result (including its manifest) is preserved
+byte-for-byte against a later writer targeting the same directory.
 
 ## Digest definitions
 
