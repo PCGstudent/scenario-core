@@ -1,0 +1,30 @@
+# Runtime dependencies of the PRODUCTION WORKER IMAGE specifically
+# (docker/worker.Dockerfile) -- a strict subset of requirements/worker.lock,
+# pinned to the exact same versions (never a different resolution; this file
+# exists to narrow, not to re-choose).
+#
+# requirements/worker.lock is the scientific stack for the whole
+# xtra_takehome core, including yfinance (data fetching) and matplotlib
+# (report figures) -- both genuinely needed by `python -m xtra_takehome`,
+# neither reachable from anything the worker container actually imports.
+# Verified directly: every module the worker's import graph touches
+# (challenger.py, diagnostics.py, metrics.py, windows.py, validation.py --
+# everything scenario_platform.domain.services pulls in from
+# xtra_takehome) was grepped for "matplotlib"/"yfinance" imports, module-
+# level or lazy, and none exists. The worker never fetches data and never
+# renders a figure, so shipping yfinance's and matplotlib's transitive
+# dependency trees (curl-cffi, websockets, protobuf, beautifulsoup4, peewee,
+# pillow, fonttools, kiwisolver, contourpy, ...) in the production image
+# would be unused weight against the Phase-2 image-size ceiling (<= 700 MB)
+# and the "minimal... free from development/UI dependencies" requirement,
+# for packages that are not development/UI dependencies in the abstract but
+# are exactly that *for this image*.
+#
+# Bump this file in lockstep with requirements/worker.in -- same versions,
+# always; if a package here is not in worker.in at the same pin, that is a
+# drift bug, not a feature.
+arch==7.2.0
+numpy==2.2.6
+pandas==2.2.3
+scipy==1.15.3
+statsmodels==0.14.4
