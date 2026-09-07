@@ -45,9 +45,6 @@ from xtra_takehome import diagnostics as _diagnostics
 from xtra_takehome.config import Config
 from xtra_takehome.data import log_returns_pct
 
-pytest.importorskip("pyarrow")
-
-
 # ---------------------------------------------------------------------------
 # 1. Dataset identity survives CSV / Parquet re-encoding
 # ---------------------------------------------------------------------------
@@ -84,7 +81,14 @@ def test_dataset_id_is_unchanged_by_csv_round_trip(tmp_path):
 def test_dataset_id_is_unchanged_by_parquet_round_trip(tmp_path):
     """Parquet is a genuinely different transport format from CSV (binary,
     columnar, its own type system) -- proving identity survives it is a
-    materially different claim from surviving a CSV round trip."""
+    materially different claim from surviving a CSV round trip.
+
+    The only test in this module that needs pyarrow (a dev-only test
+    dependency, ``requirements/dev.in``) -- skipped here, and only here, if
+    it is unavailable; every other test in this file must still collect and
+    run without it.
+    """
+    pytest.importorskip("pyarrow")
     close = _fake_close_series()
     original = build_dataset_ref(
         ticker="TEST",
@@ -420,24 +424,30 @@ def test_fitted_params_are_tier_3_not_compared_bit_for_bit_to_the_manifest(
 ):
     """The frozen ``ModelArtifact`` is the Tier-1 replay object (architecture
     plan Section 16.2); the *act of fitting* is Tier 3 and is explicitly not
-    claimed bit-reproducible across image digests. The committed
-    ``reports/run_manifest.json`` was not produced within this repository's
-    current image digest, so no numeric tolerance against it is asserted
-    here -- inventing one (as an earlier version of this test did, at
-    rel=1e-3/1e-4 chosen to make the observed drift pass) would misstate the
-    contract rather than encode it.
+    claimed bit-reproducible across sessions or machines. The committed
+    ``reports/run_manifest.json`` was produced in a different execution
+    environment than this test runs in, so no numeric tolerance against it
+    is asserted here -- inventing one (as an earlier version of this test
+    did, at rel=1e-3/1e-4 chosen to make the observed drift pass) would
+    misstate the contract rather than encode it.
 
-    What Section 16.2 *does* promise, and what this test actually checks:
-    refitting the same ``dataset_id`` **within a single image digest**
-    reproduces parameters to <= 1e-9 relative -- here checked as exact bit
-    equality, which trivially satisfies that bound. This isolates the
-    committed manifest's ~1.9%-in-mu / <=2e-4-in-everything-else deviation
-    (recorded in this session's evidence table) as purely a cross-session/
-    cross-environment phenomenon, consistent with -- not contradicting --
-    "no bit-level claim is made" across image digests. The deterministic,
-    seed-controlled outputs Tier 1 *does* promise (gate counts,
-    matched-reference percentiles, extreme-region flags) are checked to
-    exact equality in the tests above.
+    What this test actually checks: two independent calls to ``fit()`` in
+    *this same process* (same Python interpreter, same locked dependency
+    versions, same machine) reproduce ``artifact_id`` and every parameter
+    exactly. This is **not** a same-worker-image-digest experiment -- Phase 1
+    has no worker image to run one against; that experiment (§16.2's Tier 1,
+    "20 runs across distinct Fargate task placements") belongs to Phase 2,
+    once a worker image exists. What same-process determinism *does*
+    establish is that the committed manifest's ~1.9%-in-mu /
+    <=2e-4-in-everything-else deviation (recorded in this session's evidence
+    table) is a cross-session/cross-environment phenomenon rather than
+    noise from this environment itself. The deterministic, seed-controlled
+    outputs Tier 1 *does* promise against the historical manifest (gate
+    counts, matched-reference rank/percentile and historical-derived
+    fields, extreme-region flags) are checked to exact equality in the
+    tests above; matched-reference *model-derived* fields (median/p05/p95)
+    are Tier-3-drift-sensitive and are not asserted against the manifest
+    here for the same reason the raw parameters are not.
     """
     artifact, returns, _ = real_dataset_validation
 

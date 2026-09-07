@@ -33,7 +33,7 @@ import pytest
 from scenario_platform.domain import serialization
 from scenario_platform.domain.artifacts import ArtifactIntegrityError, build_dataset_ref
 from scenario_platform.domain.requests import FitConfig, ScenarioRequest
-from scenario_platform.domain.services import fit, simulate
+from scenario_platform.domain.services import RequestArtifactMismatchError, fit, simulate
 from xtra_takehome.challenger import GjrSkewTGenerator
 from xtra_takehome.data import log_returns_pct
 
@@ -119,6 +119,30 @@ def test_simulate_after_reload_is_bit_identical_across_initial_state_modes(
 
 
 # ---------------------------------------------------------------------------
+# Request/artifact consistency: a request naming a different model_version
+# than the artifact it is run against must be rejected before simulation.
+# ---------------------------------------------------------------------------
+
+
+def test_simulate_rejects_a_request_whose_model_version_does_not_match_the_artifact(
+    fitted_artifact,
+):
+    """``artifact.model_version = "gjr-skewt-test-fixture"``,
+    ``request.model_version = "some-other-model"`` -- assembling
+    ``(artifact, request)`` from mismatched pieces would otherwise produce a
+    ``ScenarioSet`` whose own request claims one model while its
+    ``artifact_id`` names another. This must fail before the quantitative
+    generator ever runs, not after."""
+    mismatched_request = ScenarioRequest(
+        model_version="some-other-model", horizon=10, n_paths=4, seed=1
+    )
+    assert mismatched_request.model_version != fitted_artifact.model_version
+
+    with pytest.raises(RequestArtifactMismatchError):
+        simulate(fitted_artifact, mismatched_request)
+
+
+# ---------------------------------------------------------------------------
 # Proof: transport bytes may differ while identity stays stable
 # ---------------------------------------------------------------------------
 
@@ -169,6 +193,48 @@ def test_load_fails_closed_when_the_stored_id_itself_is_tampered(tmp_path, fitte
     data = json.loads(metadata_path.read_text(encoding="utf-8"))
 
     data["artifact_id"] = "sha256:" + "0" * 64
+    metadata_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError):
+        serialization.load_artifact(directory)
+
+
+def test_load_fails_closed_when_a_policy_relevant_diagnostic_boolean_is_tampered(
+    tmp_path, fitted_artifact
+):
+    """The review-found gap this closes: ``artifact_id`` used to protect
+    ``params`` and the fitted state arrays but not ``StructuralDiagnostics``,
+    so flipping ``finite_fourth_moment`` from False to True could change
+    what ``policies.py`` permits (``check_pooled_moment_point_estimate``
+    reads it directly) while ``verify_identity`` stayed silent -- a stored
+    artifact could disagree with its own governance-relevant facts without
+    the fail-closed check ever noticing. Canonical identity now covers
+    every ``StructuralDiagnostics`` field (``identity.DIAGNOSTICS_ORDER``),
+    so this must fail closed like any other tamper.
+    """
+    directory = tmp_path / "artifact"
+    serialization.save_artifact(fitted_artifact, directory)
+    metadata_path = directory / serialization.METADATA_FILENAME
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    original = data["diagnostics"]["finite_fourth_moment"]
+    data["diagnostics"]["finite_fourth_moment"] = not original
+    metadata_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError):
+        serialization.load_artifact(directory)
+
+
+def test_load_fails_closed_when_a_diagnostic_float_is_tampered(tmp_path, fitted_artifact):
+    """A second ``StructuralDiagnostics`` field, of the other encoded kind
+    (float64, not bool) -- proving the whole ``DIAGNOSTICS_ORDER`` list is
+    covered, not just the one boolean field the review flagged."""
+    directory = tmp_path / "artifact"
+    serialization.save_artifact(fitted_artifact, directory)
+    metadata_path = directory / serialization.METADATA_FILENAME
+    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    data["diagnostics"]["implied_return_tail_index"] += 1e-6
     metadata_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
     with pytest.raises(ArtifactIntegrityError):

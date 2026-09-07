@@ -39,7 +39,7 @@ FIXTURE_DIR = Path(__file__).parent / "fixtures" / "gjr_skewt_v1"
 #   python scripts/build_artifact.py --model-version gjr-skewt-20260907-1 \
 #       --output tests/fixtures/gjr_skewt_v1 --cache-dir .cache
 GOLDEN_ARTIFACT_ID = (
-    "sha256:240a70185846dceae611110679961b7f50da865434d63b9664dc793de431bb51"
+    "sha256:fdf0b19144e0e899f29eb88aad30af4bb248deb7986ce34879d6cd00be29913f"
 )
 GOLDEN_MODEL_VERSION = "gjr-skewt-20260907-1"
 # ScenarioRequest(model_version=GOLDEN_MODEL_VERSION, horizon=252, n_paths=1000, seed=42)

@@ -46,6 +46,27 @@ class ArtifactIntegrityError(RuntimeError):
     """
 
 
+class ArtifactValidationError(ValueError):
+    """Raised when a ModelArtifact is constructed from structurally invalid fitted state.
+
+    Distinct from :class:`ArtifactIntegrityError` (a content/identity
+    mismatch on an otherwise well-formed object): this fires on malformed
+    *shape* or *values* -- mismatched-length state arrays, a 2-D array, an
+    empty array, a non-finite residual or variance, a non-positive
+    variance, or an unsupported ``family``/``schema_version`` -- before any
+    identity computation is even meaningful. AGENTS.md invariant 27's
+    "``historical_mix`` samples from these arrays" is not just about their
+    presence; a malformed array here would corrupt sampling or produce
+    nonsensical scenarios silently rather than fail loudly at construction.
+    """
+
+
+#: The one family this repository submits (``challenger.py``'s
+#: ``GjrSkewTGenerator``). A second family would need a second canonical
+#: encoding, not a widened string -- see identity.py.
+_SUPPORTED_FAMILIES: tuple[str, ...] = ("gjr-skewt",)
+
+
 @dataclass(frozen=True)
 class DatasetRef:
     """A price series' canonical identity, independent of storage format.
@@ -199,6 +220,15 @@ class ModelArtifact:
     ``__post_init__`` therefore defensively copies both arrays and marks them
     read-only (``numpy``'s own ``WRITEABLE`` flag) -- an in-place write raises
     ``ValueError`` immediately rather than corrupting the artifact silently.
+
+    Structural validation. ``__post_init__`` also rejects a structurally
+    invalid fitted state before it is ever accepted as a real
+    ``ModelArtifact`` (raising :class:`ArtifactValidationError`): unsupported
+    ``family``/``schema_version``, a state array that is not 1-D, state
+    arrays of different length, an empty state, a non-finite residual or
+    variance, or a variance that is not strictly positive. This is a
+    structural check, not a statistical one -- it does not constrain
+    parameter *values* beyond what the quantitative core already guarantees.
     """
 
     schema_version: str
@@ -214,8 +244,43 @@ class ModelArtifact:
     policy_set_version: str
 
     def __post_init__(self) -> None:
-        residuals = np.array(self.fitted_residuals, dtype=np.float64, copy=True)
-        variances = np.array(self.fitted_variances, dtype=np.float64, copy=True)
+        if self.family not in _SUPPORTED_FAMILIES:
+            raise ArtifactValidationError(
+                f"unsupported family {self.family!r}; expected one of {_SUPPORTED_FAMILIES}"
+            )
+        if self.schema_version != _identity.ARTIFACT_SCHEMA:
+            raise ArtifactValidationError(
+                f"unsupported schema_version {self.schema_version!r}; "
+                f"expected {_identity.ARTIFACT_SCHEMA!r}"
+            )
+
+        residuals = np.asarray(self.fitted_residuals, dtype=np.float64)
+        variances = np.asarray(self.fitted_variances, dtype=np.float64)
+
+        if residuals.ndim != 1:
+            raise ArtifactValidationError(
+                f"fitted_residuals must be 1-D, got shape {residuals.shape}"
+            )
+        if variances.ndim != 1:
+            raise ArtifactValidationError(
+                f"fitted_variances must be 1-D, got shape {variances.shape}"
+            )
+        if residuals.shape != variances.shape:
+            raise ArtifactValidationError(
+                "fitted_residuals and fitted_variances must have the same shape, "
+                f"got {residuals.shape} and {variances.shape}"
+            )
+        if residuals.size == 0:
+            raise ArtifactValidationError("fitted state arrays must not be empty")
+        if not np.all(np.isfinite(residuals)):
+            raise ArtifactValidationError("fitted_residuals contains a non-finite value")
+        if not np.all(np.isfinite(variances)):
+            raise ArtifactValidationError("fitted_variances contains a non-finite value")
+        if not np.all(variances > 0.0):
+            raise ArtifactValidationError("fitted_variances must be strictly positive")
+
+        residuals = np.array(residuals, copy=True)
+        variances = np.array(variances, copy=True)
         residuals.setflags(write=False)
         variances.setflags(write=False)
         object.__setattr__(self, "fitted_residuals", residuals)
@@ -226,6 +291,11 @@ class ModelArtifact:
 
         Never reads ``self.artifact_id``; this is the "recompute from
         scratch" half of the fail-closed check in :meth:`verify_identity`.
+        Covers ``diagnostics`` as well as ``params``/the state arrays --
+        see ``identity.py``'s module docstring for exactly why (a stored
+        ``StructuralDiagnostics`` that silently disagreed with its own
+        artifact would let a policy decision diverge from what
+        ``artifact_id`` claims to represent).
         """
         return _identity.compute_artifact_id(
             family=self.family,
@@ -237,6 +307,7 @@ class ModelArtifact:
             params=self.params,
             fitted_residuals=self.fitted_residuals,
             fitted_variances=self.fitted_variances,
+            diagnostics=self.diagnostics,
         )
 
     def verify_identity(self) -> None:

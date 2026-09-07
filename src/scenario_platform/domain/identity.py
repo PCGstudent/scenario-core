@@ -21,15 +21,16 @@ module):
   not leak into a value meant to identify *content*.
 
 The canonical encoding instead writes every semantic field through one of
-three primitives -- a length-prefixed UTF-8 string, a big-endian IEEE-754
-binary64, or a named/typed/shaped array of big-endian binary64 or binary
-int64 -- concatenates them in a fixed, documented order, and hashes the
-result with SHA-256. Two encoders are built from these primitives:
+four primitives -- a length-prefixed UTF-8 string, a big-endian IEEE-754
+binary64, a single canonical boolean byte, or a named/typed/shaped array of
+big-endian binary64 or binary int64 -- concatenates them in a fixed,
+documented order, and hashes the result with SHA-256. Two encoders are built
+from these primitives:
 
 ``compute_artifact_id``
     Over ``(family, threshold_set_version, policy_set_version, dataset_id,
     calibration_start, calibration_end, params, fitted_residuals,
-    fitted_variances)`` -- the exact byte layout in
+    fitted_variances, diagnostics)`` -- the exact byte layout in
     ``canonical_artifact_bytes``'s docstring below, matching the
     architecture plan's worked example byte-for-byte.
 
@@ -43,18 +44,42 @@ stability under re-serialisation, one-ULP sensitivity in every parameter and
 every array element, insensitivity to storage-format bytes, and (for the
 dataset scheme) insensitivity to which transport format re-encoded the same
 values.
+
+**What is deliberately covered, and what is deliberately not.** Every field
+that can change *governance/policy behaviour* -- the seven fitted parameters,
+both fitted state arrays, and every ``StructuralDiagnostics`` field (Section
+8.6) -- is part of the hash: ``policies.py`` reads ``finite_third_moment`` /
+``finite_fourth_moment`` directly, so a stored artifact whose diagnostics
+silently disagreed with its own parameters would let a governance decision
+diverge from the content ``artifact_id`` claims to represent, without
+``verify_identity`` ever noticing. ``Provenance`` (``dataset_uri``,
+``calibration_timestamp``, ``git_sha``, ``dependency_lock_hash``) is,
+by contrast, deliberately *outside* canonical identity -- it records where
+and when an artifact was produced, not what it asserts, and two artifacts
+built from the same dataset at two different timestamps are legitimately the
+*same* content with different provenance. ``model_version`` is likewise
+outside identity: it is the human-assigned registry label, not the
+machine-verified content hash. Documentation and tests must not claim
+``artifact_id`` cryptographically protects these provenance-only fields --
+only the identity-bearing, model-risk-relevant content listed above.
 """
 
 from __future__ import annotations
 
 import hashlib
 import struct
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
 
 from xtra_takehome.challenger import GjrSkewTParams
+
+if TYPE_CHECKING:
+    # Deferred: artifacts.py imports this module, so a top-level import here
+    # would be circular. Safe because `from __future__ import annotations`
+    # (above) makes every annotation in this file a lazy string.
+    from .artifacts import StructuralDiagnostics
 
 #: Domain-separation tags, one per encoding scheme this module defines. The
 #: trailing "v1" is the encoding's own version: a future change to the byte
@@ -73,6 +98,23 @@ _DATASET_IDENTITY_DOMAIN = (DATASET_SCHEMA + "\n").encode("ascii")
 #: sensitive to. Changing this tuple changes every artifact_id ever computed,
 #: so it must never change without a new ``ARTIFACT_SCHEMA`` version.
 PARAM_ORDER: tuple[str, ...] = ("mu", "omega", "alpha", "gamma", "beta", "eta", "lam")
+
+#: Fixed field order for StructuralDiagnostics in the canonical encoding
+#: (each field paired with its encoded kind: "f64" or "bool"), pinned here
+#: for the same reason PARAM_ORDER is pinned above -- and covering every
+#: field the dataclass has, deliberately, so a new StructuralDiagnostics
+#: field can never be silently added to the artifact without also becoming
+#: part of what artifact_id protects.
+DIAGNOSTICS_ORDER: tuple[tuple[str, str], ...] = (
+    ("effective_persistence", "f64"),
+    ("fourth_moment_coefficient", "f64"),
+    ("implied_unconditional_variance", "f64"),
+    ("implied_return_tail_index", "f64"),
+    ("hill_tail_index", "f64"),
+    ("finite_second_moment", "bool"),
+    ("finite_third_moment", "bool"),
+    ("finite_fourth_moment", "bool"),
+)
 
 
 def _write_varint(buf: bytearray, n: int) -> None:
@@ -111,6 +153,28 @@ def _write_f64(buf: bytearray, value: float) -> None:
 def _write_u64(buf: bytearray, value: int) -> None:
     """Append an unsigned 64-bit integer, big-endian."""
     buf.extend(struct.pack(">Q", int(value)))
+
+
+def _write_bool(buf: bytearray, value: bool) -> None:
+    """Append one explicit canonical byte: ``0x01`` for True, ``0x00`` for False.
+
+    Never encoded as a length-prefixed string (``"true"``/``"false"``) or
+    folded into ``_write_f64``/``_write_u64`` as 1.0/1 -- a dedicated
+    single-byte primitive with no ambiguity about its own type or width.
+    """
+    if not isinstance(value, bool):
+        raise TypeError(f"canonical boolean encoding requires bool, got {type(value)}")
+    buf.append(0x01 if value else 0x00)
+
+
+def _write_diagnostics(buf: bytearray, diagnostics: StructuralDiagnostics) -> None:
+    """Append every ``StructuralDiagnostics`` field, in ``DIAGNOSTICS_ORDER``."""
+    for name, kind in DIAGNOSTICS_ORDER:
+        value = getattr(diagnostics, name)
+        if kind == "f64":
+            _write_f64(buf, value)
+        else:
+            _write_bool(buf, value)
 
 
 def _write_array(buf: bytearray, name: str, array: npt.NDArray[Any], *, dtype: str) -> None:
@@ -160,6 +224,7 @@ def canonical_artifact_bytes(
     params: GjrSkewTParams,
     fitted_residuals: npt.NDArray[np.float64],
     fitted_variances: npt.NDArray[np.float64],
+    diagnostics: StructuralDiagnostics,
 ) -> bytes:
     """Build the canonical byte stream an artifact's identity is hashed from.
 
@@ -180,6 +245,13 @@ def canonical_artifact_bytes(
                || big-endian uint64 ndim
                || big-endian uint64 * ndim (one per dimension)
                || C-contiguous raw bytes, big-endian
+        || for each field in DIAGNOSTICS_ORDER (effective_persistence,
+               fourth_moment_coefficient, implied_unconditional_variance,
+               implied_return_tail_index, hill_tail_index -- each a
+               big-endian binary64; then finite_second_moment,
+               finite_third_moment, finite_fourth_moment -- each one
+               canonical byte, 0x01/0x00):
+               the field's encoded value, per its kind
 
     This function has no side effects and performs no I/O; it is pure enough
     to call directly from a test with hand-built inputs.
@@ -196,6 +268,7 @@ def canonical_artifact_bytes(
         _write_f64(buf, getattr(params, name))
     _write_array(buf, "fitted_residuals", fitted_residuals, dtype="float64")
     _write_array(buf, "fitted_variances", fitted_variances, dtype="float64")
+    _write_diagnostics(buf, diagnostics)
     return bytes(buf)
 
 
@@ -210,6 +283,7 @@ def compute_artifact_id(
     params: GjrSkewTParams,
     fitted_residuals: npt.NDArray[np.float64],
     fitted_variances: npt.NDArray[np.float64],
+    diagnostics: StructuralDiagnostics,
 ) -> str:
     """``"sha256:" + hex(SHA256(canonical_artifact_bytes(...)))``."""
     digest = hashlib.sha256(
@@ -223,6 +297,7 @@ def compute_artifact_id(
             params=params,
             fitted_residuals=fitted_residuals,
             fitted_variances=fitted_variances,
+            diagnostics=diagnostics,
         )
     ).hexdigest()
     return f"sha256:{digest}"

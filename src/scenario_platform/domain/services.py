@@ -48,6 +48,16 @@ from .reports import RiskReport, ScenarioSet, ValidationReport
 from .requests import FitConfig, RiskConfig, ScenarioRequest, ValidationConfig
 
 
+class RequestArtifactMismatchError(ValueError):
+    """Raised when a request names a different artifact than the one it is run against.
+
+    Fired by :func:`simulate` before the quantitative generator ever runs --
+    a caller that assembled ``(artifact, request)`` from mismatched pieces
+    has a real bug (contradictory provenance in the result), not something
+    to silently proceed past.
+    """
+
+
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -132,6 +142,7 @@ def fit(returns: pd.Series, config: FitConfig) -> ModelArtifact:
         params=params,
         fitted_residuals=fitted_residuals,
         fitted_variances=fitted_variances,
+        diagnostics=diagnostics,
     )
 
     return ModelArtifact(
@@ -163,8 +174,20 @@ def simulate(artifact: ModelArtifact, request: ScenarioRequest) -> ScenarioSet:
     8.3), even though an artifact produced by :func:`fit` in this same
     process is already correct by construction -- the check costs
     microseconds and catches a caller that assembled a ``ModelArtifact`` by
-    hand from mismatched pieces.
+    hand from mismatched pieces. Also rejects a request whose
+    ``model_version`` names a different artifact than the one actually being
+    simulated from -- a caller that assembled ``(artifact, request)`` from
+    mismatched pieces would otherwise produce a ``ScenarioSet`` with
+    self-contradictory provenance (the request claims model A, the returned
+    ``artifact_id`` is model B's), and nothing downstream would ever notice.
     """
+    if request.model_version != artifact.model_version:
+        raise RequestArtifactMismatchError(
+            f"request.model_version={request.model_version!r} does not match "
+            f"artifact.model_version={artifact.model_version!r} "
+            f"(artifact_id={artifact.artifact_id!r}) -- refusing to simulate from "
+            "an artifact the request does not actually name"
+        )
     if request.rng_scheme != "single":
         raise NotImplementedError(
             f"rng_scheme={request.rng_scheme!r} is a reserved value with no "

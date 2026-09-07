@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 
 from scenario_platform.domain import identity
+from scenario_platform.domain.artifacts import StructuralDiagnostics
 from xtra_takehome.challenger import GjrSkewTParams
 
 
@@ -36,8 +37,27 @@ def _variances() -> np.ndarray:
     return np.array([1.8, 0.9, 0.7, 1.0, 1.4], dtype=np.float64)
 
 
+def _diagnostics(**overrides: object) -> StructuralDiagnostics:
+    base: dict[str, object] = dict(
+        effective_persistence=0.99,
+        fourth_moment_coefficient=1.05,
+        implied_unconditional_variance=8.5,
+        implied_return_tail_index=2.7,
+        hill_tail_index=2.9,
+        finite_second_moment=True,
+        finite_third_moment=False,
+        finite_fourth_moment=False,
+    )
+    base.update(overrides)
+    return StructuralDiagnostics(**base)  # type: ignore[arg-type]
+
+
 def _artifact_id(
-    *, params: GjrSkewTParams, residuals: np.ndarray, variances: np.ndarray
+    *,
+    params: GjrSkewTParams,
+    residuals: np.ndarray,
+    variances: np.ndarray,
+    diagnostics: StructuralDiagnostics | None = None,
 ) -> str:
     return identity.compute_artifact_id(
         family="gjr-skewt",
@@ -49,6 +69,7 @@ def _artifact_id(
         params=params,
         fitted_residuals=residuals,
         fitted_variances=variances,
+        diagnostics=diagnostics if diagnostics is not None else _diagnostics(),
     )
 
 
@@ -131,6 +152,46 @@ def test_one_ulp_parameter_change_alters_artifact_id(field_name: str):
 
 
 # ---------------------------------------------------------------------------
+# Property C2: StructuralDiagnostics field sensitivity (every field, both kinds)
+#
+# Closes a review-found gap: artifact_id used to cover params and the fitted
+# state arrays but not StructuralDiagnostics, so changing e.g.
+# finite_fourth_moment from False to True could change what policies.py
+# permits while leaving artifact_id -- and verify_identity -- unchanged.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field_name,kind", identity.DIAGNOSTICS_ORDER)
+def test_diagnostics_field_change_alters_artifact_id(field_name: str, kind: str):
+    """Every StructuralDiagnostics field changes artifact_id: a one-ULP bump
+    for the five float64 fields, a plain flip for the three boolean fields
+    (there is no smaller change for a bool). Parametrized over the exact
+    fixed order identity.py hashes them in, so this is "every field the
+    dataclass has," not just the one the review report happened to name.
+    """
+    base = _diagnostics()
+    baseline_value = getattr(base, field_name)
+    if kind == "f64":
+        changed_value: float | bool = np.nextafter(baseline_value, np.inf)
+    else:
+        changed_value = not baseline_value
+    assert changed_value != baseline_value
+
+    changed = _diagnostics(**{field_name: changed_value})
+
+    id_before = _artifact_id(
+        params=_params(), residuals=_residuals(), variances=_variances(), diagnostics=base
+    )
+    id_after = _artifact_id(
+        params=_params(),
+        residuals=_residuals(),
+        variances=_variances(),
+        diagnostics=changed,
+    )
+    assert id_before != id_after
+
+
+# ---------------------------------------------------------------------------
 # Property D: one-ULP state-array sensitivity
 # ---------------------------------------------------------------------------
 
@@ -209,6 +270,7 @@ def test_transposed_reshaped_array_does_not_collide_with_original():
         params=_params(),
         fitted_residuals=residuals,
         fitted_variances=_variances(),
+        diagnostics=_diagnostics(),
     )
     bytes_reshaped = canonical_artifact_bytes(
         family="gjr-skewt",
@@ -220,6 +282,7 @@ def test_transposed_reshaped_array_does_not_collide_with_original():
         params=_params(),
         fitted_residuals=reshaped,
         fitted_variances=_variances(),
+        diagnostics=_diagnostics(),
     )
     assert bytes_flat != bytes_reshaped
     assert id_flat == identity.compute_artifact_id(
@@ -232,6 +295,7 @@ def test_transposed_reshaped_array_does_not_collide_with_original():
         params=_params(),
         fitted_residuals=residuals,
         fitted_variances=_variances(),
+        diagnostics=_diagnostics(),
     )
 
 
@@ -260,6 +324,7 @@ def test_changing_any_metadata_field_changes_identity(field_name: str):
         params=_params(),
         fitted_residuals=_residuals(),
         fitted_variances=_variances(),
+        diagnostics=_diagnostics(),
         **kwargs,
     )
     changed_kwargs = dict(kwargs)
@@ -268,6 +333,7 @@ def test_changing_any_metadata_field_changes_identity(field_name: str):
         params=_params(),
         fitted_residuals=_residuals(),
         fitted_variances=_variances(),
+        diagnostics=_diagnostics(),
         **changed_kwargs,
     )
     assert baseline != changed
@@ -292,6 +358,7 @@ def test_non_float64_array_is_rejected_rather_than_silently_coerced():
             params=_params(),
             fitted_residuals=_residuals().astype(np.float32),
             fitted_variances=_variances(),
+            diagnostics=_diagnostics(),
         )
 
 
