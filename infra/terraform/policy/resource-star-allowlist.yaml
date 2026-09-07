@@ -31,6 +31,83 @@ runtime:
       pull action in the same boundary statement is resource-scoped to
       the project ECR repository prefix.
 
+  - role: "4xtra-{env}-sfn-orchestrator (modules/job_orchestrator)"
+    action: "logs:CreateLogDelivery, logs:GetLogDelivery, logs:UpdateLogDelivery, logs:DeleteLogDelivery, logs:ListLogDeliveries, logs:PutResourcePolicy, logs:DescribeResourcePolicies"
+    sid: "StateMachineLogDelivery"
+    file: "infra/terraform/modules/job_orchestrator/main.tf"
+    justification: >
+      The exact cross-account log-delivery API family AWS's own Step
+      Functions execution-history-logging setup documentation requires
+      (CreateLogDelivery et al.) -- none of these actions support
+      resource-level permissions in the AWS Service Authorization
+      Reference for CloudWatch Logs (list_logs.html); they manage the
+      log-delivery configuration object itself, not a named log group.
+
+  - role: "4xtra-{env}-sfn-orchestrator (modules/job_orchestrator)"
+    action: "logs:DescribeLogGroups"
+    sid: "SfnLogGroupDescribe"
+    file: "infra/terraform/modules/job_orchestrator/main.tf"
+    justification: >
+      Same verified limitation as modules/ci_oidc's own
+      "ProbeLogGroupDescribe" entry below: DescribeLogGroups' own row in
+      list_logs.html lists no resource type at all, and is kept isolated
+      in its own statement rather than bundled with a resource-scoped
+      action.
+
+  - role: "4xtra-{env}-sfn-orchestrator (modules/job_orchestrator)"
+    action: "ecs:DescribeTasks"
+    sid: "DescribeOwnClusterTasks"
+    file: "infra/terraform/modules/job_orchestrator/main.tf"
+    justification: >
+      Called by ClassifyFailure (Section 6.3) against a task ARN this
+      role only learns at runtime from the RunTask/Catch response, so it
+      cannot be named in the policy when authored -- scoped instead by
+      the ecs:cluster condition to this environment's one worker cluster,
+      the same pattern Section 13.1 already documents for this role's
+      RunTask/StopTask/PassRole grants (task and execution ARNs unknown
+      ahead of time; the condition is the scoping mechanism).
+
+  - role: "4xtra-{env}-sfn-orchestrator (modules/job_orchestrator)"
+    action: "ecs:StopTask, ecs:DescribeTasks"
+    sid: "ManageOwnTasks"
+    file: "infra/terraform/modules/job_orchestrator/main.tf"
+    justification: >
+      Section 13.1's own row for this role: "ecs:StopTask,
+      ecs:DescribeTasks" -- StopTask backs the DELETE /scenario-jobs
+      cancellation path (Section 6.1 step 7). Same runtime-unknown-task-ARN
+      reasoning as "DescribeOwnClusterTasks" immediately above; scoped by
+      the ecs:cluster condition, not by task ARN.
+
+  - role: "4xtra-{env}-demo-cleanup (modules/demo_killswitch)"
+    action: "ecs:ListTasks, ecs:StopTask"
+    sid: "StopTasksInDemoClustersOnly"
+    file: "infra/terraform/modules/demo_killswitch/main.tf"
+    justification: >
+      ecs:ListTasks reads across an entire cluster by construction (it
+      enumerates task ARNs, it does not act on one already-identified
+      task) and has no resource type to scope to before the call returns.
+      ecs:StopTask's target task ARN is discovered from that same
+      ListTasks call at invocation time, not known when this policy is
+      authored. Both are scoped instead by the ecs:cluster condition to
+      exactly the demo cluster ARN(s) this module is told to watch
+      (var.ecs_cluster_arns) -- the same runtime-unknown-resource pattern
+      already documented for modules/job_orchestrator's identical actions
+      above.
+
+  - role: "4xtra-{env}-demo-cleanup (modules/demo_killswitch)"
+    action: "ec2:DescribeVpcEndpoints"
+    sid: "DescribeEndpoints"
+    file: "infra/terraform/modules/demo_killswitch/main.tf"
+    justification: >
+      Same documented limitation as modules/ci_oidc's own
+      "Ec2DescribeOnly" entry below: DescribeVpcEndpoints is a pure
+      Describe action with no resource-level support, reading across an
+      unbounded set of endpoints rather than one identified resource. The
+      subsequent ec2:DeleteVpcEndpoints action in the same role's policy
+      IS resource-scoped, to exactly the endpoint ARNs this module is
+      told to watch (var.vpc_endpoint_ids) -- not listed here because it
+      is not Resource="*".
+
 deployment:
   # Section 13.1 point 5: deployment roles are reviewed separately, and
   # this list is broader by design -- infrastructure creation legitimately

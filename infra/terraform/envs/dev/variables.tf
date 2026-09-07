@@ -70,3 +70,15 @@ variable "github_ref" {
   default     = "ref:refs/heads/main"
   description = "Section 13.2: the DEV deploy role trusts pushes/dispatches against main only. A manual workflow_dispatch run on main also carries this sub claim, so the mandatory-manual-first-deployment requirement needs no separate condition."
 }
+
+# --- Phase 3b: vertical slice (Section 24, 25) ------------------------------
+
+variable "control_plane_package_path" {
+  type        = string
+  description = "Path to the built control-plane Lambda zip (scripts/package_control_plane.py). No default -- deploy-dev.yml (extended, Phase 3b's own Files bullet) builds this artifact and passes its path explicitly; nothing here builds it, the same way the worker image is built and pushed outside Terraform entirely."
+}
+
+variable "alert_email" {
+  type        = string
+  description = "Operational-alert recipient for modules/observability's SNS topic (Step Functions execution failures). A separate concern from modules/demo_killswitch's own failure alert, even when the same address is used for both."
+}

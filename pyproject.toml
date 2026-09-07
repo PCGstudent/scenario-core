@@ -94,6 +94,31 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "boto3".msg = "AWS SDK is forbidden in the quantitative core and domain layer (AGENTS.md invariant 28)."
 "botocore".msg = "AWS SDK is forbidden in the quantitative core and domain layer (AGENTS.md invariant 28)."
 
+# Phase 3b's two named exceptions to the ban above -- the architecture plan's
+# own repository-structure section calls scenario_platform.adapters "the ONLY
+# place boto3 appears in the data plane"; scenario_platform.control is the
+# thin control-plane Lambda layer, a different plane, and boto3 there (never
+# in scenario_platform.domain or scenario_platform.worker, both still banned
+# above and both still guarded independently by tests/test_no_aws_in_core.py)
+# is the expected, reviewed shape, not a boundary erosion.
+[tool.ruff.lint.per-file-ignores]
+"src/scenario_platform/adapters/s3_store.py" = ["TID251"]
+"src/scenario_platform/adapters/job_store.py" = ["TID251"]
+"src/scenario_platform/control/*.py" = ["TID251"]
+# Phase 3b test files that set up moto-mocked AWS resources directly
+# (fixtures, assertions against S3/DynamoDB state) -- boto3 here is test
+# scaffolding, not a boundary the tests are meant to enforce.
+"tests/scenario_platform/conftest.py" = ["TID251"]
+"tests/scenario_platform/test_control_jobs.py" = ["TID251"]
+"tests/scenario_platform/test_control_submit.py" = ["TID251"]
+"tests/scenario_platform/test_control_admission.py" = ["TID251"]
+"tests/scenario_platform/test_worker_job_id_mode.py" = ["TID251"]
+# Operator scripts run once, manually, with direct human credentials --
+# never imported by application code, never run by CI (scripts/seed_registry.py's
+# own docstring; the same posture as scripts/build_artifact.py).
+"scripts/seed_registry.py" = ["TID251"]
+"scripts/smoke.py" = ["TID251"]
+
 [tool.mypy]
 python_version = "3.13"
 # src/scenario_platform is an empty placeholder package in Phase 0 (see its
@@ -125,4 +150,15 @@ ignore_missing_imports = true
 # missing stubs costs no real type-safety here either.
 [[tool.mypy.overrides]]
 module = "threadpoolctl.*"
+ignore_missing_imports = true
+
+# boto3/botocore ship no py.typed marker (boto3-stubs/botocore-stubs are a
+# separate, large, generated third-party package this Phase 3b slice does
+# not otherwise need). Every boto3 call result this module set actually
+# relies on the shape of is cast explicitly at the call site
+# (scenario_platform.adapters.{job_store,s3_store}), so ignoring the
+# missing stubs here costs no real type-safety, the same reasoning as the
+# pandas/threadpoolctl overrides above.
+[[tool.mypy.overrides]]
+module = ["boto3.*", "botocore.*"]
 ignore_missing_imports = true
