@@ -78,21 +78,41 @@ deployment:
       no-NAT-gateway/no-internet-gateway Terraform policy check.
 
   - role: "gha-ci-dev"
-    action: "ecs:RegisterTaskDefinition, ecs:DeregisterTaskDefinition, ecs:DescribeTaskDefinition, ecs:ListTaskDefinitions"
-    sid: "EcsTaskDefinitionRegistration"
+    action: "ecs:DeregisterTaskDefinition, ecs:DescribeTaskDefinition, ecs:ListTaskDefinitions"
+    sid: "EcsTaskDefinitionReadOnlyAndDeregister"
     file: "infra/terraform/modules/ci_oidc/policy.tf"
     justification: >
-      Verified directly against AWS's ECS IAM documentation and a
-      tracked, still-open containers-roadmap feature request
-      (aws/containers-roadmap#929, "Resource-level permissions for Task
-      Definitions"): task-definition actions have no resource-level
-      permission support at all today, an AWS-documented limitation
-      distinct from -- and narrower than -- the EC2 correction above.
-      Cluster-level ECS actions (CreateCluster, DeleteCluster,
-      DescribeClusters, tagging) ARE resource-scoped to the cluster and
-      task-definition-family ARN pattern (see
-      "EcsClusterManagement", not Resource="*" and therefore not listed
-      here).
+      Verified individually against the current AWS Service Authorization
+      Reference for ECS (list_ecs.html): each of these three actions'
+      own row lists no resource type at all (the "Resource types
+      (*required)" column is blank), so Resource must be "*". Corrected
+      from an earlier revision that bundled ecs:RegisterTaskDefinition
+      into this same statement/justification on the strength of a
+      containers-roadmap issue describing these three, not that one --
+      RegisterTaskDefinition's own row lists "task-definition*"
+      (required) and is now separately resource-scoped (see
+      "EcsTaskDefinitionRegistration", not Resource="*" and therefore not
+      listed here). Cluster-level ECS actions (CreateCluster,
+      DeleteCluster, DescribeClusters, tagging) are also resource-scoped
+      to the cluster and task-definition-family ARN pattern (see
+      "EcsClusterManagement", likewise not listed here).
+
+  - role: "gha-ci-dev"
+    action: "logs:DescribeLogGroups"
+    sid: "ProbeLogGroupDescribe"
+    file: "infra/terraform/modules/ci_oidc/policy.tf"
+    justification: >
+      Verified directly against the current AWS Service Authorization
+      Reference for CloudWatch Logs (list_logs.html): DescribeLogGroups'
+      own row lists no resource type at all (the "Resource types
+      (*required)" column is blank) -- it reads across every log group in
+      the account, not one identified resource. Every other action in
+      "ProbeLogGroupManagement" (CreateLogGroup, DeleteLogGroup,
+      PutRetentionPolicy, AssociateKmsKey, and both the pre- and
+      post-migration tagging action names) individually lists "log-group"
+      as a supported resource type and stays scoped to
+      arn:aws:logs:{region}:{account}:log-group:/4xtra/* -- not listed
+      here because it is not Resource="*".
 
 resource_based_policies:
   # Listed for completeness/reviewability; not IAM identity grants, so not

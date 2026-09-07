@@ -622,6 +622,136 @@ def test_probe_runtime_role_policies_are_covered_by_the_boundary():
         )
 
 
+def _statements_granting_action(
+    statements: list[tuple[str, str, dict[str, Any]]], action: str
+) -> list[dict[str, Any]]:
+    """Statements whose action list contains EXACTLY this one action name
+    -- used to check one action's own resource-scoping in isolation, so a
+    statement that happens to bundle it with a differently-scopable
+    action cannot hide a mismatch behind the other's correctness."""
+    return [s for _f, _a, s in statements if action in _statement_actions(s)]
+
+
+def test_ecs_register_task_definition_is_resource_scoped():
+    """ecs:RegisterTaskDefinition's own row in the AWS Service
+    Authorization Reference for ECS (list_ecs.html) lists resource type
+    "task-definition*" (required) -- it DOES support resource-level
+    scoping, unlike DeregisterTaskDefinition/DescribeTaskDefinition/
+    ListTaskDefinitions (checked separately below, and verified
+    individually rather than assumed to share one blanket ECS
+    limitation)."""
+    statements = _identity_policy_statements()
+    matching = _statements_granting_action(statements, "ecs:RegisterTaskDefinition")
+    assert matching, "no ecs:RegisterTaskDefinition statement found -- check the parser"
+    unscopable_siblings = {
+        "ecs:DeregisterTaskDefinition",
+        "ecs:DescribeTaskDefinition",
+        "ecs:ListTaskDefinitions",
+    }
+    for statement in matching:
+        resources = _statement_resources(statement)
+        assert resources != ["*"], (
+            'ecs:RegisterTaskDefinition granted with Resource="*" -- it supports '
+            "resource-level scoping to the task-definition family and must not fall "
+            "back to a bare wildcard"
+        )
+        assert any(":task-definition/" in r for r in resources), (
+            f"ecs:RegisterTaskDefinition has no task-definition-scoped resource in "
+            f"its resources list: {resources}"
+        )
+        bundled = set(_statement_actions(statement)) & unscopable_siblings
+        assert not bundled, (
+            f"ecs:RegisterTaskDefinition bundled in the same statement as "
+            f'Resource="*"-only actions: {bundled}'
+        )
+
+
+def test_ecs_task_definition_readonly_and_deregister_are_genuinely_unscopable():
+    """DeregisterTaskDefinition, DescribeTaskDefinition and
+    ListTaskDefinitions each individually list no resource type in the
+    AWS Service Authorization Reference for ECS -- Resource="*" is the
+    verified scoping for these three specifically, checked one action at
+    a time rather than assumed from RegisterTaskDefinition's presence
+    (which is resource-scoped -- see the test above) or from any other
+    ECS action's own compatibility."""
+    statements = _identity_policy_statements()
+    for action in (
+        "ecs:DeregisterTaskDefinition",
+        "ecs:DescribeTaskDefinition",
+        "ecs:ListTaskDefinitions",
+    ):
+        matching = _statements_granting_action(statements, action)
+        assert matching, f"no statement grants {action} -- check the parser"
+        for statement in matching:
+            assert _statement_resources(statement) == ["*"], (
+                f'{action} is not granted with Resource="*" -- if AWS has since '
+                f"added resource-level support, verify against the current Service "
+                f"Authorization Reference and update the allowlist/comments: "
+                f"{statement.get('sid')}"
+            )
+
+
+def test_logs_describe_log_groups_is_isolated_in_its_own_resource_star_statement():
+    """logs:DescribeLogGroups' own row in the AWS Service Authorization
+    Reference for CloudWatch Logs (list_logs.html) lists no resource type
+    at all -- verified individually, not assumed from the other
+    log-group-management actions it used to share a statement with."""
+    statements = _identity_policy_statements()
+    matching = _statements_granting_action(statements, "logs:DescribeLogGroups")
+    assert matching, "no logs:DescribeLogGroups statement found -- check the parser"
+    for statement in matching:
+        assert _statement_resources(statement) == ["*"], (
+            f'logs:DescribeLogGroups is not granted with Resource="*": '
+            f"{statement.get('sid')}"
+        )
+        actions = set(_statement_actions(statement))
+        assert actions == {"logs:DescribeLogGroups"}, (
+            f"logs:DescribeLogGroups must be alone in its own statement, not bundled "
+            f"with resource-scoped log-group actions: {actions}"
+        )
+
+
+def test_other_probe_log_group_actions_remain_resource_scoped():
+    """The remaining CloudWatch Logs log-group-management actions each
+    individually list "log-group" as a supported resource type in the AWS
+    Service Authorization Reference and must stay scoped to the project's
+    log-group ARN pattern -- verified one action at a time, so
+    logs:DescribeLogGroups' Resource="*" fix cannot have silently widened
+    any of these too."""
+    statements = _identity_policy_statements()
+    resource_scoped_actions = {
+        "logs:CreateLogGroup",
+        "logs:DeleteLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:AssociateKmsKey",
+        "logs:TagResource",
+        "logs:UntagResource",
+        "logs:ListTagsForResource",
+        "logs:TagLogGroup",
+        "logs:UntagLogGroup",
+        "logs:ListTagsLogGroup",
+    }
+    for action in resource_scoped_actions:
+        matching = _statements_granting_action(statements, action)
+        assert matching, f"no statement grants {action} -- check the parser"
+        for statement in matching:
+            resources = _statement_resources(statement)
+            assert resources != ["*"], (
+                f'{action} granted with Resource="*" -- it supports log-group '
+                f"resource scoping and must not fall back to a bare wildcard"
+            )
+            # `any`, not `all`: a statement may legitimately grant several
+            # actions across several resource types at once (e.g. the
+            # permissions boundary's combined data-plane statement) --
+            # what matters for THIS action is that a log-group-scoped ARN
+            # is among its resources, not that every resource in a shared
+            # list happens to be one.
+            assert any("log-group:" in r for r in resources), (
+                f"{action} has no log-group-scoped resource in its resources list: "
+                f"{resources}"
+            )
+
+
 def test_ec2_create_actions_are_resource_scoped_not_resource_star():
     """Corrects the finding that an earlier revision inaccurately claimed
     EC2 VPC-family Create actions cannot support resource-level

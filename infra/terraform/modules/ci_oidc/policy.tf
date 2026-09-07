@@ -339,19 +339,34 @@ data "aws_iam_policy_document" "probe_and_observability_management" {
     ]
   }
 
+  # Verified per-action against the AWS Service Authorization Reference
+  # for ECS (list_ecs.html), not assumed to share one blanket limitation:
+  # RegisterTaskDefinition's own row lists resource type
+  # "task-definition*" (required) -- it DOES support resource-level
+  # scoping, corrected from an earlier revision that lumped it in with
+  # the three genuinely Resource="*"-only actions below on the strength
+  # of a tracked containers-roadmap issue that turns out to describe
+  # those three, not this one.
   statement {
-    # Confirmed against AWS's own ECS IAM documentation and a tracked
-    # containers-roadmap feature request (aws/containers-roadmap#929):
-    # task-definition actions have NO resource-level permission support
-    # at all today -- Resource must be "*" for exactly these three
-    # actions. A genuinely different limitation from EC2's (corrected
-    # above): ECS's own docs state this explicitly as a still-open gap,
-    # not an assumption. Enumerated in
+    sid       = "EcsTaskDefinitionRegistration"
+    effect    = "Allow"
+    actions   = ["ecs:RegisterTaskDefinition"]
+    resources = ["arn:aws:ecs:${var.region}:${local.account_id}:task-definition/${local.prefix}-*"]
+  }
+
+  statement {
+    # Confirmed individually against the same AWS Service Authorization
+    # Reference page: DeregisterTaskDefinition, DescribeTaskDefinition and
+    # ListTaskDefinitions each list no resource type at all (the
+    # "Resource types (*required)" column is blank) -- Resource must be
+    # "*" for exactly these three. A genuinely different limitation from
+    # EC2's (corrected in network_management above) and from
+    # RegisterTaskDefinition's own row just above: verified per action,
+    # not assumed to travel together. Enumerated in
     # infra/terraform/policy/resource-star-allowlist.yaml.
-    sid    = "EcsTaskDefinitionRegistration"
+    sid    = "EcsTaskDefinitionReadOnlyAndDeregister"
     effect = "Allow"
     actions = [
-      "ecs:RegisterTaskDefinition",
       "ecs:DeregisterTaskDefinition",
       "ecs:DescribeTaskDefinition",
       "ecs:ListTaskDefinitions",
@@ -365,7 +380,6 @@ data "aws_iam_policy_document" "probe_and_observability_management" {
     actions = [
       "logs:CreateLogGroup",
       "logs:DeleteLogGroup",
-      "logs:DescribeLogGroups",
       "logs:PutRetentionPolicy",
       "logs:AssociateKmsKey",
       # Both the pre- and post-migration CloudWatch Logs tagging action
@@ -373,6 +387,9 @@ data "aws_iam_policy_document" "probe_and_observability_management" {
       # `terraform apply` to observe which one the pinned provider
       # version (~> 6.63) actually calls -- granting both is the accurate
       # response to that uncertainty, not a guess dressed up as either.
+      # Each is individually confirmed against the AWS Service
+      # Authorization Reference (list_logs.html) to list "log-group" as a
+      # supported resource type.
       "logs:TagResource",
       "logs:UntagResource",
       "logs:ListTagsForResource",
@@ -383,6 +400,23 @@ data "aws_iam_policy_document" "probe_and_observability_management" {
     resources = [
       "arn:aws:logs:${var.region}:${local.account_id}:log-group:/4xtra/*",
     ]
+  }
+
+  statement {
+    # Confirmed against the AWS Service Authorization Reference for
+    # CloudWatch Logs (list_logs.html): DescribeLogGroups' own row lists
+    # no resource type at all (the "Resource types (*required)" column is
+    # blank) -- it reads across every log group in the account, not one
+    # identified resource, and genuinely requires Resource="*". Every
+    # other action in "ProbeLogGroupManagement" above lists "log-group" as
+    # a supported resource type and stays scoped there; this is the one,
+    # individually-verified exception, not an assumption carried over
+    # from it. Enumerated in
+    # infra/terraform/policy/resource-star-allowlist.yaml.
+    sid       = "ProbeLogGroupDescribe"
+    effect    = "Allow"
+    actions   = ["logs:DescribeLogGroups"]
+    resources = ["*"]
   }
 }
 
