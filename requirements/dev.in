@@ -14,3 +14,13 @@ pytest==9.0.3
 ruff>=0.8,<1
 mypy>=1.13,<2
 pip-audit>=2.7,<3
+
+# Test-only, transport-format re-encoding proof (architecture plan Phase 1:
+# "dataset_id is invariant to re-encoding (CSV -> Parquet -> CSV)",
+# tests/test_artifact_identity.py). Not a worker/control runtime dependency:
+# the domain's dataset-identity scheme (scenario_platform.domain.identity)
+# hashes DECODED values and never touches Parquet itself, so pyarrow is used
+# only inside the test to prove that identity survives round-tripping through
+# a transport format genuinely different from CSV -- it does not appear in
+# worker.lock or control.lock, and no production code path imports it.
+pyarrow>=18,<26

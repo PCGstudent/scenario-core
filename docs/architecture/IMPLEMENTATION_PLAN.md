@@ -2470,8 +2470,9 @@ destroyable milestone where the network and storage substrate can be proved corr
 * **Files.** `src/scenario_platform/domain/*` (`artifacts`, `identity`, `requests`, `policies`,
   `reports`, `serialization`, `services`); `scripts/build_artifact.py`;
   `tests/test_artifact_identity.py`; `tests/test_artifact_roundtrip.py`; `tests/test_policies.py`;
-  `tests/platform/test_domain.py`; a committed artifact fixture (~70 KB) with its golden
-  `artifact_id` and golden returns digest.
+  `tests/scenario_platform/test_domain.py`; a committed artifact fixture (~70 KB) with its golden
+  `artifact_id` and golden returns digest; a committed pinned Brent dataset fixture (~120 KB) with its
+  canonical `dataset_id`.
 * **AWS resources.** None.
 * **Tests.**
   * `fit → save → load → simulate` is **bit-identical** to `fit → simulate` (invariant 27).
@@ -2479,15 +2480,43 @@ destroyable milestone where the network and storage substrate can be proved corr
     state arrays are necessary, in the style the repository already uses.
   * `save → load → save` yields an identical `artifact_id` **even though the two `.npz` files differ
     byte-for-byte** (invariant 29) — the test asserts both facts.
-  * A one-ULP change to any parameter or any array element changes `artifact_id`.
+  * A one-ULP change to any parameter, any array element, or any `StructuralDiagnostics` field changes
+    `artifact_id` — canonical identity covers every policy/model-risk-relevant field, not only the
+    fitted parameters and state arrays (a review-found gap, since closed: `finite_fourth_moment` is
+    read directly by `policies.py`, so it must be identity-bearing too).
   * `dataset_id` is invariant to re-encoding (CSV → Parquet → CSV) and sensitive to any value change.
-  * `validate(real, artifact, config)` reproduces the committed 9/14 and 12/13 gate counts and the
-    manifest's matched-reference percentiles.
+  * `validate(real, artifact, config)`, refit fresh against the pinned dataset, reproduces the
+    committed 9/14 pooled and 12/13 horizon-matched gate counts and the manifest's matched-reference
+    **rank/percentile and historical-derived** fields exactly; the matched-reference **model-derived**
+    fields (median/p05/p95) and the squared-return ACF Monte Carlo floor may differ slightly —
+    evidenced Tier-3 calibration drift propagated through deterministic simulation, not a defect (see
+    Acceptance below).
   * Stored structural diagnostics match a live recomputation to 1e-10.
   * **Policy tests:** VaR 95/99 and ES 95/99 are **not** restricted; a 99.9 % tail expectation **is**
     restricted; pooled skewness/kurtosis cannot be returned as point estimates.
-* **Acceptance.** One artifact reproduces every number in `reports/run_manifest.json` for the pinned
-  dataset, and its `artifact_id` is stable across re-serialisation.
+* **Acceptance.** Three distinct reproducibility claims, kept separate rather than conflated (an
+  earlier version of this bullet claimed "every number in `reports/run_manifest.json`
+  bit-for-bit," which review evidence showed false for the continuous, refit-dependent fields):
+  1. **Frozen fixture replay — Tier 1, exact.** The same committed `ModelArtifact` + the same
+     `ScenarioRequest` + the same seed produces a bit-identical scenario digest
+     (`tests/test_golden_fixture.py`), with no dependence on refitting anything. The artifact's
+     `artifact_id` is stable across re-serialisation.
+  2. **Fresh calibration against the pinned dataset — Tier 3, not bit-reproducible.** Refitting is a
+     numerical MLE optimisation; Phase 1 does not claim it bit-reproducible across sessions or
+     machines. Evidence gathered in review: two fits in the *same* current WSL/Python locked
+     environment were observed bit-identical — this is **not** a same-worker-image-digest claim, since
+     Phase 1 has no worker image; that experiment (§16.2's Tier 1 "20 runs across distinct Fargate task
+     placements") is Phase 2's, once an image exists to test. Against the historical
+     `reports/run_manifest.json` (produced in a different execution environment), the refit parameters
+     differ by up to ~2e-2 relative (the weakly-identified `mu`) and ≤ 2e-4 relative for the rest —
+     consistent with ordinary optimiser/BLAS drift, not a dataset change (the refit's `dataset_id`
+     matches the manifest's exactly).
+  3. **Validation after a fresh refit.** The gate counts (9/14, 12/13) and every rank/percentile or
+     count-based validation output reproduce the historical manifest exactly, being discrete outputs
+     insensitive to Tier-3-scale parameter drift at this sample size. Continuous simulated reference
+     values derived from the refit artifact (matched-reference model median/p05/p95, the ACF Monte
+     Carlo floor) may differ slightly, propagating the Tier-3 drift deterministically — documented, not
+     tolerance-fudged away.
 * **Rollback.** Delete the package; the core is untouched.
 * **Complexity.** Medium (4–6 days). The serialisation is easy; the identity scheme and the proofs are
   the work.
