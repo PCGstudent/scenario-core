@@ -8,6 +8,44 @@ name: CI
 # upstream tag via `git ls-remote` at the time this file was written; the
 # trailing comment names the tag that commit currently corresponds to, for
 # human readability only -- the SHA, not the comment, is what runs).
+#
+# RUNNER: repository-level self-hosted Linux runner (WSL2 Ubuntu 24.04 on a
+# developer workstation, labels: self-hosted, linux, x64, scenario-core),
+# not a GitHub-hosted runner. GitHub Actions remains the orchestrator; only
+# where the compute executes has changed.
+#
+# Trust assumption, documented rather than assumed. This repository is
+# private, and PR #1 (the only PR that exists) is feat/aws-platform -> main
+# within this same repository -- there is no public fork-contribution path.
+# The classic "a malicious fork PR executes arbitrary code on your
+# self-hosted runner" risk model applies to public repositories that accept
+# outside contributions via `pull_request`; it does not apply here, because
+# nobody outside this repository's collaborators can open a PR against it at
+# all. If this repository is ever made public, or opened to outside
+# contributors, this trigger configuration must be revisited before that
+# happens (e.g. gate `pull_request` fork runs behind a required-reviewer
+# approval, restrict self-hosted jobs to `push`/same-repo PRs only, or run
+# fork PRs on GitHub-hosted runners instead).
+#
+# Persistence caveat, documented rather than hidden. This runner is a
+# long-lived process on a developer machine, not a fresh VM per job. A
+# single-runner registration also means these 8 jobs execute one at a time,
+# not in parallel as they did on GitHub-hosted runners. Every job that needs
+# Python packages creates its own virtualenv inside the checked-out workspace
+# (never the system Python) and installs from a hash-verified lock; nothing
+# is installed machine-wide by any job. actions/checkout's default clean
+# checkout (git clean -ffdx) wipes that venv, along with any other untracked
+# state, before the next run reuses this same workspace -- so a job's mutable
+# state cannot leak into the next one. Downloaded tooling (gitleaks) is
+# scoped to $RUNNER_TEMP, a per-job directory the runner manages, rather than
+# installed system-wide.
+#
+# A persistent developer-workstation runner is an accepted trade-off for this
+# private repository during Phase 0 development. A future production or
+# organization-level setup should prefer ephemeral or otherwise isolated
+# runners (autoscaled, one job per fresh instance/container) rather than a
+# developer workstation, precisely so this persistence caveat does not need
+# to be reasoned about at all.
 
 on:
   push:
@@ -21,7 +59,9 @@ concurrency:
 
 # Least privilege at the workflow level; every job reads the checkout and
 # nothing else. No job needs to write to the repository, comment on a PR,
-# or touch any cloud credential.
+# or touch any cloud credential. Unaffected by the runner migration: no AWS
+# credentials, no AWS OIDC, and no repository secrets are used anywhere in
+# this file, on either GitHub-hosted or self-hosted compute.
 permissions:
   contents: read
 
@@ -31,14 +71,17 @@ env:
 jobs:
   lint-and-format:
     name: Lint and format (Ruff)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, scenario-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install dev tools from the locked, hash-verified set
-        run: pip install --require-hashes -r requirements/dev.lock
+      - name: Create an isolated virtualenv and install dev tools from the locked, hash-verified set
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements/dev.lock
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Ruff check (new platform code + newly added tests only -- see pyproject.toml)
         run: ruff check .
       - name: Ruff format --check (same scope)
@@ -46,20 +89,23 @@ jobs:
 
   typecheck:
     name: Type check (mypy)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, scenario-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install dev tools from the locked, hash-verified set
-        run: pip install --require-hashes -r requirements/dev.lock
+      - name: Create an isolated virtualenv and install dev tools from the locked, hash-verified set
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements/dev.lock
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: mypy (src/scenario_platform only -- see pyproject.toml)
         run: mypy
 
   test:
     name: Full test suite
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, scenario-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -69,17 +115,19 @@ jobs:
           cache-dependency-path: |
             requirements/worker.lock
             requirements/dev.lock
-      - name: Install the quantitative worker + dev dependencies from the locked, hash-verified sets
+      - name: Create an isolated virtualenv and install the quantitative worker + dev dependencies from the locked, hash-verified sets
         run: |
-          pip install --require-hashes -r requirements/worker.lock
-          pip install --require-hashes -r requirements/dev.lock
-          pip install -e . --no-deps
+          python3 -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements/worker.lock
+          .venv/bin/pip install --require-hashes -r requirements/dev.lock
+          .venv/bin/pip install -e . --no-deps
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: pytest (every test, including invariants and negative controls)
         run: pytest -v
 
   invariants:
     name: Statistical invariant lane (pytest -m invariants)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, scenario-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -89,11 +137,13 @@ jobs:
           cache-dependency-path: |
             requirements/worker.lock
             requirements/dev.lock
-      - name: Install the quantitative worker + dev dependencies from the locked, hash-verified sets
+      - name: Create an isolated virtualenv and install the quantitative worker + dev dependencies from the locked, hash-verified sets
         run: |
-          pip install --require-hashes -r requirements/worker.lock
-          pip install --require-hashes -r requirements/dev.lock
-          pip install -e . --no-deps
+          python3 -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements/worker.lock
+          .venv/bin/pip install --require-hashes -r requirements/dev.lock
+          .venv/bin/pip install -e . --no-deps
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       # pytest exits 5 (ExitCode.NO_TESTS_COLLECTED) if -m matches nothing, and
       # --strict-markers (pyproject.toml addopts) fails collection outright on
       # a typo'd/unregistered marker name -- both make this job fail loudly if
@@ -103,7 +153,7 @@ jobs:
 
   negative-controls:
     name: Negative-control lane (pytest -m negative_controls)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, scenario-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -113,11 +163,13 @@ jobs:
           cache-dependency-path: |
             requirements/worker.lock
             requirements/dev.lock
-      - name: Install the quantitative worker + dev dependencies from the locked, hash-verified sets
+      - name: Create an isolated virtualenv and install the quantitative worker + dev dependencies from the locked, hash-verified sets
         run: |
-          pip install --require-hashes -r requirements/worker.lock
-          pip install --require-hashes -r requirements/dev.lock
-          pip install -e . --no-deps
+          python3 -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements/worker.lock
+          .venv/bin/pip install --require-hashes -r requirements/dev.lock
+          .venv/bin/pip install -e . --no-deps
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       # Same guarantee as the invariants job above: pytest's own exit code 5
       # on an empty selection, plus --strict-markers, is what keeps this lane
       # honest -- no separate emptiness check needed.
@@ -126,26 +178,32 @@ jobs:
 
   control-plane-purity:
     name: Control-plane purity (no scientific stack in requirements/control.lock)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, scenario-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install pytest only -- this check reads requirements/control.lock as text
-        run: pip install --require-hashes -r requirements/dev.lock
+      - name: Create an isolated virtualenv and install pytest only -- this check reads requirements/control.lock as text
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements/dev.lock
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - run: pytest tests/test_control_plane_purity.py tests/test_no_aws_in_core.py -v
 
   dependency-audit:
     name: Dependency audit (pip-audit)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, scenario-core]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-      - name: Install pip-audit from the locked, hash-verified set
-        run: pip install --require-hashes -r requirements/dev.lock
+      - name: Create an isolated virtualenv and install pip-audit from the locked, hash-verified set
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --require-hashes -r requirements/dev.lock
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Audit each lock independently (each ships in a different artifact)
         run: |
           pip-audit -r requirements/worker.lock --require-hashes
@@ -154,21 +212,27 @@ jobs:
 
   secret-scan:
     name: Secret scanning (gitleaks)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, scenario-core]
     env:
       GITLEAKS_VERSION: "8.30.1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # gitleaks scans history; a shallow clone would miss it
-      - name: Install gitleaks (pinned release, checksum-verified)
+      - name: Install gitleaks (pinned release, checksum-verified, scoped to this job's temp dir)
         run: |
           set -euo pipefail
+          workdir="${RUNNER_TEMP}/gitleaks-${GITLEAKS_VERSION}"
+          mkdir -p "$workdir"
+          cd "$workdir"
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
           curl -sSLO "${base}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           curl -sSLO "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
           sha256sum --ignore-missing -c "gitleaks_${GITLEAKS_VERSION}_checksums.txt"
           tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
-          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          chmod +x gitleaks
+          # $RUNNER_TEMP is a per-job directory the runner manages -- no
+          # sudo, no machine-wide /usr/local/bin install, nothing to clean up.
+          echo "$workdir" >> "$GITHUB_PATH"
       - name: gitleaks detect
         run: gitleaks detect --source . --no-banner --redact
