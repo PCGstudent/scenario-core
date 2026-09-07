@@ -15,6 +15,15 @@ ruff>=0.8,<1
 mypy>=1.13,<2
 pip-audit>=2.7,<3
 
+# Test-only, structural HCL parsing for the custom Terraform policy checks
+# (IMPLEMENTATION_PLAN.md Section 17): no aws_nat_gateway/aws_internet_gateway,
+# no Action="*", no broad service wildcards, Resource="*" only against the
+# allow-list, runtime/deployment roles checked separately, PassRole conditions,
+# S3 bucket encryption/public-access-block, DynamoDB registry LeadingKeys
+# conditions. Not a worker/control runtime dependency -- it never appears in
+# worker.lock or control.lock, and no production code path imports it.
+python-hcl2>=6,<7
+
 # Test-only, transport-format re-encoding proof (architecture plan Phase 1:
 # "dataset_id is invariant to re-encoding (CSV -> Parquet -> CSV)",
 # tests/test_artifact_identity.py). Not a worker/control runtime dependency:

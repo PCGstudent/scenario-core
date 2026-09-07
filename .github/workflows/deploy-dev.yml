@@ -1,0 +1,209 @@
+name: Deploy DEV
+
+# Phase 3a (docs/architecture/IMPLEMENTATION_PLAN.md Section 24): "AWS
+# foundation: network, storage, registry, image, CI identity." This
+# workflow's Phase 3a scope is exactly its Files bullet: "build + push +
+# apply" -- it builds the worker image, pushes it to the now-existing DEV
+# ECR repository, and applies envs/dev's Terraform. It does NOT yet
+# consume an `image_digest` Terraform variable the way Section 18.2's
+# full DEPLOY DEV pipeline eventually will -- nothing in Phase 3a's
+# resource graph (kms/network/artifact_store/job_store/worker_image/
+# ci_oidc) references a running task's image at all; that wiring arrives
+# with Phase 3b's worker_compute module. Extending this workflow to pass
+# `-var image_digest=$SOURCE_DIGEST` through to a task-definition-bearing
+# apply is that phase's work, not invented here ahead of a consumer.
+#
+# DELIBERATELY workflow_dispatch ONLY, no `on: push`. A push to main
+# (merging this PR included) must never, by itself, create or change any
+# AWS resource -- the first DEV deployment is an explicit, reviewable,
+# human-triggered action. This also matches physical reality: the
+# `gha-ci-dev` role this workflow assumes over OIDC does not exist until
+# a human runs the bootstrap + first envs/dev apply sequence documented in
+# infra/terraform/bootstrap/README.md with their own account credentials
+# -- an automatic push trigger would simply fail on every run until that
+# one-time sequence has happened, and would then invite exactly the
+# "merge accidentally deploys" mistake this design avoids. Moving to an
+# automatic `on: push: branches: [main]` trigger, once the team is ready
+# to accept that, is a one-line, reviewable follow-up change to this
+# trigger block alone -- not a redesign of anything below it.
+#
+# RUNNER: the same self-hosted runner ci.yml documents (labels:
+# self-hosted, linux, x64, scenario-core) -- see ci.yml's own header
+# comment for the persistence caveat and trust-boundary reasoning; it
+# applies identically here. The runner's own identity is irrelevant to
+# the AWS trust decision: OIDC authorises this GitHub Actions job by its
+# repository and ref (Section 13.2's `sub` condition), never by anything
+# about the machine executing it.
+#
+# JOB ORDERING AND ITS FIRST-BOOTSTRAP PREREQUISITE: `build-and-push` and
+# `terraform-apply` both depend only on `guard` and run IN PARALLEL with
+# each other -- nothing in Phase 3a's Terraform resource graph consumes
+# the pushed image (see above), so there is no data dependency between
+# them today, and running them concurrently is strictly faster. This is
+# safe ONLY because `build-and-push` pushes into an ECR repository that
+# must already exist before this workflow can run at all: `gha-ci-dev`
+# (which both jobs authenticate as) is created by the SAME first-time,
+# human-credentialed `envs/dev` apply that also creates the
+# `worker_image` module's repository (infra/terraform/bootstrap/README.md,
+# step 3) -- by construction, this workflow never gets to run for the
+# very first time before that repository exists. If a future phase makes
+# `terraform-apply` responsible for creating the repository on an
+# ordinary (non-bootstrap) run -- which Phase 3a's design does not do --
+# `build-and-push` would need an explicit `needs: terraform-apply`
+# instead of running in parallel.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "deploy" to confirm this run will apply Terraform against the DEV account and may create AWS resources.'
+        required: true
+        type: string
+
+# Only one deployment at a time -- Terraform's own S3 native locking
+# (envs/dev/backend.tf, use_lockfile = true) already prevents two
+# concurrent applies from corrupting state, but failing fast here in the
+# workflow avoids a confusing lock-contention error mid-run.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+# Workflow-level default: read-only, nothing else. `id-token: write` (the
+# permission that lets `aws-actions/configure-aws-credentials` mint an
+# OIDC token at all) is granted per-job below, only on the two jobs that
+# actually authenticate to AWS -- `guard` runs no AWS action and gets no
+# OIDC permission at all, following the same least-privilege discipline
+# Section 13.1 applies to IAM roles, applied here to workflow permissions.
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  TERRAFORM_VERSION: "1.15.8"
+
+jobs:
+  guard:
+    name: Confirm deliberate dispatch
+    runs-on: [self-hosted, linux, x64, scenario-core]
+    permissions:
+      contents: read
+    steps:
+      - name: Require the exact confirmation phrase
+        # inputs.confirm is caller-supplied text. Interpolating
+        # ${{ inputs.confirm }} directly into the shell script source
+        # (as an earlier version of this workflow did) is a documented
+        # GitHub Actions script-injection vector: GitHub substitutes the
+        # literal value into the YAML before bash ever runs it, so a
+        # value containing shell metacharacters (backticks, `$(...)`)
+        # would execute as code on this runner. Passing it through `env:`
+        # and comparing the resulting environment variable is the
+        # GitHub-documented mitigation -- the value is then just data to
+        # the shell, never source text.
+        env:
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM_INPUT" != "deploy" ]; then
+            echo "::error::Input 'confirm' must be exactly \"deploy\" -- refusing to proceed." >&2
+            exit 1
+          fi
+
+  build-and-push:
+    name: Build worker image, push to DEV ECR
+    needs: guard
+    runs-on: [self-hosted, linux, x64, scenario-core]
+    permissions:
+      contents: read
+      # GitHub mints the OIDC token `aws-actions/configure-aws-credentials`
+      # exchanges for temporary AWS credentials (Section 13.2). No AWS
+      # access key exists in this repository's secrets, in DEV or PROD.
+      id-token: write
+    outputs:
+      image_digest: ${{ steps.push.outputs.image_digest }}
+      image_ref: ${{ steps.push.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials (OIDC -> gha-ci-dev)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.GHA_CI_DEV_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to the DEV ECR repository
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@aded0d722166a37980e030aa969dda0bfe6b6947 # v2.1.7
+
+      - name: Build the worker image (reproducible, from the hash-pinned lock)
+        run: |
+          set -euo pipefail
+          GIT_SHA="$(git rev-parse HEAD)"
+          REPO_URL="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY_NAME }}"
+          docker build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --build-arg "WORKER_GIT_SHA=${GIT_SHA}" \
+            --build-arg "WORKER_IMAGE_REF=${REPO_URL}:${GIT_SHA:0:12}" \
+            -f docker/worker.Dockerfile \
+            -t "${REPO_URL}:${GIT_SHA:0:12}" \
+            .
+          echo "REPO_URL=${REPO_URL}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${GIT_SHA:0:12}" >> "$GITHUB_ENV"
+
+      - name: Push and capture the ECR manifest digest
+        id: push
+        run: |
+          set -euo pipefail
+          docker push "${REPO_URL}:${IMAGE_TAG}"
+          # The ECR manifest digest is what "build once, promote by
+          # digest" (Section 18.2) actually pins -- deliberately NOT the
+          # local docker image ID `docker build`/`docker images` reports,
+          # which is a content-addressed identifier for the LOCAL image
+          # store and is never what a registry, a pull, or a task
+          # definition references.
+          SOURCE_DIGEST="$(aws ecr describe-images \
+            --repository-name "${{ vars.ECR_REPOSITORY_NAME }}" \
+            --image-ids "imageTag=${IMAGE_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          echo "image_digest=${SOURCE_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${REPO_URL}@${SOURCE_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "pushed ${REPO_URL}:${IMAGE_TAG} -- imageDigest=${SOURCE_DIGEST}"
+
+  terraform-apply:
+    name: terraform apply (envs/dev)
+    needs: guard
+    runs-on: [self-hosted, linux, x64, scenario-core]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure AWS credentials (OIDC -> gha-ci-dev)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.GHA_CI_DEV_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Terraform ${{ env.TERRAFORM_VERSION }}
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: infra/terraform/envs/dev
+        run: terraform init -input=false
+
+      - name: terraform plan
+        working-directory: infra/terraform/envs/dev
+        run: terraform plan -input=false -out=dev.tfplan
+
+      - name: terraform apply
+        working-directory: infra/terraform/envs/dev
+        run: terraform apply -input=false -auto-approve dev.tfplan
+
+      - name: terraform output (record what exists now)
+        working-directory: infra/terraform/envs/dev
+        run: terraform output

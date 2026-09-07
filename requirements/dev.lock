@@ -210,6 +210,10 @@ iniconfig==2.3.0 \
     --hash=sha256:c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730 \
     --hash=sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12
     # via pytest
+lark==1.3.1 \
+    --hash=sha256:b426a7a6d6d53189d318f2b6236ab5d6429eaf09259f1ca33eb716eed10d2905 \
+    --hash=sha256:c629b661023a014c37da873b4ff58a817398d12635d3bbb2c5a03be7fe5d1e12
+    # via python-hcl2
 librt==0.15.0 ; platform_python_implementation != 'PyPy' \
     --hash=sha256:04d5387b908676c0b8d5d2f5fb58373b4ea382d81f7a6f0fab8ea2a462bb4738 \
     --hash=sha256:077471b3182db4e17c36ae91555f36a4d2c00080b267f749bcad34a478a9a302 \
@@ -602,6 +606,10 @@ pyparsing==3.3.2 \
 pytest==9.0.3 \
     --hash=sha256:2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9 \
     --hash=sha256:b86ada508af81d19edeb213c681b1d48246c1a91d304c6c81a427674c17eb91c
+    # via -r requirements/dev.in
+python-hcl2==6.1.1 \
+    --hash=sha256:5c41525c71bd7b6b5a3a64e45a9bf40b1c1782da4fdaea42311d42ede71d2ec2 \
+    --hash=sha256:67a0859bdb7d4f258a3278c3f2f058e6d65df28b5f99a8c2b1f0907a51eddfc8
     # via -r requirements/dev.in
 requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
