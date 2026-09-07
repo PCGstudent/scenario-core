@@ -7,8 +7,16 @@
 #
 # Deliberately excludes streamlit/plotly/pyarrow (the interactive lab's `app`
 # extra): the worker never renders a UI, so those ~300MB of transitive
-# dependencies do not belong in the execution image that Phase 2 builds from
-# this lock (architecture plan Section 11.3, "slim the image").
+# dependencies do not belong in a worker execution image (architecture plan
+# Section 11.3, "slim the image").
+#
+# This is the scientific stack for the whole xtra_takehome core (matplotlib
+# for report figures, yfinance for data fetching) -- both genuinely needed by
+# `python -m xtra_takehome` and its own tests. The Phase-2 worker CONTAINER
+# specifically builds from requirements/worker-image.lock instead (see that
+# file's own header comment): a strict subset of this file, pinned to the
+# same versions, that additionally excludes yfinance/matplotlib because
+# neither is reachable from anything the worker process actually imports.
 arch==7.2.0
 matplotlib==3.10.3
 numpy==2.2.6

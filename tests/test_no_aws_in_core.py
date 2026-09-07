@@ -180,6 +180,28 @@ def test_domain_layer_has_no_aws_coupling_when_it_exists():
     _assert_package_is_clean(domain_dir, "the domain layer (scenario_platform.domain)")
 
 
+def test_worker_layer_has_no_aws_coupling_when_it_exists():
+    """Phase 2 creates scenario_platform.worker; it gets the same rule,
+    permanently -- unlike scenario_platform.adapters (documented in the
+    repository structure as "the ONLY place boto3 appears in the data
+    plane," once Phase 3 adds s3_store.py/job_store.py there), the worker
+    process itself is never meant to import boto3 directly. The
+    control/data-plane split (Section 4) means a Phase-3 worker calls
+    *into* ``adapters.s3_store``/``adapters.job_store`` as its own
+    dependency boundary, never the AWS SDK itself -- so this check, unlike
+    the domain one above, is not expected to ever need loosening.
+
+    Skipped rather than failed while the package does not exist, exactly
+    like the domain-layer test above.
+    """
+    import pytest
+
+    worker_dir = REPO_ROOT / "src" / "scenario_platform" / "worker"
+    if not worker_dir.is_dir():
+        pytest.skip("scenario_platform.worker does not exist yet (created in Phase 2)")
+    _assert_package_is_clean(worker_dir, "the worker CLI (scenario_platform.worker)")
+
+
 def test_boto3_import_is_actually_detected():
     """Negative control: the AST scan must be able to fail.
 

@@ -10,3 +10,5 @@ build/
 *.tar
 *.tar.gz
 .cache/
+.acceptance-scratch/
+.acceptance-pytest-tmp/

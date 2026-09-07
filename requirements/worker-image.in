@@ -1,0 +1,42 @@
+# Runtime dependencies of the PRODUCTION WORKER IMAGE specifically
+# (docker/worker.Dockerfile) -- a strict subset of requirements/worker.lock,
+# pinned to the exact same versions (never a different resolution; this file
+# exists to narrow, not to re-choose).
+#
+# requirements/worker.lock is the scientific stack for the whole
+# xtra_takehome core, including yfinance (data fetching) and matplotlib
+# (report figures) -- both genuinely needed by `python -m xtra_takehome`,
+# neither reachable from anything the worker container actually imports.
+# Verified directly: every module the worker's import graph touches
+# (challenger.py, diagnostics.py, metrics.py, windows.py, validation.py --
+# everything scenario_platform.domain.services pulls in from
+# xtra_takehome) was grepped for "matplotlib"/"yfinance" imports, module-
+# level or lazy, and none exists. The worker never fetches data and never
+# renders a figure, so shipping yfinance's and matplotlib's transitive
+# dependency trees (curl-cffi, websockets, protobuf, beautifulsoup4, peewee,
+# pillow, fonttools, kiwisolver, contourpy, ...) in the production image
+# would be unused weight against the Phase-2 image-size ceiling (<= 700 MB)
+# and the "minimal... free from development/UI dependencies" requirement,
+# for packages that are not development/UI dependencies in the abstract but
+# are exactly that *for this image*.
+#
+# Bump this file in lockstep with requirements/worker.in -- same versions,
+# always; if a package here is not in worker.in at the same pin, that is a
+# drift bug, not a feature.
+arch==7.2.0
+numpy==2.2.6
+pandas==2.2.3
+scipy==1.15.3
+statsmodels==0.14.4
+
+# Pre-merge correction: logging OMP_NUM_THREADS/OPENBLAS_NUM_THREADS/
+# MKL_NUM_THREADS does not prove the numerical libraries actually resolved
+# to one thread -- a stale env var, a BLAS build that ignores it, or a
+# `docker run -e` override all leave the *logged* value wrong or misleading.
+# threadpoolctl (pure Python, no C extension, ~40 KB installed) introspects
+# the BLAS/OpenMP thread pools NumPy/SciPy actually loaded and reports their
+# real effective thread count, which is what worker/__main__.py's runtime
+# contract check verifies against. Negligible image-size impact; verified
+# directly with threadpoolctl.threadpool_info() that it correctly reflects
+# both a pinned (1) and an overridden (>1) OpenBLAS thread count.
+threadpoolctl==3.6.0

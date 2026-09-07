@@ -1,0 +1,49 @@
+# Build-context controls for docker/worker.Dockerfile (architecture plan
+# Section 22). The Dockerfile only ever COPYs requirements/worker.lock and
+# src/ explicitly, but this file is still the single source of truth for
+# what may enter the build context at all -- defence in depth against a
+# future Dockerfile edit, and it keeps the context small regardless.
+
+# Git metadata and local environments
+.git
+.gitignore
+.gitattributes
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
+
+# The Streamlit lab -- never part of the worker image
+app.py
+src/xtra_takehome/app/
+
+# Not needed at runtime
+tests/
+docs/
+scripts/
+docker/
+infra/
+reports/
+run.sh
+run.ps1
+README.md
+AGENTS.md
+AIUSAGE.md
+AWS_DESIGN.md
+pyproject.toml
+
+# Dev/control-plane locks -- the worker image installs only worker.lock
+requirements/dev.in
+requirements/dev.lock
+requirements/control.in
+requirements/control.lock
+
+# Editor/OS noise
+.DS_Store
+*.swp
