@@ -138,12 +138,20 @@ module "ci_oidc" {
 # exist yet, by design; Section 25's slice explicitly runs against a
 # manually-registered artifact, not a calibrated one).
 #
-# Deliberately NOT wired here: infra/terraform/modules/demo_killswitch. That
-# module exists to bound the standing cost of a TEMPORARY demonstration
-# deployment (docs/aws-demo-runbook.md) and is applied alongside this
-# environment only for the duration of such a demo -- wiring it in
-# permanently here would make it a standing resource itself, which defeats
-# its purpose.
+# infra/terraform/modules/demo_killswitch is wired in CONDITIONALLY
+# (var.demo_killswitch_enabled, default false) rather than unconditionally
+# or as a separate root/module invocation. Both alternatives were tried and
+# rejected: unconditional would make it a standing resource itself, which
+# defeats its purpose (it exists to bound a TEMPORARY demonstration
+# deployment, docs/aws-demo-runbook.md); a separate invocation applied
+# AFTER this one -- an earlier version of this comment's own plan -- means
+# module.network's costly endpoints exist for the entire gap between the
+# two applies with no auto-cleanup watching them at all, not just during a
+# partial-apply failure. Toggling it on WITHIN this same root module means
+# one `terraform apply -var demo_killswitch_enabled=true` creates the
+# endpoints and their kill switch together, atomically, in the same
+# dependency graph -- docs/aws-demo-runbook.md section 3.1 is the residual,
+# narrower risk this cannot close (the apply itself failing partway).
 
 module "worker_compute" {
   source = "../../modules/worker_compute"
@@ -159,6 +167,7 @@ module "worker_compute" {
   scenario_jobs_table_name = module.job_store.scenario_jobs_table_name
   ecr_repository_arn       = module.worker_image.repository_arn
   ecr_repository_url       = module.worker_image.repository_url
+  worker_image_digest      = var.worker_image_digest
   permissions_boundary_arn = module.ci_oidc.runtime_role_boundary_arn
 }
 
@@ -204,4 +213,27 @@ module "observability" {
   environment       = var.environment
   state_machine_arn = module.job_orchestrator.state_machine_arn
   alert_email       = var.alert_email
+}
+
+# --- Demo-window auto-cleanup (off by default) ------------------------------
+#
+# count-based, not for-each -- there is exactly one of these per
+# environment, ever, matching the pattern every other single-instance
+# module here already uses implicitly (module blocks with no count/for_each
+# at all). `var.demo_killswitch_enabled=true` is only ever passed at apply
+# time for the duration of a demo window (docs/aws-demo-runbook.md); the
+# default `false` means a plain `terraform apply` with no extra -var never
+# creates it.
+
+module "demo_killswitch" {
+  count  = var.demo_killswitch_enabled ? 1 : 0
+  source = "../../modules/demo_killswitch"
+
+  environment          = var.environment
+  region               = var.region
+  vpc_endpoint_ids     = [module.network.ecr_api_endpoint_id, module.network.ecr_dkr_endpoint_id, module.network.logs_endpoint_id]
+  ecs_cluster_arns     = [module.worker_compute.cluster_arn]
+  task_definition_arns = [module.worker_compute.task_definition_arn]
+  failure_alert_email  = var.alert_email
+  schedule_expression  = var.demo_schedule_expression
 }

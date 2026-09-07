@@ -100,12 +100,28 @@ def get_idem_record(principal: str, idempotency_key: str) -> dict[str, Any] | No
     return cast("dict[str, Any] | None", resp.get("Item"))
 
 
+#: Once a job reaches one of these, no further status write may overwrite it
+#: (mark_cancelled/set_execution_arn's conditional updates below both key off
+#: this set) -- a status transition diagram with exactly one direction: into
+#: a terminal state, never out of one.
+TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED"})
+
+
 def get_job(job_id: str) -> dict[str, Any] | None:
-    """Strongly-consistent GetItem on ``JOB#{job_id}`` -- default DynamoDB read
-    behaviour for a single-table GetItem, no ``ConsistentRead`` needed to opt
-    in beyond the default (which is already strongly consistent unless
-    eventual consistency is explicitly requested)."""
-    resp = _jobs_table().get_item(Key={"pk": f"JOB#{job_id}"})
+    """Strongly-consistent GetItem on ``JOB#{job_id}``.
+
+    **Correction**: DynamoDB's ``GetItem`` defaults to an EVENTUALLY
+    consistent read unless ``ConsistentRead=True`` is passed explicitly --
+    an earlier version of this docstring claimed the opposite (that
+    ``GetItem`` is "already strongly consistent unless eventual consistency
+    is explicitly requested"), which is backwards and was never actually
+    enforced by the code below it. A caller polling status right after
+    ``StartExecution``/a state-machine transition needs to see that write
+    immediately, not an eventually-consistent replica lagging behind it, so
+    this explicitly opts in to strong consistency the same way
+    :func:`get_idem_record` already did.
+    """
+    resp = _jobs_table().get_item(Key={"pk": f"JOB#{job_id}"}, ConsistentRead=True)
     return cast("dict[str, Any] | None", resp.get("Item"))
 
 
@@ -222,23 +238,35 @@ def submit_job(
         raise
 
 
-def set_execution_arn(job_id: str, execution_arn: str) -> bool:
-    """Conditional UpdateItem: ``execution_arn`` absent -> present, ``status`` -> QUEUED.
+def _conditional_update(
+    job_id: str,
+    *,
+    update_expression: str,
+    condition_expression: str,
+    values: dict[str, Any],
+    names: dict[str, str] | None = None,
+) -> bool:
+    """Returns ``True`` if the update applied, ``False`` if the condition
+    failed (never raised as an error -- a failed condition here is always a
+    legitimate "someone/something else already moved this forward", never a
+    caller bug).
 
-    Section 6.2a's healing invariant. Returns ``True`` if this call performed
-    the update, ``False`` if the condition failed (someone else already set
-    it -- the caller should treat that as success too, per the healing
-    table's "status == SUBMITTED and execution_arn present -> return 200,
-    nothing to do").
+    ``names`` is only passed to DynamoDB when non-empty: it validates that
+    every declared ``ExpressionAttributeNames`` key is actually referenced
+    somewhere in the expressions, so a caller whose update doesn't touch
+    ``#status`` at all (e.g. the ``execution_arn``-only write below) must
+    not have it declared regardless.
     """
+    kwargs: dict[str, Any] = {
+        "Key": {"pk": f"JOB#{job_id}"},
+        "UpdateExpression": update_expression,
+        "ConditionExpression": condition_expression,
+        "ExpressionAttributeValues": values,
+    }
+    if names:
+        kwargs["ExpressionAttributeNames"] = names
     try:
-        _jobs_table().update_item(
-            Key={"pk": f"JOB#{job_id}"},
-            UpdateExpression="SET execution_arn = :arn, #status = :queued",
-            ConditionExpression="attribute_not_exists(execution_arn)",
-            ExpressionAttributeNames={"#status": "status"},
-            ExpressionAttributeValues={":arn": execution_arn, ":queued": "QUEUED"},
-        )
+        _jobs_table().update_item(**kwargs)
         return True
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
@@ -246,14 +274,70 @@ def set_execution_arn(job_id: str, execution_arn: str) -> bool:
         raise
 
 
-def mark_cancelled(job_id: str) -> None:
-    """``DELETE /scenario-jobs/{job_id}`` -> ``status = CANCELLED`` (Section 6.1 step 7)."""
-    _jobs_table().update_item(
-        Key={"pk": f"JOB#{job_id}"},
-        UpdateExpression="SET #status = :cancelled",
-        ExpressionAttributeNames={"#status": "status"},
-        ExpressionAttributeValues={":cancelled": "CANCELLED"},
+def set_execution_arn(job_id: str, execution_arn: str) -> str:
+    """Record ``execution_arn`` and, if still possible, advance ``SUBMITTED``
+    -> ``QUEUED``. Returns the job's status **after** this call -- the
+    caller (``control.submit``) uses it to decide what to tell the client
+    and whether a just-started execution needs to be stopped again.
+
+    **Two separate conditional writes, not one, and in this order**:
+
+    1. ``SET execution_arn`` -- conditioned only on the ARN being absent
+       (Section 6.2a's healing invariant: exactly-once, idempotent, never
+       regresses anything). Attempted and (on success or "already set by
+       someone else") treated as done, regardless of what happens next.
+    2. ``SET #status = QUEUED`` -- conditioned on the status STILL being
+       ``SUBMITTED``. A single combined ``UpdateItem`` (as an earlier
+       version of this function did) cannot express "always write the ARN,
+       but only advance the status forward": DynamoDB's
+       ``ConditionExpression`` gates the WHOLE update, so a status
+       precondition failing would also have silently dropped the ARN write.
+       Splitting the two closes a real regression this earlier version had:
+       the state machine's own ``RecordQueued``/``RecordSucceeded`` native
+       updates can legitimately land BEFORE this function's own status
+       write (a fast Fargate task can finish before this synchronous
+       ``StartExecution`` caller even gets to call this function) -- an
+       unconditional ``SET #status = QUEUED`` would then stomp a real
+       ``RUNNING``/``SUCCEEDED``/``FAILED``/``CANCELLED`` value back to
+       ``QUEUED``, a genuine status regression. This function never writes
+       status except FROM exactly ``SUBMITTED``.
+    """
+    _conditional_update(
+        job_id,
+        update_expression="SET execution_arn = :arn",
+        condition_expression="attribute_not_exists(execution_arn)",
+        values={":arn": execution_arn},
     )
+    _conditional_update(
+        job_id,
+        update_expression="SET #status = :queued",
+        condition_expression="#status = :submitted",
+        values={":queued": "QUEUED", ":submitted": "SUBMITTED"},
+        names={"#status": "status"},
+    )
+    job = get_job(job_id)
+    assert job is not None, f"job {job_id!r} vanished immediately after being written to"
+    return str(job["status"])
+
+
+def mark_cancelled(job_id: str) -> str:
+    """``DELETE /scenario-jobs/{job_id}`` -> ``status = CANCELLED`` (Section 6.1 step 7),
+    unless the job already reached a :data:`TERMINAL_STATUSES` value first
+    (an already-``SUCCEEDED``/``FAILED``/``CANCELLED`` job is never regressed
+    by a cancellation that lost the race). Returns the job's actual status
+    after this call, which the caller reports back to the client instead of
+    assuming ``CANCELLED`` unconditionally.
+    """
+    _conditional_update(
+        job_id,
+        update_expression="SET #status = :cancelled",
+        condition_expression="NOT (#status IN (:succeeded, :failed, :cancelled))",
+        values={":cancelled": "CANCELLED", ":succeeded": "SUCCEEDED", ":failed": "FAILED"},
+        names={"#status": "status"},
+    )
+    job = get_job(job_id)
+    assert job is not None, f"job {job_id!r} vanished immediately after being written to"
+    return str(job["status"])
 
 
 # --- model-registry table: CANDIDATE# / APPROVAL# / POINTER# ---------------

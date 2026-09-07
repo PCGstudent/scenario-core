@@ -9,13 +9,21 @@
         "TableName": "${jobs_table_name}",
         "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
         "UpdateExpression": "SET #status = :running, started_at = :now",
+        "ConditionExpression": "#status <> :cancelled",
         "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
           ":running": { "S": "RUNNING" },
+          ":cancelled": { "S": "CANCELLED" },
           ":now": { "S.$": "$$.State.EnteredTime" }
         }
       },
       "ResultPath": "$.recordQueuedResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "AlreadyCancelled"
+        }
+      ],
       "Next": "InitAttempt"
     },
     "InitAttempt": {
@@ -127,13 +135,21 @@
         "TableName": "${jobs_table_name}",
         "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
         "UpdateExpression": "SET #status = :failed, error_class = :error_class, finished_at = :now",
+        "ConditionExpression": "#status <> :cancelled",
         "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
           ":failed": { "S": "FAILED" },
+          ":cancelled": { "S": "CANCELLED" },
           ":error_class": { "S.$": "$.classification.error_class" },
           ":now": { "S.$": "$$.State.EnteredTime" }
         }
       },
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "AlreadyCancelled"
+        }
+      ],
       "End": true
     },
     "RecordSucceeded": {
@@ -143,12 +159,25 @@
         "TableName": "${jobs_table_name}",
         "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
         "UpdateExpression": "SET #status = :succeeded, finished_at = :now",
+        "ConditionExpression": "#status <> :cancelled",
         "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
           ":succeeded": { "S": "SUCCEEDED" },
+          ":cancelled": { "S": "CANCELLED" },
           ":now": { "S.$": "$$.State.EnteredTime" }
         }
       },
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "AlreadyCancelled"
+        }
+      ],
+      "End": true
+    },
+    "AlreadyCancelled": {
+      "Comment": "The job was already CANCELLED (a concurrent DELETE won the race against RecordQueued/RecordSucceeded/RecordFailed's own conditional write) -- nothing further to record; the CANCELLED status set by the DELETE handler (control.jobs) is authoritative and left untouched.",
+      "Type": "Pass",
       "End": true
     }
   }

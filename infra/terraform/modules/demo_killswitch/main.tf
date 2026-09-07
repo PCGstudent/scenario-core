@@ -70,15 +70,50 @@ data "aws_iam_policy_document" "cleanup" {
   }
 
   statement {
-    sid       = "StopTasksInDemoClustersOnly"
+    # ecs:DescribeTasks is included here (not just ecs:ListTasks/StopTask)
+    # because the tasks_stopped waiter (lambda/cleanup.py) polls
+    # DescribeTasks itself to confirm a stop actually completed -- without
+    # this the waiter would fail closed with AccessDenied on every call,
+    # silently degrading "confirmed stopped" back to "fire and forget".
+    sid       = "StopAndConfirmTasksInDemoClustersOnly"
     effect    = "Allow"
-    actions   = ["ecs:ListTasks", "ecs:StopTask"]
+    actions   = ["ecs:ListTasks", "ecs:StopTask", "ecs:DescribeTasks"]
     resources = ["*"]
     condition {
       test     = "ArnEquals"
       variable = "ecs:cluster"
       values   = var.ecs_cluster_arns
     }
+  }
+
+  statement {
+    # DescribeTaskDefinition has no resource-level support in the AWS
+    # Service Authorization Reference for ECS (list_ecs.html) -- same
+    # justification as modules/ci_oidc's own "EcsTaskDefinitionReadOnlyAndDeregister"
+    # entry, allowlisted below for this role too.
+    sid       = "DescribeWatchedTaskDefinitions"
+    effect    = "Allow"
+    actions   = ["ecs:DescribeTaskDefinition"]
+    resources = ["*"]
+  }
+
+  statement {
+    # ecs:DeregisterTaskDefinition is NOT resource-scopable, verified
+    # against the AWS Service Authorization Reference for ECS
+    # (list_ecs.html) -- the same finding modules/ci_oidc's own
+    # "EcsTaskDefinitionReadOnlyAndDeregister" entry already establishes
+    # for this exact action (bundled there with DescribeTaskDefinition/
+    # ListTaskDefinitions for the same reason). IAM cannot narrow WHICH
+    # task definition this role is allowed to deregister; the actual
+    # narrowing is in the Lambda's own code (lambda/cleanup.py only ever
+    # calls this with the specific ARNs from var.task_definition_arns,
+    # never a wildcard or a caller-supplied value) -- a real, disclosed
+    # gap between "what IAM can express" and "what the code actually
+    # does", not a silently broader grant than intended.
+    sid       = "DeregisterTaskDefinitions"
+    effect    = "Allow"
+    actions   = ["ecs:DeregisterTaskDefinition"]
+    resources = ["*"]
   }
 
   statement {
@@ -111,11 +146,15 @@ resource "aws_iam_role_policy" "cleanup" {
 }
 
 resource "aws_lambda_function" "cleanup" {
-  function_name    = "4xtra-${var.environment}-demo-cleanup"
-  role             = aws_iam_role.cleanup.arn
-  handler          = "cleanup.handler"
-  runtime          = "python3.13"
-  timeout          = 120
+  function_name = "4xtra-${var.environment}-demo-cleanup"
+  role          = aws_iam_role.cleanup.arn
+  handler       = "cleanup.handler"
+  runtime       = "python3.13"
+  # 90s task-stop confirmation + 90s endpoint-deletion confirmation +
+  # deregistration/API overhead -- 120s (an earlier version's value) was
+  # too tight to let both waits run to their own documented timeouts
+  # without the Lambda itself being killed first.
+  timeout          = 300
   memory_size      = 256
   filename         = data.archive_file.cleanup.output_path
   source_code_hash = data.archive_file.cleanup.output_base64sha256
@@ -124,6 +163,7 @@ resource "aws_lambda_function" "cleanup" {
     variables = {
       VPC_ENDPOINT_IDS      = join(",", var.vpc_endpoint_ids)
       ECS_CLUSTER_ARNS      = join(",", var.ecs_cluster_arns)
+      TASK_DEFINITION_ARNS  = join(",", var.task_definition_arns)
       FAILURE_SNS_TOPIC_ARN = aws_sns_topic.cleanup_failure.arn
     }
   }

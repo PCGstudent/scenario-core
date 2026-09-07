@@ -38,8 +38,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
-from .artifacts import StructuralDiagnostics
+if TYPE_CHECKING:
+    # Deferred exactly like domain/identity.py's own identical guard, and for
+    # the same reason: `.artifacts` pulls in numpy/pandas/xtra_takehome.challenger
+    # transitively (DatasetRef/ModelArtifact's array fields), and nothing at
+    # runtime in this module needs the StructuralDiagnostics *class* -- only
+    # its two attributes, read by ordinary attribute access below. A real
+    # top-level import here would make this module (and everything that
+    # imports it -- scenario_platform.control.admission, in particular)
+    # transitively require the scientific stack just to import, which is
+    # exactly the control-plane/data-plane boundary this codebase's own
+    # `tests/test_control_plane_purity.py` exists to guard. `from __future__
+    # import annotations` above keeps the type annotation below valid as a
+    # lazy string even though the name is undefined at runtime.
+    from .artifacts import StructuralDiagnostics
 
 POLICY_SET_VERSION = "v1"
 

@@ -137,3 +137,17 @@ def test_job_id_mutually_exclusive_with_local_paths(moto_env, tmp_path):
 def test_missing_all_arguments_is_input_error(moto_env):
     exit_code = main(["simulate"])
     assert exit_code == 2  # ExitCode.INPUT
+
+
+def test_retried_job_id_invocation_does_not_crash_on_superseded_publish(moto_env):
+    """Simulates a retried Fargate task for the SAME job (Section 6.3): the
+    second `main()` call must still exit 0 -- the manifest write losing the
+    race to the first invocation's is success, not an internal error."""
+    job_id = "job-golden-retry"
+    _seed_artifact_and_job(moto_env, job_id)
+
+    first_exit = main(["simulate", "--job-id", job_id])
+    assert first_exit == 0
+
+    second_exit = main(["simulate", "--job-id", job_id])
+    assert second_exit == 0

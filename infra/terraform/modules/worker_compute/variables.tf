@@ -43,10 +43,9 @@ variable "ecr_repository_url" {
   type = string
 }
 
-variable "worker_image_tag" {
+variable "worker_image_digest" {
   type        = string
-  default     = "latest"
-  description = "Mutable during early bring-up; the deploy workflow moves this to a digest pin once a real build-once/promote-by-digest pipeline exists for this module (Section 18.2, mirroring the worker image's own eventual pinning)."
+  description = "The worker image's immutable content digest (\"sha256:...\", from `aws ecr describe-images` after the manual build+push handoff in docs/architecture/IMPLEMENTATION_PLAN.md Section 18.2's build-once/promote-by-digest pipeline) -- referenced as `{repository_url}@{digest}`, never `{repository_url}:{tag}`. No default: a task definition that silently floats to whatever a mutable tag currently resolves to is exactly what promote-by-digest exists to prevent (the same reasoning Section 18.3 applies to the PROD image-copy job), and the manifest's own `worker_image_ref` provenance field (worker/__main__.py, from WORKER_IMAGE_REF) is only a meaningful audit trail if this value is pinned, not floating."
 }
 
 variable "permissions_boundary_arn" {

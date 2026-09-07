@@ -2,10 +2,18 @@
 #
 # Production quantitative worker image (architecture plan Section 22:
 # docker/worker.Dockerfile, "digest-pinned base, non-root, threads pinned,
-# MPLBACKEND=Agg"). Phase 2 builds and smoke-tests this image locally and in
-# CI only -- nothing here pushes to a registry, launches a task, or touches
-# AWS in any way; there is no AWS SDK, no AWS CLI, and no credential of any
-# kind anywhere in this file (Phase 2's own scope boundary).
+# MPLBACKEND=Agg"). Phase 2 built and smoke-tested this image locally and in
+# CI only, with no AWS SDK/CLI/credential anywhere in it -- that was this
+# file's own Phase 2 scope boundary. Phase 3b's `simulate --job-id` mode
+# (worker/__main__.py) reads its job document from DynamoDB and its
+# artifact from S3 through scenario_platform.adapters, which import boto3
+# (the ONLY two files in the data plane allowed to, per pyproject.toml's
+# Ruff exception) -- boto3/botocore are therefore now a real, deliberate
+# part of this image (requirements/worker-image.lock), not a boundary
+# violation of the Phase 2 comment this replaces. Still no AWS CLI and no
+# credential baked into the image itself: the ECS task role supplies
+# credentials at runtime via the container credential provider, never
+# anything this Dockerfile embeds.
 
 FROM python:3.13-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
 
@@ -49,7 +57,27 @@ WORKDIR /app
 # makes. --require-hashes makes an unpinned or substituted transitive
 # dependency a hard build failure, not a silent drift.
 COPY requirements/worker-image.lock /app/requirements/worker-image.lock
-RUN pip install --no-cache-dir --require-hashes -r /app/requirements/worker-image.lock
+# botocore ships per-service API definitions for every AWS service AWS has
+# ever published (432 directories, ~27 MB measured directly) under its own
+# `data/` directory -- scenario_platform.adapters only ever constructs an
+# S3 or a DynamoDB client/resource (job_store.py, s3_store.py; grepped, not
+# assumed), so every other service's definition is dead weight this image
+# has no reason to ship. Adding boto3/botocore for Phase 3b's `--job-id`
+# mode pushed the built image from ~610 MB to 722 MB, over the Phase 2
+# acceptance ceiling (<= 700 MB) that predates boto3 entirely.
+#
+# The prune MUST happen in this SAME `RUN` as the install, not a later one:
+# Docker images are a stack of layers, and deleting a file in a LATER layer
+# only adds a whiteout marker over it -- the deleted bytes are still
+# physically present in the earlier `pip install` layer and still count
+# toward the image's real size. A first attempt at this fix put the prune
+# in its own subsequent `RUN` and measured NO size reduction at all
+# (`docker images` still reported 722 MB) for exactly this reason; merging
+# both into one layer is what actually removes the bytes.
+RUN pip install --no-cache-dir --require-hashes -r /app/requirements/worker-image.lock \
+    && BOTOCORE_DATA=$(python -c "import botocore, os; print(os.path.join(os.path.dirname(botocore.__file__), 'data'))") \
+    && find "$BOTOCORE_DATA" -mindepth 1 -maxdepth 1 -type d ! -name s3 ! -name dynamodb -exec rm -rf {} + \
+    && python -c "import boto3; boto3.client('s3', region_name='eu-west-1'); boto3.resource('dynamodb', region_name='eu-west-1'); print('s3/dynamodb client construction OK after data-directory pruning')"
 
 # Only the two source trees the worker actually imports: the quantitative
 # core (src/xtra_takehome, unchanged, invariant-bearing) and the platform

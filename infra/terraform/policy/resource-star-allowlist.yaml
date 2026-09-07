@@ -79,8 +79,8 @@ runtime:
       the ecs:cluster condition, not by task ARN.
 
   - role: "4xtra-{env}-demo-cleanup (modules/demo_killswitch)"
-    action: "ecs:ListTasks, ecs:StopTask"
-    sid: "StopTasksInDemoClustersOnly"
+    action: "ecs:ListTasks, ecs:StopTask, ecs:DescribeTasks"
+    sid: "StopAndConfirmTasksInDemoClustersOnly"
     file: "infra/terraform/modules/demo_killswitch/main.tf"
     justification: >
       ecs:ListTasks reads across an entire cluster by construction (it
@@ -88,11 +88,43 @@ runtime:
       task) and has no resource type to scope to before the call returns.
       ecs:StopTask's target task ARN is discovered from that same
       ListTasks call at invocation time, not known when this policy is
-      authored. Both are scoped instead by the ecs:cluster condition to
+      authored. ecs:DescribeTasks is what the `tasks_stopped` waiter
+      (lambda/cleanup.py) polls to confirm a stop actually completed,
+      rather than trusting StopTask's own acceptance of the request.
+      All three are scoped instead by the ecs:cluster condition to
       exactly the demo cluster ARN(s) this module is told to watch
       (var.ecs_cluster_arns) -- the same runtime-unknown-resource pattern
       already documented for modules/job_orchestrator's identical actions
       above.
+
+  - role: "4xtra-{env}-demo-cleanup (modules/demo_killswitch)"
+    action: "ecs:DescribeTaskDefinition"
+    sid: "DescribeWatchedTaskDefinitions"
+    file: "infra/terraform/modules/demo_killswitch/main.tf"
+    justification: >
+      Same verified limitation as modules/ci_oidc's own
+      "EcsTaskDefinitionReadOnlyAndDeregister" entry below:
+      DescribeTaskDefinition's own row in list_ecs.html lists no resource
+      type at all. Used to confirm a deregistration actually took effect
+      (verification, not assumption) before this module reports it as
+      done.
+
+  - role: "4xtra-{env}-demo-cleanup (modules/demo_killswitch)"
+    action: "ecs:DeregisterTaskDefinition"
+    sid: "DeregisterTaskDefinitions"
+    file: "infra/terraform/modules/demo_killswitch/main.tf"
+    justification: >
+      Same verified limitation as modules/ci_oidc's own
+      "EcsTaskDefinitionReadOnlyAndDeregister" entry below: this action's
+      own row in list_ecs.html lists no resource type at all, so IAM
+      cannot scope WHICH task definition this role may deregister to
+      var.task_definition_arns -- an earlier version of this module
+      attempted exactly that scoping and was wrong to. The actual
+      narrowing lives in the Lambda's own code
+      (infra/terraform/modules/demo_killswitch/lambda/cleanup.py only
+      ever calls this with the specific ARNs it was configured with),
+      not in IAM -- a real, disclosed gap, not a silently broader grant
+      than intended.
 
   - role: "4xtra-{env}-demo-cleanup (modules/demo_killswitch)"
     action: "ec2:DescribeVpcEndpoints"

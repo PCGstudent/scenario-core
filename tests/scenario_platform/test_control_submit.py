@@ -198,3 +198,119 @@ def test_malformed_json_returns_422(moto_env):
 def test_unknown_field_returns_422(approved_v1):
     resp = submit.handler(_event(_body(bogus_field=True)))
     assert resp["statusCode"] == 422
+
+
+# --- Interleaving/state-transition tests (job_store's conditional writes) --
+
+
+def test_execution_advances_before_arn_is_persisted(approved_v1):
+    """The state machine's own RecordQueued can land (status -> RUNNING)
+    before this synchronous caller gets to persist execution_arn. The ARN
+    must still be recorded; the status write must be a no-op, not a
+    regression back to QUEUED."""
+    job_store._jobs_table().put_item(
+        Item={"pk": "JOB#race-1", "sk": "META", "job_id": "race-1", "status": "RUNNING"}
+    )
+    status = job_store.set_execution_arn(
+        "race-1", "arn:aws:states:eu-west-1:123456789012:execution:x:race-1"
+    )
+    assert status == "RUNNING"
+    job = job_store.get_job("race-1")
+    assert job["status"] == "RUNNING"
+    assert (
+        job["execution_arn"] == "arn:aws:states:eu-west-1:123456789012:execution:x:race-1"
+    )
+
+
+def test_cancellation_during_startup_is_not_overwritten_and_stops_execution(approved_v1):
+    """A DELETE that wins the race while the job is still SUBMITTED (no
+    execution_arn yet) must stick -- the later set_execution_arn call still
+    records the ARN (for provenance) but must not resurrect QUEUED, and
+    submit.py's own caller (tested separately) uses the returned status to
+    stop the just-started execution."""
+    job_store._jobs_table().put_item(
+        Item={"pk": "JOB#race-2", "sk": "META", "job_id": "race-2", "status": "SUBMITTED"}
+    )
+    cancelled_status = job_store.mark_cancelled("race-2")
+    assert cancelled_status == "CANCELLED"
+
+    status = job_store.set_execution_arn(
+        "race-2", "arn:aws:states:eu-west-1:123456789012:execution:x:race-2"
+    )
+    assert status == "CANCELLED"
+    job = job_store.get_job("race-2")
+    assert job["status"] == "CANCELLED"
+    assert (
+        job["execution_arn"] == "arn:aws:states:eu-west-1:123456789012:execution:x:race-2"
+    )
+
+
+def test_concurrent_completion_vs_cancellation_dynamodb_condition(approved_v1):
+    """Proves the exact ConditionExpression
+    modules/job_orchestrator/state_machine.asl.json.tftpl's RecordSucceeded/
+    RecordFailed states use ("#status <> :cancelled") behaves as intended
+    against real DynamoDB semantics (via moto) -- Step Functions itself
+    cannot be executed in this test, but the DynamoDB native-integration
+    condition it relies on is fully testable directly."""
+    from botocore.exceptions import ClientError
+
+    table = job_store._jobs_table()
+    table.put_item(
+        Item={"pk": "JOB#race-3", "sk": "META", "job_id": "race-3", "status": "CANCELLED"}
+    )
+    with pytest.raises(ClientError) as exc_info:
+        table.update_item(
+            Key={"pk": "JOB#race-3"},
+            UpdateExpression="SET #status = :succeeded",
+            ConditionExpression="#status <> :cancelled",
+            ExpressionAttributeNames={"#status": "status"},
+            ExpressionAttributeValues={
+                ":succeeded": "SUCCEEDED",
+                ":cancelled": "CANCELLED",
+            },
+        )
+    assert exc_info.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+    assert job_store.get_job("race-3")["status"] == "CANCELLED"
+
+    # The same write against a job that was NOT cancelled succeeds.
+    table.put_item(
+        Item={"pk": "JOB#race-4", "sk": "META", "job_id": "race-4", "status": "RUNNING"}
+    )
+    table.update_item(
+        Key={"pk": "JOB#race-4"},
+        UpdateExpression="SET #status = :succeeded",
+        ConditionExpression="#status <> :cancelled",
+        ExpressionAttributeNames={"#status": "status"},
+        ExpressionAttributeValues={":succeeded": "SUCCEEDED", ":cancelled": "CANCELLED"},
+    )
+    assert job_store.get_job("race-4")["status"] == "SUCCEEDED"
+
+
+def test_replay_after_completion_returns_terminal_status_without_restarting(approved_v1):
+    """A replay of an already-SUCCEEDED job must report SUCCEEDED as-is --
+    healing only fires for status == SUBMITTED with no execution_arn, so a
+    terminal job is never re-started."""
+    job_store._jobs_table().put_item(
+        Item={
+            "pk": "JOB#done-1",
+            "sk": "META",
+            "job_id": "done-1",
+            "status": "SUCCEEDED",
+            "execution_arn": "arn:aws:states:eu-west-1:123456789012:execution:x:done-1",
+        }
+    )
+    job_store._jobs_table().put_item(
+        Item={
+            "pk": f"IDEM#{PRINCIPAL}#done-key",
+            "sk": "META",
+            "job_id": "done-1",
+            "client_request_hash": client_request_hash(
+                ScenarioJobIn.model_validate(_body())
+            ),
+        }
+    )
+    resp = submit.handler(_event(_body(), idempotency_key="done-key"))
+    assert resp["statusCode"] == 200
+    out = json.loads(resp["body"])
+    assert out["job_id"] == "done-1"
+    assert out["status"] == "SUCCEEDED"

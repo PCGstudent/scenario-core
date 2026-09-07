@@ -73,6 +73,11 @@ variable "github_ref" {
 
 # --- Phase 3b: vertical slice (Section 24, 25) ------------------------------
 
+variable "worker_image_digest" {
+  type        = string
+  description = "See modules/worker_compute's identical variable -- the worker image's immutable content digest (\"sha256:...\"), never a mutable tag. No default: passed explicitly at apply time from `aws ecr describe-images` after the manual build+push handoff."
+}
+
 variable "control_plane_package_path" {
   type        = string
   description = "Path to the built control-plane Lambda zip (scripts/package_control_plane.py). No default -- deploy-dev.yml (extended, Phase 3b's own Files bullet) builds this artifact and passes its path explicitly; nothing here builds it, the same way the worker image is built and pushed outside Terraform entirely."
@@ -81,4 +86,16 @@ variable "control_plane_package_path" {
 variable "alert_email" {
   type        = string
   description = "Operational-alert recipient for modules/observability's SNS topic (Step Functions execution failures). A separate concern from modules/demo_killswitch's own failure alert, even when the same address is used for both."
+}
+
+variable "demo_killswitch_enabled" {
+  type        = bool
+  default     = false
+  description = "Off by default -- creates modules/demo_killswitch (the demo-window auto-cleanup) in the SAME apply as module.network's costly endpoints, so both are created atomically rather than in a second, separate apply that would leave the endpoints unwatched in between (docs/aws-demo-runbook.md section 3.1). Only ever set true for the duration of a demo window."
+}
+
+variable "demo_schedule_expression" {
+  type        = string
+  default     = null
+  description = "Required (non-null) only when demo_killswitch_enabled=true: a one-time EventBridge Scheduler `at(yyyy-mm-ddThh:mm:ss)` expression (UTC), e.g. computed via `timeadd(timestamp(), \"4h\")` at apply time. See modules/demo_killswitch's own identical variable for why this has no default of its own."
 }

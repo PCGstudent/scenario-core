@@ -76,6 +76,23 @@ def _execution_arn_for(job_id: str) -> tuple[str, str]:
 
 
 def _start_or_heal_execution(job_id: str) -> str:
+    """Starts (or recovers, per the module docstring) the execution, then
+    returns the job's CURRENT status -- which is not necessarily ``QUEUED``:
+
+    * The state machine's own ``RecordQueued``/``RecordSucceeded`` native
+      updates can land before this function's own status write does (a
+      fast job can finish before this synchronous caller even gets here);
+      ``job_store.set_execution_arn`` never regresses that, and this
+      function reports whatever it actually observes.
+    * A ``DELETE`` can race a job that is still ``SUBMITTED`` with no
+      ``execution_arn`` yet (cancellation during startup): the caller wins,
+      marks it ``CANCELLED``, and only THEN does this function's
+      ``StartExecution``/``set_execution_arn`` sequence run. Detected here
+      by ``set_execution_arn`` reporting ``CANCELLED`` back -- in which case
+      the just-started (or just-recovered) execution is itself stopped
+      immediately, best-effort, so a cancelled job does not silently keep
+      running compute anyway.
+    """
     state_machine_arn, execution_arn = _execution_arn_for(job_id)
     try:
         _sfn().start_execution(
@@ -85,8 +102,17 @@ def _start_or_heal_execution(job_id: str) -> str:
         )
     except _sfn().exceptions.ExecutionAlreadyExists:
         pass
-    job_store.set_execution_arn(job_id, execution_arn)
-    return execution_arn
+    status = job_store.set_execution_arn(job_id, execution_arn)
+    if status == "CANCELLED":
+        try:
+            _sfn().stop_execution(executionArn=execution_arn)
+        except _sfn().exceptions.ExecutionDoesNotExist:
+            pass
+        LOGGER.info(
+            "execution stopped: job was cancelled before/during startup",
+            extra={"job_id": job_id, "execution_arn": execution_arn},
+        )
+    return status
 
 
 def _canonical_request(
@@ -131,8 +157,7 @@ def _handle_replay(idem: dict[str, Any], expected_hash: str) -> ScenarioJobOut:
         )
     status = str(job["status"])
     if status == "SUBMITTED" and "execution_arn" not in job:
-        _start_or_heal_execution(job_id)
-        status = "QUEUED"
+        status = _start_or_heal_execution(job_id)
     return ScenarioJobOut(job_id=job_id, status=status, poll=f"/scenario-jobs/{job_id}")
 
 
@@ -189,8 +214,8 @@ def _submit_new_job(
                 ) from None
             job_id = str(uuid.uuid4())
 
-    _start_or_heal_execution(job_id)
-    out = ScenarioJobOut(job_id=job_id, status="QUEUED", poll=f"/scenario-jobs/{job_id}")
+    status = _start_or_heal_execution(job_id)
+    out = ScenarioJobOut(job_id=job_id, status=status, poll=f"/scenario-jobs/{job_id}")
     return json_response(202, out.model_dump())
 
 

@@ -113,6 +113,8 @@ select = ["E", "F", "I", "UP", "B", "TID251"]
 "tests/scenario_platform/test_control_submit.py" = ["TID251"]
 "tests/scenario_platform/test_control_admission.py" = ["TID251"]
 "tests/scenario_platform/test_worker_job_id_mode.py" = ["TID251"]
+"tests/scenario_platform/test_s3_store.py" = ["TID251"]
+"tests/infra/test_demo_killswitch_cleanup.py" = ["TID251"]
 # Operator scripts run once, manually, with direct human credentials --
 # never imported by application code, never run by CI (scripts/seed_registry.py's
 # own docstring; the same posture as scripts/build_artifact.py).

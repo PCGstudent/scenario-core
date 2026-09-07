@@ -585,18 +585,33 @@ def _resolve_simulate_inputs(
         output_dir = Path(output_tmp.name)
         try:
             s3_store.download_artifact(expected_artifact_id, artifact_dir)
-        except Exception as exc:  # noqa: BLE001 -- re-classified below, not swallowed
+        except s3_store.ArtifactNotFound as exc:
             # Section 8.3: "artifact missing ... on the loader" is
             # ARTIFACT_INTEGRITY, not an unrelated INTERNAL failure -- the
             # same fail-closed rule _load_and_verify_artifact already
             # applies to a missing/malformed LOCAL artifact directory,
-            # extended here to a missing/unreachable S3 object.
+            # extended here to a genuinely missing S3 object (never a
+            # permissions/config problem or an exhausted transient retry,
+            # both of which s3_store.download_artifact classifies
+            # separately and lets propagate as-is below).
             artifact_tmp.cleanup()
             output_tmp.cleanup()
             raise ArtifactIntegrityError(
-                f"could not fetch artifact {expected_artifact_id!r} from S3: "
-                f"{type(exc).__name__}: {exc}"
+                f"artifact {expected_artifact_id!r} not found in S3: {exc}"
             ) from exc
+        except (s3_store.ArtifactAccessConfigError, s3_store.ArtifactTransientError):
+            # Deliberately NOT mapped to ArtifactIntegrityError: a
+            # permissions/endpoint-policy misconfiguration or an exhausted
+            # transient retry says nothing about whether the artifact
+            # itself is intact, and Section 8.3's ARTIFACT_INTEGRITY
+            # error_class specifically claims "storage mutation or a
+            # wrong-object read" -- a claim neither of these failures
+            # supports. Falls through to _cmd_simulate's generic
+            # exception handler (INTERNAL), which already logs the full
+            # cause with exc_info=True.
+            artifact_tmp.cleanup()
+            output_tmp.cleanup()
+            raise
         return (
             artifact_dir,
             expected_artifact_id,
@@ -774,7 +789,23 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
             # reaches S3 at all, and any partial S3 upload here would still
             # be missing manifest.json, so it is invisible to any consumer
             # gating on the same completion contract this worker documents.
-            s3_store.upload_run_outputs(job_id_for_upload, output_dir)
+            try:
+                s3_store.upload_run_outputs(job_id_for_upload, output_dir)
+            except s3_store.ConcurrentPublishSuperseded as exc:
+                # A retried invocation of the SAME job (Section 6.3: retries
+                # are safe because a re-run is deterministic) whose manifest
+                # write lost the race to an earlier attempt's -- this
+                # invocation's own computation is correct and complete, it
+                # simply is not the copy a reader will see. That is success,
+                # not failure: raising this onward would report SUCCESS as
+                # an error, and the classifier has no error_class for "the
+                # answer was right but someone else's identical copy was
+                # published first."
+                LOGGER.info(
+                    "simulate succeeded but manifest publish was superseded "
+                    "by a concurrent/earlier invocation of the same job",
+                    extra={"job_id": job_id_for_upload, "reason": str(exc)},
+                )
 
         LOGGER.info(
             "simulate succeeded",

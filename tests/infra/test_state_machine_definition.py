@@ -128,3 +128,24 @@ def test_run_simulation_uses_the_optimized_sync_integration():
         definition["States"]["RunSimulation"]["Resource"]
         == "arn:aws:states:::ecs:runTask.sync"
     )
+
+
+def test_record_queued_succeeded_failed_all_guard_against_cancelled():
+    """A concurrent DELETE that already set CANCELLED must never be
+    regressed by RecordQueued/RecordSucceeded/RecordFailed's own native
+    DynamoDB writes."""
+    definition = _load_definition()
+    for state_name in ("RecordQueued", "RecordSucceeded", "RecordFailed"):
+        state = definition["States"][state_name]
+        condition = state["Parameters"]["ConditionExpression"]
+        assert "cancelled" in condition.lower(), f"{state_name} has no CANCELLED guard"
+        catches = state.get("Catch", [])
+        assert any(
+            "DynamoDB.ConditionalCheckFailedException" in c["ErrorEquals"] for c in catches
+        ), f"{state_name} does not catch a lost race against cancellation"
+
+
+def test_already_cancelled_is_a_terminal_no_op():
+    definition = _load_definition()
+    assert definition["States"]["AlreadyCancelled"]["Type"] == "Pass"
+    assert definition["States"]["AlreadyCancelled"]["End"] is True

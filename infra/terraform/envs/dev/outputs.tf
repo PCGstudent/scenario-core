@@ -63,8 +63,7 @@ output "worker_cluster_arn" {
 }
 
 output "ecr_api_endpoint_id" {
-  description = "For modules/demo_killswitch's vpc_endpoint_ids, if/when a demo window is stood up."
-  value       = module.network.ecr_api_endpoint_id
+  value = module.network.ecr_api_endpoint_id
 }
 
 output "ecr_dkr_endpoint_id" {
@@ -73,4 +72,9 @@ output "ecr_dkr_endpoint_id" {
 
 output "logs_endpoint_id" {
   value = module.network.logs_endpoint_id
+}
+
+output "demo_killswitch_schedule_arn" {
+  description = "Null unless applied with -var demo_killswitch_enabled=true. docs/aws-demo-runbook.md section 3.1: confirm this resolves immediately after any apply that was meant to create it."
+  value       = try(module.demo_killswitch[0].schedule_arn, null)
 }

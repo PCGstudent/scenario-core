@@ -38,8 +38,11 @@ any of it yet:**
   3a modules — the full Phase 3b vertical slice (`terraform validate`
   passes; nothing has been planned or applied against the real backend).
 - `infra/terraform/modules/demo_killswitch` — the independent auto-cleanup
-  mechanism (section 4), a standalone module not wired into `envs/dev`
-  (see that module's own comment for why).
+  mechanism (section 3), wired into `envs/dev` CONDITIONALLY
+  (`var.demo_killswitch_enabled`, default `false`) so a plain `apply`
+  never creates it, but a demo apply creates it atomically alongside
+  `module.network`'s endpoints in the same plan (section 3's own design
+  note on why a separate, later apply was rejected).
 - `src/scenario_platform/control/*` (three Lambda handlers), the new
   `simulate --job-id` mode on the worker CLI, `adapters/{s3_store,
   job_store}.py`.
@@ -157,32 +160,50 @@ not investigated per standing instruction) **or on any local machine**
 being on.
 
 **What is built** (`modules/demo_killswitch/{main.tf,lambda/cleanup.py}`,
-not yet applied):
+not yet applied), in the order the Lambda actually runs it:
 
-- `aws_scheduler_schedule`, **one-time** (`at(...)`, never a recurring
-  cron) — the deadline is a required input (`var.schedule_expression`),
-  never a value this module invents for itself.
-- A cleanup Lambda whose IAM role can, and only can: `ec2:
-  DescribeVpcEndpoints` (no resource-level support, allowlisted) +
-  `ec2:DeleteVpcEndpoints` scoped to exactly the endpoint ARNs it is
-  told to watch; `ecs:ListTasks`/`StopTask` scoped by an `ecs:cluster`
-  condition to exactly the cluster ARNs it is told to watch; `sns:
-  Publish` to its own one failure topic. No `s3:*`, `dynamodb:*`,
-  `kms:*`, `iam:*` — verified by reading the policy document, not by
-  intent: no statement in `modules/demo_killswitch/main.tf` names any of
-  those services at all, so there is nothing to accidentally exercise.
-- **Order of operations inside the Lambda, and why**: stop any still-
-  running Fargate tasks in the watched cluster(s) **before** deleting the
-  interface endpoints. Deleting the endpoints first would cut a running
-  task off from DynamoDB/S3/ECR/Logs without stopping its billed compute
-  time — "the endpoints are gone" is not the same claim as "the compute
-  is gone," and the code treats them as two separate, sequenced steps.
-- **Idempotent**: every step describes current state (`DescribeVpcEndpoints`,
-  `ListTasks`) before acting, and treats "already gone" as success, not
-  as an error to retry into.
-- **Verification, not assumption**: after issuing the delete calls, it
-  polls `DescribeVpcEndpoints` for up to 60s until every targeted
-  endpoint reports `deleted`/`deleting`. A timeout is recorded as failure.
+1. **Deregister the watched task definition(s) first** (`ecs:
+   DeregisterTaskDefinition`, scoped to exactly the ARN(s) it is told to
+   watch). This is the step that actually stops NEW compute from being
+   placed while cleanup runs: Step Functions' `RunSimulation` state
+   references one fixed task-definition ARN baked in at `terraform
+   apply` time, and `ecs:RunTask` against a deregistered revision fails
+   immediately at the ECS API level — a submission arriving mid-cleanup
+   cannot place a task, no matter how many times its own bounded retry
+   loop tries (that failure is classified `TRANSIENT_INFRA` by
+   `classify_failure.py`'s existing "unrecognised ECS error" branch, so
+   such a submission still burns its retry budget before failing closed
+   — compute is blocked from being *placed*, not from being *retried at
+   the state-machine level*, a real but bounded, disclosed limit).
+   Confirmed by re-`DescribeTaskDefinition`-ing afterward, not assumed
+   from the deregister call's own HTTP success.
+2. **Stop already-running Fargate tasks**, cluster task lists paginated
+   in full (not just the first page), each `StopTask` confirmed via
+   boto3's `tasks_stopped` waiter — not fire-and-forget. Deleting the
+   endpoints before this would cut a running task off from DynamoDB/S3/
+   ECR/Logs without stopping its billed compute time; "the endpoints are
+   gone" is not the same claim as "the compute is gone."
+3. **Delete the interface endpoints**, each id's state checked
+   **individually** (a single batched `DescribeVpcEndpoints` call fails
+   entirely if even one of several ids is unrecognised, which would
+   otherwise mask the real state of every other, still-billing,
+   endpoint), polled until each genuinely reports `deleted` — `deleting`
+   is still in progress, not the same as done, and is not mistaken for
+   it. The `Unsuccessful` list `DeleteVpcEndpoints` itself returns is
+   inspected, not ignored.
+
+The role behind all of this can, and only can: the three EC2/ECS actions
+above (each individually allowlisted in
+`infra/terraform/policy/resource-star-allowlist.yaml` with its own AWS
+Service Authorization Reference citation) plus `sns:Publish` to its own
+one failure topic. No `s3:*`, `dynamodb:*`, `kms:*`, `iam:*` — verified by
+reading the policy document, not by intent: no statement in
+`modules/demo_killswitch/main.tf` names any of those services at all, so
+there is nothing to accidentally exercise.
+
+- **Idempotent** at every step: each one describes current state before
+  acting and treats "already gone/already inactive/already stopped" as
+  success, not as an error to retry into.
 - **On failure**: publishes to its own SNS topic (`todosgranja@gmail.com`),
   naming the specific errors, then re-raises so CloudWatch's own `AWS/
   Lambda Errors` metric fires too — a second, independent alarm
@@ -194,6 +215,34 @@ not yet applied):
 - **This is a safety net, not the primary teardown path.** The intended
   flow is manual teardown within the window (section 6); the schedule
   only matters if that is missed.
+
+### 3.1 The one window this cannot close: a partial `terraform apply`
+
+If the same `terraform apply` that creates `module.network` (the costly
+endpoints) also creates `modules/demo_killswitch` (the schedule that
+watches them) — as section 4 below instructs — an apply that fails
+**after** the endpoints exist but **before** the schedule/Lambda do
+leaves a real, unprotected window: costly resources with no auto-cleanup
+watching them yet.
+
+**Mitigation, not a guarantee**:
+
+- Never apply `module.network` with `-target` on its own for a demo —
+  always a single, untargeted `terraform apply` covering both
+  `module.network` and `modules/demo_killswitch` together, so Terraform's
+  own dependency graph either creates both or (on failure) leaves the
+  error visible before declaring the apply done.
+- **Immediately after any apply that touches the demo resources**, before
+  doing anything else, run `terraform state list | grep demo_killswitch`
+  (or the module's own `terraform output schedule_arn`) and confirm it
+  resolves. If the apply reported an error and this comes back empty,
+  the endpoints may already exist unprotected — proceed straight to
+  section 6's manual teardown for `module.network` rather than walking
+  away or retrying blind.
+- This is a process discipline, not a code fix: no Terraform provider
+  feature makes a multi-resource `apply` atomic across a partial-failure
+  boundary. Treat "confirm the schedule exists" as a mandatory step of
+  section 4, not an optional sanity check.
 
 **Reconciling Terraform after this Lambda fires** (it acts outside any
 `terraform apply`/`destroy`, so state and reality diverge the moment it
@@ -212,42 +261,75 @@ runs):
    will report 0 real deletions for the 3 endpoints (already gone) and
    correctly remove everything else in that module (VPC, subnets,
    security groups, flow-log bucket) that the Lambda did not touch.
-4. If the intent is instead to resume the demo: `terraform apply`
-   recreates the 3 endpoints with fresh IDs — update
-   `modules/demo_killswitch`'s `vpc_endpoint_ids` input and re-apply that
-   module too if a fresh deadline is wanted, since it was watching IDs
-   that no longer exist.
+4. If the intent is instead to resume the demo: `terraform apply` (with
+   `demo_killswitch_enabled=true` and a fresh `demo_schedule_expression`)
+   recreates the 3 endpoints with fresh IDs and re-wires
+   `module.demo_killswitch`'s `vpc_endpoint_ids` to them automatically
+   (it is wired from `module.network`'s own outputs, section 3's design
+   note -- nothing to update by hand).
 
 ## 4. Demo window plan
 
+**A real chicken-and-egg step, disclosed rather than glossed over**:
+`module.worker_compute`'s task definition takes the worker image's digest
+as a required Terraform INPUT variable (section 6's own fix, replacing a
+mutable `:tag` reference) — but the ECR repository that image gets pushed
+to (`module.worker_image`) does not exist until `envs/dev` is applied at
+least once. A single, one-shot `terraform apply` therefore cannot work
+the very first time; the connectivity probe's own task definition
+(`probe.tf`) sidesteps this by referencing a mutable `:probe` tag instead,
+resolved by ECS at pull time rather than baked into a Terraform value —
+`worker_compute` deliberately does not take that shortcut (section 6's
+whole point). Two applies, the first narrow, are required on a truly
+first-ever deployment only:
+
 1. `aws sts get-caller-identity --profile 4xtra-dev` — confirm account
    758895552145, region eu-west-1; re-authenticate if the session expired.
-2. `cd infra/terraform/envs/dev && terraform init && terraform plan
-   -var control_plane_package_path=<path to scripts/package_control_plane.py's
-   output> -out=dev.tfplan` — **review the plan** (expected: the full
-   Phase 3a + 3b resource set, ~35-45 resources depending on final count;
-   0 destroys). This is the point at which "does it actually apply"
-   (section 1's first AWS-only unknown) gets answered.
-3. `terraform apply dev.tfplan`.
-4. Build and push the worker image (now including `boto3` per
-   `requirements/worker-image.in`) to ECR, manually, once — same
-   handoff pattern as the existing connectivity probe.
-5. `python scripts/seed_registry.py ...` — register the one frozen
+2. `cd infra/terraform/envs/dev && terraform init && terraform apply \
+   -target=module.worker_image` — creates ONLY the ECR repository (and
+   its own KMS/CI-identity dependencies), so there is somewhere to push
+   to. Skip this step on any subsequent demo run where the repository
+   already exists.
+3. Build and push the worker image (now including `boto3` per
+   `requirements/worker-image.in`) to that repository, manually, once —
+   same handoff pattern as the existing connectivity probe.
+4. `aws ecr describe-images --repository-name <name> --image-ids
+   imageTag=<pushed tag> --query 'imageDetails[0].imageDigest' --output text`
+   — capture the real digest (`sha256:...`).
+5. Compute a deadline, e.g. `date -u -d "+4 hours" +%Y-%m-%dT%H:%M:%S`
+   (UTC, no offset suffix -- `aws_scheduler_schedule` wants `at(...)`
+   format).
+6. `terraform plan \
+   -var worker_image_digest=<digest from step 4> \
+   -var control_plane_package_path=<scripts/package_control_plane.py's output> \
+   -var demo_killswitch_enabled=true \
+   -var demo_schedule_expression="at(<deadline from step 5>)" \
+   -out=dev.tfplan` — **review the plan** (expected: the remaining Phase
+   3a + full Phase 3b resource set PLUS `module.demo_killswitch`'s
+   schedule/Lambda/SNS topic, all in the SAME plan; 0 destroys, and
+   `module.worker_image` shows no changes since step 2 already applied
+   it). This is the point at which "does it actually apply" (section 1's
+   first AWS-only unknown) gets answered for everything else, and --
+   because `demo_killswitch_enabled=true` is part of this same
+   plan/apply -- the endpoints and their auto-cleanup are created
+   atomically together (section 3's own design note).
+7. `terraform apply dev.tfplan`.
+8. **Immediately**, before anything else: `terraform output -raw
+   demo_killswitch_schedule_arn` and confirm it prints a real ARN, not
+   empty. If the apply reported any error and this comes back empty,
+   follow section 3.1's mitigation now, before proceeding.
+9. `python scripts/seed_registry.py ...` — register the one frozen
    artifact this demo runs against (Section 25's "pre-registered frozen
    artifact"; Phase 4's calibration/promotion workflow does not exist).
-6. Compute a deadline (e.g. `date -u -d "+4 hours" +%Y-%m-%dT%H:%M:%S`)
-   and apply `modules/demo_killswitch` with it, plus the real
-   `vpc_endpoint_ids` (`terraform output ecr_api_endpoint_id` etc.) and
-   `ecs_cluster_arns` from the `envs/dev` apply above.
-7. Run the existing connectivity probe first (zero new cost) to confirm
-   the network is genuinely reachable.
-8. `python scripts/smoke.py --api-endpoint $(terraform output -raw
-   api_endpoint) --golden-digest sha256:637920e5...fb3c255` — submit,
-   poll, fetch results, verify the digest (section 1's second AWS-only
-   unknown).
-9. Capture evidence (section 5).
-10. Run the final shutdown sequence (section 6) well inside the deadline
-    from step 6, so the scheduled Lambda finds nothing left to do.
+10. Run the existing connectivity probe first (zero new cost) to confirm
+    the network is genuinely reachable.
+11. `python scripts/smoke.py --api-endpoint $(terraform output -raw
+    api_endpoint) --golden-digest sha256:637920e5...fb3c255` — submit,
+    poll, fetch results, verify the digest (section 1's second AWS-only
+    unknown).
+12. Capture evidence (section 5).
+13. Run the final shutdown sequence (section 6) well inside the deadline
+    from step 5, so the scheduled Lambda finds nothing left to do.
 
 ## 5. Evidence to capture before any teardown
 
@@ -296,7 +378,7 @@ when that review has actually happened, not as something to run now.
 
 ```bash
 cd infra/terraform/envs/dev
-terraform destroy -target=module.demo_killswitch   # if applied as a separate root/module invocation
+terraform destroy -target=module.demo_killswitch   # the schedule/Lambda/SNS topic -- no longer watching anything after this
 terraform destroy -target=module.network           # the 3 interface endpoints -- the dominant cost line
 terraform destroy -target=module.worker_compute -target=module.job_orchestrator -target=module.job_api -target=module.observability
 # Left standing deliberately (all $0 or near-$0 at rest):
@@ -357,18 +439,28 @@ session.
 
 1. `aws sts get-caller-identity --profile 4xtra-dev` — confirm session/
    account/region.
-2. `cd infra/terraform/envs/dev && terraform init && terraform plan
-   -var control_plane_package_path=... -out=dev.tfplan` — the bootstrap
-   bucket and the reusable base from 6A already exist, so this only
-   recreates what was destroyed.
-3. Review, then `terraform apply dev.tfplan`.
-4. Re-push the worker image if the ECR lifecycle policy already expired
-   the old one (`image_count_to_retain`, 5 in DEV) — `scripts/seed_registry.py`
-   does not need to re-run if the artifact is still present at its S3
-   prefix (bucket was never destroyed under 6A).
-5. Re-apply `modules/demo_killswitch` with a fresh deadline and the new
-   endpoint/cluster IDs from this apply.
-6. Follow section 4 from step 7 onward, then section 6A again afterward.
+2. The ECR repository already exists (never destroyed under 6A), so
+   section 4's step 2 (targeted `module.worker_image` apply) is not
+   needed again -- but a digest is still required every time: re-push
+   the worker image if the ECR lifecycle policy already expired the old
+   one (`image_count_to_retain`, 5 in DEV), then re-run section 4 step 4
+   (`aws ecr describe-images ...`) to capture the current digest even if
+   the image itself did not change (a lifecycle-expired-and-repushed
+   image gets a new digest).
+3. `cd infra/terraform/envs/dev && terraform init && terraform plan \
+   -var worker_image_digest=<digest from step 2> \
+   -var control_plane_package_path=... \
+   -var demo_killswitch_enabled=true \
+   -var demo_schedule_expression="at(<fresh deadline>)" \
+   -out=dev.tfplan` — the bootstrap bucket and the reusable base from 6A
+   already exist, so this only recreates what was destroyed (endpoint
+   count, `module.demo_killswitch` wired from this apply's own module
+   outputs, nothing to copy by hand).
+4. Review, then `terraform apply dev.tfplan`, then section 4 step 8's
+   `demo_killswitch_schedule_arn` confirmation.
+5. `scripts/seed_registry.py` does not need to re-run if the artifact is
+   still present at its S3 prefix (bucket was never destroyed under 6A).
+6. Follow section 4 from step 10 onward, then section 6A again afterward.
 
 This runbook is the durable instruction set for recreating the
 demonstration independent of any particular chat session, and its

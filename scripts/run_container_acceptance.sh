@@ -24,7 +24,44 @@
 
 set -euo pipefail
 
+# python3 on PATH is a WSL/Linux-host assumption; this repo's Windows
+# development environment only has "python" (python3 resolves via PATH to
+# Windows's own App Execution Alias stub -- `command -v python3` reports it
+# as present, since it genuinely is an executable on PATH, but running it
+# prints a Microsoft Store prompt and exits nonzero instead of running any
+# code; presence on PATH is therefore not sufficient, it must actually be
+# invoked to tell the two apart) -- resolved once, here, rather than
+# hard-coded at each call site below.
+PY="python3"
+"$PY" --version >/dev/null 2>&1 || PY="python"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Same host-path mismatch as the docker-vs-python split noted below,
+# generalised: whenever $PY ends up being NATIVE Windows python.exe (no
+# POSIX-path support), every path handed to it needs the "C:\..." form,
+# not the MSYS "/c/..." form $REPO_ROOT is in (which docker.exe itself
+# handles natively and does not need converting). PY_REPO_ROOT is that
+# converted form when needed, and is exactly $REPO_ROOT unchanged
+# everywhere cygpath does not exist (a genuine WSL/Linux host).
+PY_REPO_ROOT="$REPO_ROOT"
+command -v cygpath >/dev/null 2>&1 && PY_REPO_ROOT="$(cygpath -w "$REPO_ROOT")"
+
+# On a genuine MSYS/Git-Bash host (as opposed to WSL, this script's other
+# documented target), MSYS auto-rewrites ANY bare argument that looks like
+# an absolute POSIX path when invoking a native Windows .exe -- not just
+# `-v`/`--volume` values. That is fatal for this script's step 8, which
+# passes container-INTERNAL paths (`--request /request.json`, etc.) as
+# plain CLI arguments to `docker run`: MSYS rewrote `/request.json` into
+# `C:/Program Files/Git/request.json` (confirmed directly), a path on the
+# HOST that has nothing to do with the container's own filesystem. This
+# script already does its own deliberate, explicit `-v` source-path
+# translation (the wrapper installed below, via `wslpath -w`) for the one
+# case that genuinely needs it; disabling MSYS's own blind, broader
+# conversion is strictly more correct here, not a loss of functionality,
+# and is a no-op (unset, ignored) on the WSL host this script primarily
+# targets.
+export MSYS_NO_PATHCONV=1
 cd "$REPO_ROOT"
 
 # --- 0. Locate a WORKING docker client ------------------------------------
@@ -175,7 +212,7 @@ echo "=== 6. Actual runtime thread counts (threadpoolctl, not env vars) ==="
 THREAD_POOLS="$("$DOCKER_BIN" run --rm --platform linux/amd64 --entrypoint python "$IMAGE_ID" -c \
     "import numpy, scipy, threadpoolctl, json; print(json.dumps(threadpoolctl.threadpool_info()))")"
 echo "$THREAD_POOLS"
-if echo "$THREAD_POOLS" | python3 -c "import json,sys; pools=json.load(sys.stdin); sys.exit(0 if all(p['num_threads']==1 for p in pools) and pools else 1)"; then
+if echo "$THREAD_POOLS" | "$PY" -c "import json,sys; pools=json.load(sys.stdin); sys.exit(0 if all(p['num_threads']==1 for p in pools) and pools else 1)"; then
     echo "confirmed: every loaded thread pool reports num_threads=1"
 else
     echo "FAIL: at least one thread pool did not report num_threads=1" >&2
@@ -214,9 +251,19 @@ mkdir -p "$ACCEPT_DIR/output"
     -v "$ACCEPT_DIR/request.json:/request.json:ro" \
     -v "$ACCEPT_DIR/output:/output" \
     "$IMAGE_ID" simulate --artifact-dir /artifact --request /request.json --output-dir /output
-ARRAY_DIGEST="$(python3 -c "
+# The container itself (via docker.exe's own POSIX-path handling for -v,
+# unrelated to MSYS_NO_PATHCONV above) reads/writes this path just fine --
+# but $PY, when it resolves to native Windows python.exe (this host), has
+# no POSIX-path support of its own and needs the real "C:\..." form for
+# the SAME file to open it afterward. cygpath (ships with Git for Windows)
+# does that conversion; on a genuine WSL/Linux host, where the original
+# path is already correct and cygpath does not exist, this falls back to
+# it unchanged.
+RETURNS_PATH="$ACCEPT_DIR/output/returns.npy"
+command -v cygpath >/dev/null 2>&1 && RETURNS_PATH="$(cygpath -w "$RETURNS_PATH")"
+ARRAY_DIGEST="$("$PY" -c "
 import hashlib, numpy as np
-a = np.load('$ACCEPT_DIR/output/returns.npy')
+a = np.load(r'$RETURNS_PATH')
 print('sha256:' + hashlib.sha256(np.ascontiguousarray(a).tobytes()).hexdigest())
 ")"
 echo "golden array digest obtained: $ARRAY_DIGEST"
@@ -244,13 +291,13 @@ export SCENARIO_WORKER_IMAGE="$IMAGE_ID"
 # mount service: ... no such file or directory"). Pinning --basetemp under
 # the repository root keeps every tmp_path on the Windows-visible /mnt/c/...
 # filesystem, so translation produces a plain "C:\..." path instead.
-PYTEST_BASETEMP="$REPO_ROOT/.acceptance-pytest-tmp"
+PYTEST_BASETEMP="$PY_REPO_ROOT/.acceptance-pytest-tmp"
 rm -rf "$PYTEST_BASETEMP"
 mkdir -p "$PYTEST_BASETEMP"
 
 REPORT_LOG="$(mktemp)"
 set +e
-python3 -m pytest "$REPO_ROOT/tests/test_replay.py" -k "container or image_" \
+"$PY" -m pytest "$PY_REPO_ROOT/tests/test_replay.py" -k "container or image_" \
     --basetemp="$PYTEST_BASETEMP" -o addopts="" -v 2>&1 | tee "$REPORT_LOG"
 # NOT `$?` here -- that would capture `tee`'s exit status, not pytest's,
 # since this is the last command in a pipeline. PIPESTATUS[0] is pytest's.

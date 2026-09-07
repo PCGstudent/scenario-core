@@ -173,8 +173,11 @@ resource "aws_ecs_task_definition" "simulate" {
 
   container_definitions = jsonencode([
     {
-      name                   = "worker"
-      image                  = "${var.ecr_repository_url}:${var.worker_image_tag}"
+      name = "worker"
+      # Immutable digest reference, never a mutable tag (Section 18.2's
+      # build-once/promote-by-digest pipeline) -- see worker_image_digest's
+      # own variable description for why this has no default.
+      image                  = "${var.ecr_repository_url}@${var.worker_image_digest}"
       readonlyRootFilesystem = false # the worker stages under a temp dir it creates itself
       environment = [
         { name = "SCENARIO_JOBS_TABLE", value = var.scenario_jobs_table_name },
