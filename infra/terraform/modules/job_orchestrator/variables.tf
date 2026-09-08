@@ -43,6 +43,11 @@ variable "scenario_jobs_table_arn" {
   type = string
 }
 
+variable "kms_key_arn" {
+  type        = string
+  description = "The environment CMK, needed by sfn_orchestrator's own native DynamoDB UpdateItem call against the SSE-KMS scenario_jobs table (module.kms's key_arn output) -- never the artifact/runs CMK, this table's own encryption key only."
+}
+
 variable "scenario_jobs_table_name" {
   type = string
 }

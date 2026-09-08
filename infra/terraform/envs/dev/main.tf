@@ -176,6 +176,7 @@ module "job_orchestrator" {
   security_group_id          = module.network.task_security_group_id
   scenario_jobs_table_arn    = module.job_store.scenario_jobs_table_arn
   scenario_jobs_table_name   = module.job_store.scenario_jobs_table_name
+  kms_key_arn                = module.kms.key_arn
   lambda_package_path        = var.control_plane_package_path
   permissions_boundary_arn   = module.ci_oidc.runtime_role_boundary_arn
 }
