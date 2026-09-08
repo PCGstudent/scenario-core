@@ -218,6 +218,36 @@ def assert_dynamodb_registry_write_has_leading_keys_condition(
     )
 
 
+def assert_dynamodb_kms_grant_is_minimal_and_conditioned(statement: dict[str, Any]) -> None:
+    """A kms:Decrypt/GenerateDataKey grant for an SSE-KMS-encrypted
+    DynamoDB table's own native-integration calls (e.g. Step Functions'
+    UpdateItem, made under the state machine role's own identity, not a
+    Lambda's) must be scoped to exactly one CMK resource and conditioned on
+    kms:ViaService naming the dynamodb endpoint -- never a bare/broad KMS
+    grant. Reproduced directly: a real execution failed at RecordQueued
+    with "no identity-based policy allows the kms:Decrypt action" before
+    this exact statement shape existed on modules/job_orchestrator's
+    sfn_orchestrator role."""
+    actions = set(_statement_actions(statement))
+    if not (actions & {"kms:Decrypt", "kms:GenerateDataKey"}):
+        return
+    assert actions == {"kms:Decrypt", "kms:GenerateDataKey"}, (
+        f"unexpected actions alongside kms:Decrypt/GenerateDataKey: {statement.get('sid')}"
+    )
+    resources = _statement_resources(statement)
+    sid = statement.get("sid")
+    assert resources == ["${var.kms_key_arn}"], (
+        f"must be scoped to exactly var.kms_key_arn, got {resources}: {sid}"
+    )
+    conditions = _statement_conditions(statement)
+    has_via_service = any(
+        str(_unquote(c.get("variable"))) == "kms:ViaService"
+        and any("dynamodb" in str(v) for v in _unquote(c.get("values", [])))
+        for c in conditions
+    )
+    assert has_via_service, f"missing kms:ViaService=dynamodb.* condition: {sid}"
+
+
 #: Actions AWS's own IAM User Guide example does NOT bundle under an
 #: iam:PermissionsBoundary condition (GetRolePolicy, ListRolePolicies,
 #: UpdateUser, DeleteUser all sit in that example's separate, unconditioned
@@ -972,3 +1002,104 @@ def test_dev_backend_uses_kms_sse_matching_the_bucket_policy():
     assert backend["use_lockfile"] is True
     assert backend["encrypt"] is True
     assert backend["kms_key_id"] == "alias/4xtra-dev-tfstate"
+
+
+def _sfn_orchestrator_statements() -> list[dict[str, Any]]:
+    return _policy_documents_by_address()["data.aws_iam_policy_document.sfn_orchestrator"]
+
+
+def test_sfn_orchestrator_has_a_correctly_scoped_dynamodb_kms_statement():
+    statements = _sfn_orchestrator_statements()
+    kms_statements = [
+        s
+        for s in statements
+        if set(_statement_actions(s)) & {"kms:Decrypt", "kms:GenerateDataKey"}
+    ]
+    found = len(kms_statements)
+    assert found == 1, f"expected exactly one kms:Decrypt statement, got {found}"
+    assert kms_statements[0].get("sid") == "DataKmsForDynamoDb"
+    assert_dynamodb_kms_grant_is_minimal_and_conditioned(kms_statements[0])
+
+
+def test_sfn_orchestrator_still_has_plain_dynamodb_update_item():
+    statements = _sfn_orchestrator_statements()
+    record_job_status = [s for s in statements if s.get("sid") == "RecordJobStatus"]
+    assert len(record_job_status) == 1
+    assert _statement_actions(record_job_status[0]) == ["dynamodb:UpdateItem"]
+
+
+def test_sfn_orchestrator_policy_has_no_broad_kms_wildcard():
+    statements = _sfn_orchestrator_statements()
+    for s in statements:
+        actions = _statement_actions(s)
+        assert "kms:*" not in actions, f"bare kms:* found in {s.get('sid')}"
+
+
+def test_negative_control_dynamodb_kms_grant_missing_via_service_is_rejected():
+    with pytest.raises(AssertionError):
+        assert_dynamodb_kms_grant_is_minimal_and_conditioned(
+            {
+                "sid": "synthetic",
+                "effect": "Allow",
+                "actions": ["kms:Decrypt", "kms:GenerateDataKey"],
+                "resources": ["${var.kms_key_arn}"],
+                "condition": [],
+            }
+        )
+
+
+def test_negative_control_dynamodb_kms_grant_with_wildcard_resource_is_rejected():
+    with pytest.raises(AssertionError):
+        assert_dynamodb_kms_grant_is_minimal_and_conditioned(
+            {
+                "sid": "synthetic",
+                "effect": "Allow",
+                "actions": ["kms:Decrypt", "kms:GenerateDataKey"],
+                "resources": ["*"],
+                "condition": [
+                    {
+                        "variable": "kms:ViaService",
+                        "test": "StringEquals",
+                        "values": ["dynamodb.eu-west-1.amazonaws.com"],
+                    }
+                ],
+            }
+        )
+
+
+def test_negative_control_dynamodb_kms_grant_missing_generate_data_key_is_rejected():
+    with pytest.raises(AssertionError):
+        assert_dynamodb_kms_grant_is_minimal_and_conditioned(
+            {
+                "sid": "synthetic",
+                "effect": "Allow",
+                "actions": ["kms:Decrypt"],
+                "resources": ["${var.kms_key_arn}"],
+                "condition": [
+                    {
+                        "variable": "kms:ViaService",
+                        "test": "StringEquals",
+                        "values": ["dynamodb.eu-west-1.amazonaws.com"],
+                    }
+                ],
+            }
+        )
+
+
+def test_negative_control_dynamodb_kms_grant_scoped_correctly_is_permitted():
+    # Every required element present -- must NOT raise.
+    assert_dynamodb_kms_grant_is_minimal_and_conditioned(
+        {
+            "sid": "synthetic",
+            "effect": "Allow",
+            "actions": ["kms:Decrypt", "kms:GenerateDataKey"],
+            "resources": ["${var.kms_key_arn}"],
+            "condition": [
+                {
+                    "variable": "kms:ViaService",
+                    "test": "StringEquals",
+                    "values": ["dynamodb.eu-west-1.amazonaws.com"],
+                }
+            ],
+        }
+    )

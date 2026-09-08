@@ -160,6 +160,26 @@ data "aws_iam_policy_document" "sfn_orchestrator" {
   }
 
   statement {
+    # dynamodb:UpdateItem alone is not sufficient against an SSE-KMS table:
+    # DynamoDB's own service-to-service call to KMS is made under this
+    # role's identity (not a Lambda-mediated call, so a Lambda execution
+    # role's own KMS grant elsewhere in this project does not cover it) --
+    # confirmed directly by a real execution failing at RecordQueued with
+    # "no identity-based policy allows the kms:Decrypt action" before this
+    # statement existed. Scoped to exactly the environment CMK and to calls
+    # DynamoDB itself makes (kms:ViaService), never a bare grant.
+    sid       = "DataKmsForDynamoDb"
+    effect    = "Allow"
+    actions   = ["kms:Decrypt", "kms:GenerateDataKey"]
+    resources = [var.kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["dynamodb.${var.region}.amazonaws.com"]
+    }
+  }
+
+  statement {
     sid       = "InvokeClassifyFailureOnly"
     effect    = "Allow"
     actions   = ["lambda:InvokeFunction"]
