@@ -1103,3 +1103,208 @@ def test_negative_control_dynamodb_kms_grant_scoped_correctly_is_permitted():
             ],
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# BoundaryPassWorkerTaskRoles: the boundary only caps what an identity
+# policy may grant, so an sfn_orchestrator PassRole grant that is correct on
+# its own still fails closed (AccessDeniedException, "no permissions
+# boundary allows the iam:PassRole action") unless the boundary names the
+# same two roles too -- reproduced directly against the real deployment.
+# ---------------------------------------------------------------------------
+
+_WORKER_TASK_ROLE_RESOURCE = (
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:"
+    "role/${var.resource_name_prefix}-worker-task"
+)
+_ECS_EXECUTION_ROLE_RESOURCE = (
+    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:"
+    "role/${var.resource_name_prefix}-ecs-execution"
+)
+_EXPECTED_PASSROLE_RESOURCES = {_WORKER_TASK_ROLE_RESOURCE, _ECS_EXECUTION_ROLE_RESOURCE}
+
+
+def assert_passrole_scoped_to_exactly_the_two_worker_task_roles(
+    statement: dict[str, Any],
+) -> None:
+    actions = _statement_actions(statement)
+    if "iam:PassRole" not in actions:
+        return
+    resources = set(_statement_resources(statement))
+    assert resources == _EXPECTED_PASSROLE_RESOURCES, (
+        f"iam:PassRole must be scoped to exactly the two worker/ecs-execution "
+        f"role ARNs (no wildcard, no other role), got {resources}: {statement.get('sid')}"
+    )
+    conditions = _statement_conditions(statement)
+    has_ecs_condition = any(
+        str(_unquote(c.get("variable"))) == "iam:PassedToService"
+        and _unquote(c.get("values")) == ["ecs-tasks.amazonaws.com"]
+        for c in conditions
+    )
+    assert has_ecs_condition, (
+        f"iam:PassRole must condition on iam:PassedToService=ecs-tasks.amazonaws.com "
+        f"only: {statement.get('sid')}"
+    )
+
+
+def _runtime_role_boundary_statements() -> list[dict[str, Any]]:
+    address = "data.aws_iam_policy_document.runtime_role_boundary"
+    return _policy_documents_by_address()[address]
+
+
+def test_boundary_grants_passrole_scoped_to_exactly_the_two_worker_roles():
+    statements = _runtime_role_boundary_statements()
+    passrole_statements = [s for s in statements if "iam:PassRole" in _statement_actions(s)]
+    assert len(passrole_statements) == 1
+    assert passrole_statements[0].get("sid") == "BoundaryPassWorkerTaskRoles"
+    assert_passrole_scoped_to_exactly_the_two_worker_task_roles(passrole_statements[0])
+
+
+def test_negative_control_passrole_on_unlisted_role_is_rejected():
+    with pytest.raises(AssertionError):
+        assert_passrole_scoped_to_exactly_the_two_worker_task_roles(
+            {
+                "sid": "synthetic",
+                "effect": "Allow",
+                "actions": ["iam:PassRole"],
+                "resources": [
+                    _WORKER_TASK_ROLE_RESOURCE,
+                    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:"
+                    "role/${var.resource_name_prefix}-some-other-role",
+                ],
+                "condition": [
+                    {
+                        "variable": "iam:PassedToService",
+                        "test": "StringEquals",
+                        "values": ["ecs-tasks.amazonaws.com"],
+                    }
+                ],
+            }
+        )
+
+
+def test_negative_control_passrole_for_lambda_service_is_rejected():
+    with pytest.raises(AssertionError):
+        assert_passrole_scoped_to_exactly_the_two_worker_task_roles(
+            {
+                "sid": "synthetic",
+                "effect": "Allow",
+                "actions": ["iam:PassRole"],
+                "resources": [_WORKER_TASK_ROLE_RESOURCE, _ECS_EXECUTION_ROLE_RESOURCE],
+                "condition": [
+                    {
+                        "variable": "iam:PassedToService",
+                        "test": "StringEquals",
+                        "values": ["lambda.amazonaws.com"],
+                    }
+                ],
+            }
+        )
+
+
+def test_negative_control_passrole_with_role_wildcard_is_rejected():
+    with pytest.raises(AssertionError):
+        assert_passrole_scoped_to_exactly_the_two_worker_task_roles(
+            {
+                "sid": "synthetic",
+                "effect": "Allow",
+                "actions": ["iam:PassRole"],
+                "resources": [
+                    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:"
+                    "role/${var.resource_name_prefix}-*"
+                ],
+                "condition": [
+                    {
+                        "variable": "iam:PassedToService",
+                        "test": "StringEquals",
+                        "values": ["ecs-tasks.amazonaws.com"],
+                    }
+                ],
+            }
+        )
+
+
+def test_negative_control_passrole_with_resource_star_is_rejected():
+    with pytest.raises(AssertionError):
+        assert_passrole_scoped_to_exactly_the_two_worker_task_roles(
+            {
+                "sid": "synthetic",
+                "effect": "Allow",
+                "actions": ["iam:PassRole"],
+                "resources": ["*"],
+                "condition": [
+                    {
+                        "variable": "iam:PassedToService",
+                        "test": "StringEquals",
+                        "values": ["ecs-tasks.amazonaws.com"],
+                    }
+                ],
+            }
+        )
+
+
+def test_negative_control_passrole_missing_service_condition_is_rejected():
+    with pytest.raises(AssertionError):
+        assert_passrole_scoped_to_exactly_the_two_worker_task_roles(
+            {
+                "sid": "synthetic",
+                "effect": "Allow",
+                "actions": ["iam:PassRole"],
+                "resources": [_WORKER_TASK_ROLE_RESOURCE, _ECS_EXECUTION_ROLE_RESOURCE],
+                "condition": [],
+            }
+        )
+
+
+def test_negative_control_passrole_scoped_correctly_is_permitted():
+    # Every required element present -- must NOT raise.
+    assert_passrole_scoped_to_exactly_the_two_worker_task_roles(
+        {
+            "sid": "synthetic",
+            "effect": "Allow",
+            "actions": ["iam:PassRole"],
+            "resources": [_WORKER_TASK_ROLE_RESOURCE, _ECS_EXECUTION_ROLE_RESOURCE],
+            "condition": [
+                {
+                    "variable": "iam:PassedToService",
+                    "test": "StringEquals",
+                    "values": ["ecs-tasks.amazonaws.com"],
+                }
+            ],
+        }
+    )
+
+
+def test_sfn_orchestrator_passrole_still_scoped_to_same_two_roles_and_service():
+    """modules/job_orchestrator's own PassTaskRoles statement, unrelated to
+    this boundary change, must remain exactly as narrow as before."""
+    statements = _sfn_orchestrator_statements()
+    passrole_statements = [s for s in statements if "iam:PassRole" in _statement_actions(s)]
+    assert len(passrole_statements) == 1
+    assert passrole_statements[0].get("sid") == "PassTaskRoles"
+    resources = set(_statement_resources(passrole_statements[0]))
+    assert resources == {"${var.worker_task_role_arn}", "${var.ecs_execution_role_arn}"}
+    conditions = _statement_conditions(passrole_statements[0])
+    assert any(
+        str(_unquote(c.get("variable"))) == "iam:PassedToService"
+        and _unquote(c.get("values")) == ["ecs-tasks.amazonaws.com"]
+        for c in conditions
+    )
+
+
+def test_no_other_identity_policy_grants_passrole():
+    """Every iam:PassRole statement anywhere in the tree must be one of the
+    three known, already-reviewed grants: the boundary's own ceiling and
+    sfn_orchestrator's runtime identity policy (both narrowly scoped to the
+    two ECS task roles and ecs-tasks.amazonaws.com only), plus gha-ci-dev's
+    own PassProjectScopedRoles -- a DEPLOYMENT-role grant (broader by
+    design, Section 13.1 point 5: "infrastructure creation legitimately
+    needs a wider surface than any runtime identity"), not a runtime one,
+    and out of scope for this boundary-only fix. No new PassRole statement
+    may be introduced elsewhere."""
+    known_sids = {"BoundaryPassWorkerTaskRoles", "PassTaskRoles", "PassProjectScopedRoles"}
+    for _path, address, statement in _identity_policy_statements():
+        if "iam:PassRole" not in _statement_actions(statement):
+            continue
+        sid = statement.get("sid")
+        assert sid in known_sids, f"unexpected iam:PassRole statement {sid!r} in {address}"

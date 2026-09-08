@@ -148,6 +148,33 @@ data "aws_iam_policy_document" "runtime_role_boundary" {
     ]
   }
 
+  # A boundary only caps what an identity policy may grant -- it never
+  # grants anything by itself. sfn_orchestrator's own PassTaskRoles
+  # statement (modules/job_orchestrator) already names these same two
+  # roles conditioned on the same service; without this statement here
+  # too, ecs:RunTask's PassRole still fails closed with AccessDenied
+  # ("no permissions boundary allows the iam:PassRole action") even though
+  # the identity policy is correct -- reproduced directly against the real
+  # deployment before this statement existed. Exactly the two ECS task
+  # roles this project ever passes to ecs-tasks.amazonaws.com, never a
+  # role/* wildcard.
+  statement {
+    sid    = "BoundaryPassWorkerTaskRoles"
+    effect = "Allow"
+    actions = [
+      "iam:PassRole",
+    ]
+    resources = [
+      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.resource_name_prefix}-worker-task",
+      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.resource_name_prefix}-ecs-execution",
+    ]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+
   statement {
     sid       = "BoundaryCleanupEndpointDelete"
     effect    = "Allow"
