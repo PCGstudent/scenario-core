@@ -47,3 +47,34 @@ output "gha_ci_dev_role_arn" {
 output "runtime_role_boundary_arn" {
   value = module.ci_oidc.runtime_role_boundary_arn
 }
+
+# --- Phase 3b -----------------------------------------------------------
+
+output "api_endpoint" {
+  value = module.job_api.api_endpoint
+}
+
+output "state_machine_arn" {
+  value = module.job_orchestrator.state_machine_arn
+}
+
+output "worker_cluster_arn" {
+  value = module.worker_compute.cluster_arn
+}
+
+output "ecr_api_endpoint_id" {
+  value = module.network.ecr_api_endpoint_id
+}
+
+output "ecr_dkr_endpoint_id" {
+  value = module.network.ecr_dkr_endpoint_id
+}
+
+output "logs_endpoint_id" {
+  value = module.network.logs_endpoint_id
+}
+
+output "demo_killswitch_schedule_arn" {
+  description = "Mandatory one-time cleanup schedule; verify it immediately after every DEV apply."
+  value       = module.demo_killswitch.schedule_arn
+}

@@ -6,12 +6,9 @@
 # the bottom of this file. Split into topic-scoped statements/policies for
 # reviewability, not for any technical reason.
 #
-# Scope note: this policy covers exactly what Phase 3a's modules
-# (bootstrap already applied; kms, network, artifact_store, job_store,
-# worker_image, ci_oidc itself) create and manage. Phase 3b/4/5 extend it
-# with additional ecs:*/states:*/lambda:*/events:*/sns:*/budgets:*
-# statements as those modules are built -- by ADDING statements, never by
-# loosening the naming constraints or the guardrails below.
+# Scope note: this policy covers the Phase 3a foundation and Phase 3b
+# vertical slice. Later phases add statements rather than loosening these
+# naming constraints or the guardrails below.
 
 locals {
   account_id = data.aws_caller_identity.current.account_id
@@ -399,6 +396,7 @@ data "aws_iam_policy_document" "probe_and_observability_management" {
     ]
     resources = [
       "arn:aws:logs:${var.region}:${local.account_id}:log-group:/4xtra/*",
+      "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws/lambda/${local.prefix}-*",
     ]
   }
 
@@ -424,6 +422,93 @@ resource "aws_iam_role_policy" "probe_and_observability_management" {
   name   = "probe-and-observability-management"
   role   = aws_iam_role.gha_ci_dev.id
   policy = data.aws_iam_policy_document.probe_and_observability_management.json
+}
+
+# --- 3c. Phase 3b control-plane/orchestration resource management ---------
+
+data "aws_iam_policy_document" "phase3b_management" {
+  statement {
+    sid    = "LambdaManagement"
+    effect = "Allow"
+    actions = [
+      "lambda:CreateFunction", "lambda:DeleteFunction", "lambda:GetFunction",
+      "lambda:GetFunctionCodeSigningConfig", "lambda:GetPolicy",
+      "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration",
+      "lambda:AddPermission", "lambda:RemovePermission",
+      "lambda:TagResource", "lambda:UntagResource", "lambda:ListTags",
+    ]
+    resources = ["arn:aws:lambda:${var.region}:${local.account_id}:function:${local.prefix}-*"]
+  }
+
+  statement {
+    sid    = "StepFunctionsManagement"
+    effect = "Allow"
+    actions = [
+      "states:CreateStateMachine", "states:UpdateStateMachine",
+      "states:DeleteStateMachine", "states:DescribeStateMachine",
+      "states:TagResource", "states:UntagResource", "states:ListTagsForResource",
+    ]
+    resources = ["arn:aws:states:${var.region}:${local.account_id}:stateMachine:${local.prefix}-*"]
+  }
+
+  statement {
+    sid     = "HttpApiManagement"
+    effect  = "Allow"
+    actions = ["apigateway:GET", "apigateway:POST", "apigateway:PATCH", "apigateway:DELETE"]
+    resources = [
+      "arn:aws:apigateway:${var.region}::/apis",
+      "arn:aws:apigateway:${var.region}::/apis/*",
+      "arn:aws:apigateway:${var.region}::/tags/*",
+    ]
+  }
+
+  statement {
+    sid    = "SchedulerManagement"
+    effect = "Allow"
+    actions = [
+      "scheduler:CreateSchedule", "scheduler:UpdateSchedule",
+      "scheduler:DeleteSchedule", "scheduler:GetSchedule",
+      "scheduler:TagResource", "scheduler:UntagResource", "scheduler:ListTagsForResource",
+    ]
+    resources = ["arn:aws:scheduler:${var.region}:${local.account_id}:schedule/default/${local.prefix}-*"]
+  }
+
+  statement {
+    sid    = "SnsTopicManagement"
+    effect = "Allow"
+    actions = [
+      "sns:CreateTopic", "sns:DeleteTopic", "sns:GetTopicAttributes",
+      "sns:SetTopicAttributes", "sns:Subscribe", "sns:ListSubscriptionsByTopic",
+      "sns:TagResource", "sns:UntagResource", "sns:ListTagsForResource",
+    ]
+    resources = ["arn:aws:sns:${var.region}:${local.account_id}:${local.prefix}-*"]
+  }
+
+  statement {
+    # Unsubscribe acts on an opaque subscription ARN returned only after
+    # confirmation; AWS does not support constraining it to a topic ARN.
+    sid       = "SnsSubscriptionDelete"
+    effect    = "Allow"
+    actions   = ["sns:Unsubscribe"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "CloudWatchAlarmManagement"
+    effect = "Allow"
+    actions = [
+      "cloudwatch:PutMetricAlarm", "cloudwatch:DeleteAlarms",
+      "cloudwatch:DescribeAlarms", "cloudwatch:TagResource",
+      "cloudwatch:UntagResource", "cloudwatch:ListTagsForResource",
+    ]
+    resources = ["arn:aws:cloudwatch:${var.region}:${local.account_id}:alarm:${local.prefix}-*"]
+  }
+}
+
+resource "aws_iam_role_policy" "phase3b_management" {
+  name   = "phase3b-management"
+  role   = aws_iam_role.gha_ci_dev.id
+  policy = data.aws_iam_policy_document.phase3b_management.json
 }
 
 # --- 4. Worker image push (BUILD ONCE step of deploy-dev.yml) -------------

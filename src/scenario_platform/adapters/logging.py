@@ -59,16 +59,19 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, sort_keys=True)
 
 
-def configure_worker_logging(
-    *, level: int = logging.INFO, stream: TextIO = sys.stdout
+def configure_logging(
+    name: str, *, level: int = logging.INFO, stream: TextIO = sys.stdout
 ) -> logging.Logger:
-    """Configure and return the ``scenario_platform.worker`` logger.
+    """Configure and return a named JSON logger.
 
-    Idempotent: safe to call more than once (e.g. once from ``__main__`` and
-    once from a test) -- clears any handlers this call previously attached
-    rather than accumulating duplicate log lines.
+    Idempotent: safe to call more than once (e.g. once from a module's
+    top-level and once from a test) -- clears any handlers this call
+    previously attached rather than accumulating duplicate log lines. Used
+    by both the worker (``configure_worker_logging`` below, unchanged) and
+    Phase 3b's control-plane Lambdas, which need the same one-JSON-object-
+    per-line shape CloudWatch Logs ingests either way.
     """
-    logger = logging.getLogger("scenario_platform.worker")
+    logger = logging.getLogger(name)
     logger.handlers.clear()
     handler = logging.StreamHandler(stream)
     handler.setFormatter(JsonFormatter())
@@ -76,3 +79,10 @@ def configure_worker_logging(
     logger.setLevel(level)
     logger.propagate = False
     return logger
+
+
+def configure_worker_logging(
+    *, level: int = logging.INFO, stream: TextIO = sys.stdout
+) -> logging.Logger:
+    """Configure and return the ``scenario_platform.worker`` logger."""
+    return configure_logging("scenario_platform.worker", level=level, stream=stream)

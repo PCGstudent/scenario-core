@@ -172,7 +172,7 @@ jobs:
 
   terraform-apply:
     name: terraform apply (envs/dev)
-    needs: guard
+    needs: [guard, build-and-push]
     runs-on: [self-hosted, linux, x64, scenario-core]
     permissions:
       contents: read
@@ -192,13 +192,31 @@ jobs:
           terraform_version: ${{ env.TERRAFORM_VERSION }}
           terraform_wrapper: false
 
+      - name: Build and clean-room verify the control-plane ZIP
+        run: python scripts/package_control_plane.py --output build/control-plane.zip
+
       - name: terraform init
         working-directory: infra/terraform/envs/dev
         run: terraform init -input=false
 
       - name: terraform plan
         working-directory: infra/terraform/envs/dev
-        run: terraform plan -input=false -out=dev.tfplan
+        env:
+          WORKER_IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image_digest }}
+          ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+          CONTROL_PLANE_PACKAGE: ${{ github.workspace }}/build/control-plane.zip
+        run: |
+          set -euo pipefail
+          if [ -z "$ALERT_EMAIL" ]; then
+            echo "::error::Repository variable ALERT_EMAIL is required." >&2
+            exit 1
+          fi
+          DEMO_DEADLINE="at($(date -u -d '+4 hours' '+%Y-%m-%dT%H:%M:%S'))"
+          terraform plan -input=false -out=dev.tfplan \
+            -var="worker_image_digest=${WORKER_IMAGE_DIGEST}" \
+            -var="control_plane_package_path=${CONTROL_PLANE_PACKAGE}" \
+            -var="alert_email=${ALERT_EMAIL}" \
+            -var="demo_schedule_expression=${DEMO_DEADLINE}"
 
       - name: terraform apply
         working-directory: infra/terraform/envs/dev

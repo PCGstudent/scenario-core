@@ -40,3 +40,13 @@ statsmodels==0.14.4
 # directly with threadpoolctl.threadpool_info() that it correctly reflects
 # both a pinned (1) and an overridden (>1) OpenBLAS thread count.
 threadpoolctl==3.6.0
+
+# Phase 3b: the worker's new `simulate --job-id` path (architecture plan
+# Section 6.1 step 4) reads its job document and artifact from DynamoDB/S3
+# through scenario_platform.adapters.{job_store,s3_store} -- the ONLY two
+# files in the data plane allowed to import boto3 (pyproject.toml's
+# per-file Ruff exception). The worker CLI itself still never imports boto3
+# directly (tests/test_no_aws_in_core.py continues to enforce that). Not
+# pinned in requirements/worker.in: that file mirrors pyproject.toml's
+# [project.dependencies] scientific stack, which boto3 is not part of.
+boto3>=1.34,<2

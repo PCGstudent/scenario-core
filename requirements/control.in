@@ -5,10 +5,15 @@
 # enforced by tests/test_control_plane_purity.py). A control-plane cold start
 # has no reason to pay for a scientific dependency closure.
 #
-# Only one dependency is currently justified: pydantic, for the request/response
-# schemas shared with scenario_platform.domain (architecture plan Section 7.4,
-# "shared contract without shared runtime"). boto3 is deliberately NOT pinned
-# here yet -- no control-plane or adapter code exists before Phase 3a, and this
-# lock should not carry a dependency nothing in the repository uses. It is
-# added when Phase 3a's adapters first import it.
+# pydantic: request/response schemas shared with scenario_platform.domain
+# (architecture plan Section 7.4, "shared contract without shared runtime").
+#
+# boto3: Phase 3b's three control-plane Lambdas (submit, jobs, classify_failure)
+# talk to DynamoDB, Step Functions and ECS directly -- a different plane from
+# scenario_platform.domain/worker, where boto3 remains banned (AGENTS.md
+# invariant 28, tests/test_no_aws_in_core.py). The AWS-provided Lambda runtime
+# already bundles a recent boto3/botocore, so this pin only fixes what the
+# control-plane zip itself carries for local testing and reproducibility, not
+# what actually executes in Lambda.
 pydantic>=2,<3
+boto3>=1.34,<2

@@ -14,3 +14,9 @@ image_count_to_retain = 5
 
 github_repository = "PCGstudent/scenario-core"
 github_ref        = "ref:refs/heads/main"
+
+# Phase 3b. control_plane_package_path has NO value here deliberately --
+# see its description in variables.tf: it must be passed with -var at
+# apply time, pointing at scripts/package_control_plane.py's actual output
+# for that deployment (deploy-dev.yml, once extended, does this in CI).
+alert_email = "todosgranja@gmail.com"

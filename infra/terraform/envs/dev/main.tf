@@ -101,7 +101,8 @@ module "worker_image" {
 # --- Network (Section 14) ---------------------------------------------------
 
 module "network" {
-  source = "../../modules/network"
+  depends_on = [module.demo_killswitch]
+  source     = "../../modules/network"
 
   environment           = var.environment
   region                = var.region
@@ -128,4 +129,96 @@ module "ci_oidc" {
   environment_kms_key_arn = module.kms.key_arn
   artifacts_bucket_arn    = module.artifact_store.artifacts_bucket_arn
   ecr_repository_arn      = module.worker_image.repository_arn
+}
+
+# --- Phase 3b: first complete vertical slice (Section 24, Section 25) ------
+#
+# API Gateway -> thin Lambda -> Step Functions Standard -> ECS Fargate ->
+# S3 + DynamoDB, against a pre-registered frozen artifact (scripts/
+# seed_registry.py -- Phase 4's calibration/promotion workflow does not
+# exist yet, by design; Section 25's slice explicitly runs against a
+# manually-registered artifact, not a calibrated one).
+#
+# Cleanup is created before the network, using predictable names rather than
+# references to resources that do not exist yet. Terraform apply is not atomic.
+
+module "worker_compute" {
+  source = "../../modules/worker_compute"
+
+  environment              = var.environment
+  region                   = var.region
+  kms_key_arn              = module.kms.key_arn
+  artifacts_bucket_arn     = module.artifact_store.artifacts_bucket_arn
+  artifacts_bucket_name    = module.artifact_store.artifacts_bucket_name
+  runs_bucket_arn          = module.artifact_store.runs_bucket_arn
+  runs_bucket_name         = module.artifact_store.runs_bucket_name
+  scenario_jobs_table_arn  = module.job_store.scenario_jobs_table_arn
+  scenario_jobs_table_name = module.job_store.scenario_jobs_table_name
+  ecr_repository_arn       = module.worker_image.repository_arn
+  ecr_repository_url       = module.worker_image.repository_url
+  worker_image_digest      = var.worker_image_digest
+  permissions_boundary_arn = module.ci_oidc.runtime_role_boundary_arn
+}
+
+module "job_orchestrator" {
+  demo_deadline_utc = "${substr(var.demo_schedule_expression, 3, 19)}Z"
+  source            = "../../modules/job_orchestrator"
+
+  environment                = var.environment
+  region                     = var.region
+  cluster_arn                = module.worker_compute.cluster_arn
+  task_definition_arn        = module.worker_compute.task_definition_arn
+  task_definition_family_arn = "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:task-definition/${module.worker_compute.task_definition_family}:*"
+  container_name             = module.worker_compute.container_name
+  worker_task_role_arn       = module.worker_compute.worker_task_role_arn
+  ecs_execution_role_arn     = module.worker_compute.ecs_execution_role_arn
+  subnet_ids                 = module.network.private_subnet_ids
+  security_group_id          = module.network.task_security_group_id
+  scenario_jobs_table_arn    = module.job_store.scenario_jobs_table_arn
+  scenario_jobs_table_name   = module.job_store.scenario_jobs_table_name
+  lambda_package_path        = var.control_plane_package_path
+  permissions_boundary_arn   = module.ci_oidc.runtime_role_boundary_arn
+}
+
+module "job_api" {
+  demo_deadline_utc = "${substr(var.demo_schedule_expression, 3, 19)}Z"
+  source            = "../../modules/job_api"
+
+  environment               = var.environment
+  region                    = var.region
+  scenario_jobs_table_arn   = module.job_store.scenario_jobs_table_arn
+  scenario_jobs_table_name  = module.job_store.scenario_jobs_table_name
+  model_registry_table_arn  = module.job_store.model_registry_table_arn
+  model_registry_table_name = module.job_store.model_registry_table_name
+  runs_bucket_arn           = module.artifact_store.runs_bucket_arn
+  runs_bucket_name          = module.artifact_store.runs_bucket_name
+  kms_key_arn               = module.kms.key_arn
+  state_machine_arn         = module.job_orchestrator.state_machine_arn
+  lambda_package_path       = var.control_plane_package_path
+  permissions_boundary_arn  = module.ci_oidc.runtime_role_boundary_arn
+}
+
+module "observability" {
+  source = "../../modules/observability"
+
+  environment       = var.environment
+  state_machine_arn = module.job_orchestrator.state_machine_arn
+  alert_email       = var.alert_email
+}
+
+# --- Mandatory demo-window auto-cleanup -------------------------------------
+# This module has no feature flag. A DEV apply cannot create the interface
+# endpoints without first creating the independent cleanup schedule and its
+# Lambda; module.network's depends_on above enforces that order.
+
+module "demo_killswitch" {
+  source = "../../modules/demo_killswitch"
+
+  environment              = var.environment
+  region                   = var.region
+  vpc_endpoint_names       = ["4xtra-${var.environment}-ecr-api", "4xtra-${var.environment}-ecr-dkr", "4xtra-${var.environment}-logs"]
+  ecs_cluster_arns         = [for suffix in ["", "-probe"] : "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:cluster/4xtra-${var.environment}${suffix}"]
+  failure_alert_email      = var.alert_email
+  schedule_expression      = var.demo_schedule_expression
+  permissions_boundary_arn = module.ci_oidc.runtime_role_boundary_arn
 }

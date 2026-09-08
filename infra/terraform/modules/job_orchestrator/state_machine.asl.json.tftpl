@@ -1,0 +1,194 @@
+{
+  "Comment": "Phase 3b scenario job workflow (architecture plan Section 6.1 step 3, Section 6.3 retry/classification model). Execution input is deliberately just {\"job_id\": \"...\"} -- Section 6.2a.",
+  "StartAt": "RecordQueued",
+  "States": {
+    "RecordQueued": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${jobs_table_name}",
+        "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
+        "UpdateExpression": "SET #status = :running, started_at = :now",
+        "ConditionExpression": "#status IN (:submitted, :queued)",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":running": { "S": "RUNNING" },
+          ":submitted": { "S": "SUBMITTED" },
+          ":queued": { "S": "QUEUED" },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": "$.recordQueuedResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "AlreadyCancelled"
+        }
+      ],
+      "Next": "InitAttempt"
+    },
+    "InitAttempt": {
+      "Type": "Pass",
+      "Parameters": { "job_id.$": "$.job_id", "attempt": 1 },
+      "Next": "RunSimulation"
+    },
+    "RunSimulation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "TimeoutSeconds": ${task_timeout_seconds},
+      "Parameters": {
+        "Cluster": "${cluster_arn}",
+        "TaskDefinition": "${task_definition_arn}",
+        "LaunchType": "FARGATE",
+        "PlatformVersion": "1.4.0",
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": ${subnet_ids_json},
+            "SecurityGroups": ["${security_group_id}"],
+            "AssignPublicIp": "DISABLED"
+          }
+        },
+        "Overrides": {
+          "ContainerOverrides": [
+            {
+              "Name": "${container_name}",
+              "Command.$": "States.Array('simulate', '--job-id', $.job_id)"
+            }
+          ]
+        }
+      },
+      "ResultPath": "$.taskResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error_info",
+          "Next": "ClassifyFailure"
+        }
+      ],
+      "Next": "RecordSucceeded"
+    },
+    "ClassifyFailure": {
+      "Type": "Task",
+      "Resource": "${classify_failure_function_arn}",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "attempt.$": "$.attempt",
+        "cluster_arn": "${cluster_arn}",
+        "error_info.$": "$.error_info"
+      },
+      "ResultPath": "$.classification",
+      "Next": "RecordAttempt"
+    },
+    "RecordAttempt": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${jobs_table_name}",
+        "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
+        "UpdateExpression": "SET attempts = list_append(if_not_exists(attempts, :empty), :entry)",
+        "ConditionExpression": "#status = :running",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":running": { "S": "RUNNING" },
+          ":empty": { "L": [] },
+          ":entry": {
+            "L": [
+              {
+                "M": {
+                  "attempt": { "N.$": "States.Format('{}', $.classification.attempt)" },
+                  "error_class": { "S.$": "$.classification.error_class" }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "ResultPath": "$.recordAttemptResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "AlreadyCancelled"
+        }
+      ],
+      "Next": "RetryDecision"
+    },
+    "RetryDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.classification.error_class", "StringEquals": "TRANSIENT_INFRA" },
+            { "Variable": "$.classification.attempt", "NumericLessThan": ${max_attempts} }
+          ],
+          "Next": "IncrementAttempt"
+        }
+      ],
+      "Default": "RecordFailed"
+    },
+    "IncrementAttempt": {
+      "Type": "Pass",
+      "Parameters": {
+        "job_id.$": "$.job_id",
+        "attempt.$": "States.MathAdd($.classification.attempt, 1)"
+      },
+      "Next": "WaitBeforeRetry"
+    },
+    "WaitBeforeRetry": {
+      "Type": "Wait",
+      "Seconds": ${retry_wait_seconds},
+      "Next": "RunSimulation"
+    },
+    "RecordFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${jobs_table_name}",
+        "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
+        "UpdateExpression": "SET #status = :failed, error_class = :error_class, finished_at = :now",
+        "ConditionExpression": "#status = :running",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":failed": { "S": "FAILED" },
+          ":running": { "S": "RUNNING" },
+          ":error_class": { "S.$": "$.classification.error_class" },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "AlreadyCancelled"
+        }
+      ],
+      "End": true
+    },
+    "RecordSucceeded": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${jobs_table_name}",
+        "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
+        "UpdateExpression": "SET #status = :succeeded, finished_at = :now",
+        "ConditionExpression": "#status = :running",
+        "ExpressionAttributeNames": { "#status": "status" },
+        "ExpressionAttributeValues": {
+          ":succeeded": { "S": "SUCCEEDED" },
+          ":running": { "S": "RUNNING" },
+          ":now": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "AlreadyCancelled"
+        }
+      ],
+      "End": true
+    },
+    "AlreadyCancelled": {
+      "Comment": "A transition precondition failed. Preserve the existing state, including every terminal state; do not start more compute.",
+      "Type": "Pass",
+      "End": true
+    }
+  }
+}

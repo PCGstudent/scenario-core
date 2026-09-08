@@ -79,6 +79,7 @@ from typing import Any
 import numpy as np
 import threadpoolctl
 
+from scenario_platform.adapters import job_store, s3_store
 from scenario_platform.adapters.logging import configure_worker_logging
 from scenario_platform.adapters.metrics import emit_duration_ms
 from scenario_platform.domain import serialization
@@ -280,18 +281,11 @@ def _parse_risk_levels(
 
 
 def _parse_request(path: Path) -> tuple[str, ScenarioRequest, RiskConfig]:
-    """Read and strictly validate the worker's request document.
-
-    Returns ``(expected_artifact_id, scenario_request, risk_config)``.
-    Every failure here is a :class:`WorkerInputError` -- this function never
-    lets a bare ``KeyError``/``TypeError``/``json.JSONDecodeError`` escape,
-    because those would be misclassified as INTERNAL by the top-level
-    handler rather than the INPUT failure they actually are. Nothing here
-    duplicates a quantitative formula: every check is a transport-level
-    shape/type/range check, and the actual domain rules
-    (``ScenarioRequest.__post_init__``, ``policies.check_metric_request``)
-    still run, unchanged, on the values this function produces.
-    """
+    """Read, parse and strictly validate a request document from a local file
+    (Phase 2's ``--request`` path). Delegates the actual field-level
+    validation to :func:`_parse_request_data`, shared with Phase 3b's
+    ``--job-id`` path (:func:`_run_job_id_mode`), which reads the same field
+    shape from a DynamoDB job item instead of a file."""
     try:
         raw_text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -303,7 +297,22 @@ def _parse_request(path: Path) -> tuple[str, ScenarioRequest, RiskConfig]:
         raise WorkerInputError(f"request file {path} is not valid JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise WorkerInputError(f"request file {path} must contain a JSON object")
+    return _parse_request_data(data)
 
+
+def _parse_request_data(data: dict[str, object]) -> tuple[str, ScenarioRequest, RiskConfig]:
+    """Strictly validate an already-parsed request document.
+
+    Returns ``(expected_artifact_id, scenario_request, risk_config)``.
+    Every failure here is a :class:`WorkerInputError` -- this function never
+    lets a bare ``KeyError``/``TypeError`` escape, because those would be
+    misclassified as INTERNAL by the top-level handler rather than the
+    INPUT failure they actually are. Nothing here duplicates a quantitative
+    formula: every check is a transport-level shape/type/range check, and
+    the actual domain rules (``ScenarioRequest.__post_init__``,
+    ``policies.check_metric_request``) still run, unchanged, on the values
+    this function produces.
+    """
     unknown = set(data) - _KNOWN_REQUEST_FIELDS
     if unknown:
         raise WorkerInputError(f"request contains unsupported field(s): {sorted(unknown)}")
@@ -545,25 +554,132 @@ def _write_outputs_atomically(
         lock_path.unlink(missing_ok=True)
 
 
+def _resolve_simulate_inputs(
+    args: argparse.Namespace,
+) -> tuple[Path, str, ScenarioRequest, RiskConfig, Path, str | None, Any, Any]:
+    """Resolve ``(artifact_dir, expected_artifact_id, scenario_request,
+    risk_config, output_dir, job_id_for_s3_upload, artifact_tmp, output_tmp)``
+    from either the local-path arguments (Phase 2) or ``--job-id`` (Phase 3b,
+    Section 6.1 step 4a). ``artifact_tmp``/``output_tmp`` are the
+    ``TemporaryDirectory`` context managers backing the job-id path's S3
+    downloads/uploads (``None`` in local-path mode) -- the caller is
+    responsible for cleaning them up once done.
+    """
+    local_args = (args.artifact_dir, args.request, args.output_dir)
+    if args.job_id is not None:
+        if any(a is not None for a in local_args):
+            raise WorkerInputError(
+                "--job-id is mutually exclusive with --artifact-dir/--request/--output-dir"
+            )
+        job = job_store.get_job(args.job_id)
+        if job is None:
+            raise WorkerInputError(f"no job found for job_id={args.job_id!r}")
+        if job.get("status") != "RUNNING":
+            raise WorkerInputError(
+                f"job {args.job_id!r} is {job.get('status')!r}, not RUNNING"
+            )
+        request_data = job_store.to_native(job["request"])
+        expected_artifact_id, scenario_request, risk_config = _parse_request_data(
+            request_data
+        )
+
+        artifact_tmp = tempfile.TemporaryDirectory(prefix="job-artifact-")
+        output_tmp = tempfile.TemporaryDirectory(prefix="job-output-")
+        artifact_dir = Path(artifact_tmp.name)
+        output_dir = Path(output_tmp.name)
+        try:
+            s3_store.download_artifact(expected_artifact_id, artifact_dir)
+        except s3_store.ArtifactNotFound as exc:
+            # Section 8.3: "artifact missing ... on the loader" is
+            # ARTIFACT_INTEGRITY, not an unrelated INTERNAL failure -- the
+            # same fail-closed rule _load_and_verify_artifact already
+            # applies to a missing/malformed LOCAL artifact directory,
+            # extended here to a genuinely missing S3 object (never a
+            # permissions/config problem or an exhausted transient retry,
+            # both of which s3_store.download_artifact classifies
+            # separately and lets propagate as-is below).
+            artifact_tmp.cleanup()
+            output_tmp.cleanup()
+            raise ArtifactIntegrityError(
+                f"artifact {expected_artifact_id!r} not found in S3: {exc}"
+            ) from exc
+        except (
+            s3_store.ArtifactAccessConfigError,
+            s3_store.ArtifactTransientError,
+            s3_store.ArtifactUnknownError,
+        ):
+            # Deliberately NOT mapped to ArtifactIntegrityError: a
+            # permissions/endpoint-policy misconfiguration or an exhausted
+            # transient retry says nothing about whether the artifact
+            # itself is intact, and Section 8.3's ARTIFACT_INTEGRITY
+            # error_class specifically claims "storage mutation or a
+            # wrong-object read" -- a claim neither of these failures
+            # supports. Falls through to _cmd_simulate's generic
+            # exception handler (INTERNAL), which already logs the full
+            # cause with exc_info=True.
+            artifact_tmp.cleanup()
+            output_tmp.cleanup()
+            raise
+        return (
+            artifact_dir,
+            expected_artifact_id,
+            scenario_request,
+            risk_config,
+            output_dir,
+            args.job_id,
+            artifact_tmp,
+            output_tmp,
+        )
+
+    if any(a is None for a in local_args):
+        raise WorkerInputError(
+            "either --job-id, or all three of --artifact-dir/--request/--output-dir, "
+            "must be supplied"
+        )
+    artifact_dir = Path(args.artifact_dir)
+    expected_artifact_id, scenario_request, risk_config = _parse_request(Path(args.request))
+    output_dir = Path(args.output_dir)
+    return (
+        artifact_dir,
+        expected_artifact_id,
+        scenario_request,
+        risk_config,
+        output_dir,
+        None,
+        None,
+        None,
+    )
+
+
 def _cmd_simulate(args: argparse.Namespace) -> int:
     started_at = datetime.now(tz=UTC)
     t0 = time.monotonic()
-    artifact_dir = Path(args.artifact_dir)
-    request_path = Path(args.request)
-    output_dir = Path(args.output_dir)
-
-    LOGGER.info(
-        "simulate starting",
-        extra={
-            "artifact_dir": str(artifact_dir),
-            "request_path": str(request_path),
-            "output_dir": str(output_dir),
-            "thread_env": _effective_thread_env(),
-        },
-    )
 
     error_class: str | None = None
+    artifact_tmp: Any = None
+    output_tmp: Any = None
     try:
+        (
+            artifact_dir,
+            expected_artifact_id,
+            scenario_request,
+            risk_config,
+            output_dir,
+            job_id_for_upload,
+            artifact_tmp,
+            output_tmp,
+        ) = _resolve_simulate_inputs(args)
+
+        LOGGER.info(
+            "simulate starting",
+            extra={
+                "artifact_dir": str(artifact_dir),
+                "output_dir": str(output_dir),
+                "job_id": job_id_for_upload,
+                "thread_env": _effective_thread_env(),
+            },
+        )
+
         thread_pools = _verify_thread_contract()
 
         if output_dir.exists() and any(output_dir.iterdir()):
@@ -571,7 +687,6 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
                 f"output directory {output_dir} already exists and is not empty"
             )
 
-        expected_artifact_id, scenario_request, risk_config = _parse_request(request_path)
         artifact = _load_and_verify_artifact(artifact_dir, expected_artifact_id)
 
         scenario_set = run_simulate(artifact, scenario_request)
@@ -675,6 +790,28 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
             output_dir, returns_npy_bytes, risk_report, manifest, variances_npy_bytes
         )
 
+        if job_id_for_upload is not None:
+            # Section 6.1 step 4f's AWS-shaped destination. Each invocation
+            # stages into its own immutable attempt prefix; a conditional
+            # stable manifest commits exactly one complete attempt.
+            try:
+                s3_store.upload_run_outputs(job_id_for_upload, output_dir)
+            except s3_store.ConcurrentPublishSuperseded as exc:
+                # A retried invocation of the SAME job (Section 6.3: retries
+                # are safe because a re-run is deterministic) whose manifest
+                # write lost the race to an earlier attempt's -- this
+                # invocation's own computation is correct and complete, it
+                # simply is not the copy a reader will see. That is success,
+                # not failure: raising this onward would report SUCCESS as
+                # an error, and the classifier has no error_class for "the
+                # answer was right but someone else's identical copy was
+                # published first."
+                LOGGER.info(
+                    "simulate succeeded but manifest publish was superseded "
+                    "by a concurrent/earlier invocation of the same job",
+                    extra={"job_id": job_id_for_upload, "reason": str(exc)},
+                )
+
         LOGGER.info(
             "simulate succeeded",
             extra={
@@ -716,6 +853,25 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
             },
         )
         return int(ExitCode.ARTIFACT_INTEGRITY)
+    except (
+        s3_store.ArtifactAccessConfigError,
+        s3_store.ArtifactTransientError,
+        s3_store.ArtifactUnknownError,
+    ) as exc:
+        code = (
+            ExitCode.CONFIG
+            if isinstance(exc, s3_store.ArtifactAccessConfigError)
+            else ExitCode.TRANSIENT_INFRA
+            if isinstance(exc, s3_store.ArtifactTransientError)
+            else ExitCode.UNCLASSIFIED
+        )
+        error_class = code.name
+        LOGGER.error(
+            "artifact download failed",
+            exc_info=True,
+            extra={"error_class": error_class, "error": str(exc)},
+        )
+        return int(code)
     except Exception as exc:  # noqa: BLE001 -- the deliberate, documented INTERNAL catch-all
         error_class = "INTERNAL"
         LOGGER.error(
@@ -734,6 +890,10 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
             duration_ms=(time.monotonic() - t0) * 1000.0,
             error_class=error_class,
         )
+        if artifact_tmp is not None:
+            artifact_tmp.cleanup()
+        if output_tmp is not None:
+            output_tmp.cleanup()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -755,16 +915,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     simulate_parser.add_argument(
         "--artifact-dir",
-        required=True,
-        help="Directory holding artifact.json + state.npz (load_artifact's format).",
+        help="Directory holding artifact.json + state.npz (load_artifact's format). "
+        "Mutually exclusive with --job-id.",
     )
     simulate_parser.add_argument(
-        "--request", required=True, help="Path to the JSON request document."
+        "--request",
+        help="Path to the JSON request document. Mutually exclusive with --job-id.",
     )
     simulate_parser.add_argument(
         "--output-dir",
-        required=True,
-        help="Directory to atomically publish returns.npy/risk_report.json/manifest.json.",
+        help="Directory to atomically publish returns.npy/risk_report.json/manifest.json. "
+        "Mutually exclusive with --job-id.",
+    )
+    simulate_parser.add_argument(
+        "--job-id",
+        help="Phase 3b mode (architecture plan Section 6.1 step 4): read the job's "
+        "canonical resolved request from DynamoDB and its artifact from S3 "
+        "(scenario_platform.adapters.{job_store,s3_store}), then publish "
+        "returns.npy/risk_report.json/manifest.json to S3 under runs/{job_id}/ "
+        "instead of a local --output-dir. Mutually exclusive with the three "
+        "local-path arguments above -- this is what Section 6.1's ECS "
+        "container override actually passes: "
+        'command=["simulate", "--job-id", "{job_id}"].',
     )
     simulate_parser.set_defaults(handler=_cmd_simulate)
 

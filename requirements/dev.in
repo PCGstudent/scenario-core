@@ -33,3 +33,13 @@ python-hcl2>=6,<7
 # a transport format genuinely different from CSV -- it does not appear in
 # worker.lock or control.lock, and no production code path imports it.
 pyarrow>=18,<26
+
+# Test-only, Phase 3b control-plane/worker Lambda and adapter unit tests
+# (moto mocks DynamoDB, S3, Step Functions and ECS in-process -- no network,
+# no real AWS account touched). boto3 itself is also needed directly by
+# these tests to set up moto-backed fixtures (create the mock tables/bucket/
+# state machine before exercising the code under test). Neither appears in
+# worker.lock; boto3 (but not moto) does appear in control.lock and
+# worker-image.lock, where it is a real runtime dependency.
+boto3>=1.34,<2
+moto[dynamodb,s3,stepfunctions,ecs]>=5.0,<6
