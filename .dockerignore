@@ -1,8 +1,19 @@
 # Build-context controls for docker/worker.Dockerfile (architecture plan
-# Section 22). The Dockerfile only ever COPYs requirements/worker.lock and
-# src/ explicitly, but this file is still the single source of truth for
-# what may enter the build context at all -- defence in depth against a
-# future Dockerfile edit, and it keeps the context small regardless.
+# Section 22) -- this is the DEFAULT build context for `docker build` with
+# no -f, and for `-f docker/worker.Dockerfile` specifically. The Dockerfile
+# only ever COPYs requirements/worker.lock and src/ explicitly, but this
+# file is still the single source of truth for what may enter the build
+# context at all -- defence in depth against a future Dockerfile edit, and
+# it keeps the context small regardless. These worker protections are
+# unchanged by the rule below.
+#
+# A Dockerfile with different context needs gets its own
+# "<Dockerfile>.dockerignore" instead of loosening this file -- Docker
+# picks that sibling file up automatically for a matching `-f` build.
+# docker/probe.Dockerfile uses docker/probe.Dockerfile.dockerignore (a
+# minimal allowlist: exclude everything, re-include only what that
+# Dockerfile's own COPY steps need), since it needs scripts/
+# connectivity_probe.py, which this file deliberately excludes below.
 
 # Git metadata and local environments
 .git

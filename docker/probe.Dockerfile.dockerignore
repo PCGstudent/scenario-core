@@ -1,0 +1,20 @@
+# Build-context allowlist for docker/probe.Dockerfile specifically --
+# picked up automatically by Docker as "<Dockerfile>.dockerignore" instead
+# of the repo-root .dockerignore whenever this exact Dockerfile is built
+# via `-f docker/probe.Dockerfile`.
+#
+# The repo-root .dockerignore was written for docker/worker.Dockerfile
+# only (its own header says so) and excludes the whole scripts/ directory
+# -- correct for the worker image, but it also blocks probe.Dockerfile's
+# own COPY scripts/connectivity_probe.py step, since .dockerignore applies
+# to the entire build context regardless of which Dockerfile is in use.
+# Rather than loosening the worker's own ignore file, this probe-specific
+# allowlist excludes everything by default and re-includes only the two
+# paths this Dockerfile actually needs, plus their parent directories
+# (Docker's exclusion of a directory blocks re-inclusion of a file inside
+# it unless the directory itself is also re-included first).
+**
+!docker/
+!docker/probe.Dockerfile
+!scripts/
+!scripts/connectivity_probe.py
