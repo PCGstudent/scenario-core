@@ -12,8 +12,6 @@
 # worker_compute's eventual '4xtra-dev-worker' names -- both are free to
 # coexist"). This module is that "eventual" arrival.
 
-data "aws_caller_identity" "current" {}
-
 resource "aws_ecs_cluster" "worker" {
   #checkov:skip=CKV_AWS_65:Container Insights deferred (Section 27), same reasoning as probe.tf -- a cluster with no idle task/service costs nothing regardless.
   name = "4xtra-${var.environment}"

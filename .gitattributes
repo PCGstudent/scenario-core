@@ -1,0 +1,5 @@
+# Shell scripts must run on both a Windows checkout (Git-Bash/MSYS) and a
+# genuine Linux host (WSL, CI runners); a CRLF-terminated script fails on
+# native Linux bash with "$'\r': command not found" the moment
+# core.autocrlf=true on a Windows clone re-introduces CRLF on checkout.
+*.sh text eol=lf

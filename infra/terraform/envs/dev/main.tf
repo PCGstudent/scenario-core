@@ -214,11 +214,11 @@ module "observability" {
 module "demo_killswitch" {
   source = "../../modules/demo_killswitch"
 
-  environment         = var.environment
-  region              = var.region
-  vpc_endpoint_names  = ["4xtra-${var.environment}-ecr-api", "4xtra-${var.environment}-ecr-dkr", "4xtra-${var.environment}-logs"]
-  ecs_cluster_arns    = [for suffix in ["", "-probe"] : "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:cluster/4xtra-${var.environment}${suffix}"]
-  failure_alert_email = var.alert_email
-  schedule_expression = var.demo_schedule_expression
+  environment              = var.environment
+  region                   = var.region
+  vpc_endpoint_names       = ["4xtra-${var.environment}-ecr-api", "4xtra-${var.environment}-ecr-dkr", "4xtra-${var.environment}-logs"]
+  ecs_cluster_arns         = [for suffix in ["", "-probe"] : "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:cluster/4xtra-${var.environment}${suffix}"]
+  failure_alert_email      = var.alert_email
+  schedule_expression      = var.demo_schedule_expression
   permissions_boundary_arn = module.ci_oidc.runtime_role_boundary_arn
 }

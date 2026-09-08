@@ -452,8 +452,8 @@ data "aws_iam_policy_document" "phase3b_management" {
   }
 
   statement {
-    sid    = "HttpApiManagement"
-    effect = "Allow"
+    sid     = "HttpApiManagement"
+    effect  = "Allow"
     actions = ["apigateway:GET", "apigateway:POST", "apigateway:PATCH", "apigateway:DELETE"]
     resources = [
       "arn:aws:apigateway:${var.region}::/apis",
