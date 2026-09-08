@@ -54,10 +54,8 @@ def test_incomplete_publish_never_looks_complete(moto_env, tmp_path):
     s3_store.upload_run_outputs("job-3", tmp_path)
 
     assert s3_store.get_manifest("job-3") is None
-    # The data files ARE present -- exactly the "partial result, no
-    # manifest" state a consumer must never mistake for complete.
     s3 = boto3.client("s3", region_name=moto_env["region"])
-    s3.head_object(Bucket=moto_env["runs_bucket"], Key="runs/job-3/returns.npy")
+    assert s3.list_objects_v2(Bucket=moto_env["runs_bucket"]).get("KeyCount") == 0
 
 
 class _FakeClientErrorSequence:
@@ -134,3 +132,97 @@ class TestDownloadArtifactClassification:
         with pytest.raises(s3_store.ArtifactTransientError):
             s3_store.download_artifact("sha256:aaa", tmp_path)
         assert fake.calls == s3_store._ARTIFACT_DOWNLOAD_MAX_ATTEMPTS
+
+
+def test_loser_with_different_bytes_cannot_mutate_winner(moto_env, tmp_path):
+    first = tmp_path / "a"
+    first.mkdir()
+    second = tmp_path / "b"
+    second.mkdir()
+    _write_local_result(first, artifact_id="first")
+    _write_local_result(second, artifact_id="second")
+    (second / "returns.npy").write_bytes(b"different")
+    (second / "risk_report.json").write_text('{"different":true}')
+    s3_store.upload_run_outputs("immutable", first)
+    winner = s3_store.get_manifest("immutable")
+    with pytest.raises(s3_store.ConcurrentPublishSuperseded):
+        s3_store.upload_run_outputs("immutable", second)
+    assert s3_store.get_manifest("immutable") == winner
+    key = "runs/immutable/" + winner["outputs"]["returns"]
+    body = (
+        boto3.client("s3")
+        .get_object(Bucket=moto_env["runs_bucket"], Key=key)["Body"]
+        .read()
+    )
+    assert body == b"fake-returns"
+    assert s3_store.get_risk_report("immutable") == {"var_es": {}}
+
+
+def test_failed_second_upload_preserves_committed_result(moto_env, tmp_path, monkeypatch):
+    _write_local_result(tmp_path, artifact_id="first")
+    s3_store.upload_run_outputs("failure", tmp_path)
+    winner = s3_store.get_manifest("failure")
+    real = s3_store._client()
+    original = real.put_object
+
+    def failing(**kwargs):
+        if kwargs["Key"].endswith("risk_report.json"):
+            raise RuntimeError("injected interruption")
+        return original(**kwargs)
+
+    monkeypatch.setattr(real, "put_object", failing)
+    (tmp_path / "returns.npy").write_bytes(b"other-attempt")
+    with pytest.raises(RuntimeError, match="injected"):
+        s3_store.upload_run_outputs("failure", tmp_path)
+    assert s3_store.get_manifest("failure") == winner
+    assert (
+        real.get_object(
+            Bucket=moto_env["runs_bucket"],
+            Key="runs/failure/" + winner["outputs"]["returns"],
+        )["Body"].read()
+        == b"fake-returns"
+    )
+
+
+def test_two_publishers_interleave_without_mixing_outputs(moto_env, tmp_path, monkeypatch):
+    first = tmp_path / "a"
+    first.mkdir()
+    second = tmp_path / "b"
+    second.mkdir()
+    _write_local_result(first, artifact_id="first")
+    _write_local_result(second, artifact_id="second")
+    (second / "returns.npy").write_bytes(b"second")
+    real = s3_store._client()
+    original = real.put_object
+    interleaved = False
+
+    def interleave(**kwargs):
+        nonlocal interleaved
+        if not interleaved and kwargs["Key"].endswith("risk_report.json"):
+            interleaved = True
+            s3_store.upload_run_outputs("race", second)
+        return original(**kwargs)
+
+    monkeypatch.setattr(real, "put_object", interleave)
+    with pytest.raises(s3_store.ConcurrentPublishSuperseded):
+        s3_store.upload_run_outputs("race", first)
+    winner = s3_store.get_manifest("race")
+    assert winner["artifact_id"] == "second"
+    assert (
+        real.get_object(
+            Bucket=moto_env["runs_bucket"], Key="runs/race/" + winner["outputs"]["returns"]
+        )["Body"].read()
+        == b"second"
+    )
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        ("NoSuchBucket", s3_store.ArtifactAccessConfigError),
+        ("Unrecognised", s3_store.ArtifactUnknownError),
+        ("SlowDown", s3_store.ArtifactTransientError),
+    ],
+)
+def test_download_error_distinctions(error, expected):
+    assert isinstance(s3_store._classify_download_error(_client_error(error)), expected)

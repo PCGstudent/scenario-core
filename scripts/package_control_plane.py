@@ -11,9 +11,9 @@ version via ``pip install --platform manylinux2014_x86_64 --python-version
 **boto3/botocore are deliberately excluded from this zip**, even though they
 are real, pinned entries in ``requirements/control.lock`` (needed there for
 local dev/testing reproducibility, including the ``moto``-backed test suite).
-The AWS Lambda Python 3.13 managed runtime already bundles a recent boto3/
-botocore -- this is AWS's own standard guidance for when NOT to vendor the
-SDK -- and botocore's own source alone is ~16 MB unpacked, which by itself
+The AWS Lambda Python 3.13 managed runtime supplies boto3/botocore; this
+is an explicit unpinned runtime dependency and a deployment trade-off.
+Botocore's own source alone is ~16 MB unpacked, which by itself
 blows the Phase 3b package-size acceptance criterion (< 15 MB, Section 24).
 A first attempt at this script bundled the whole lock file unfiltered and
 produced a 21.3 MB zip; excluding the boto3 family (boto3, botocore,
@@ -25,14 +25,11 @@ local testing), that is a deliberate, reviewed addition to this exclusion
 list, not something to silently reintroduce by reverting to the whole lock
 file.
 
-``scenario_platform.domain`` is included because ``scenario_platform.control.
-admission`` imports ``scenario_platform.domain.policies`` directly (Section
-7.4's "shared contract without shared runtime" -- the domain layer is pure
-Python with no scientific dependency *once ``domain.policies`` stops
-eagerly importing ``domain.artifacts`` at module level, which it now does
-under ``TYPE_CHECKING`` only* -- see that module's own comment). Bundling it
-costs nothing and keeps policy logic defined exactly once, never
-reimplemented in the control plane. ``scenario_platform.worker`` as a whole
+Only ``domain/__init__.py`` and ``domain/policies.py`` are included because
+``scenario_platform.control.admission`` imports the governance policy. This
+keeps policy defined exactly once while making it structurally impossible for
+the ZIP to contain the scientific artifact/serialization/services runtime.
+``scenario_platform.worker`` as a whole
 is deliberately NOT bundled (it would pull in ``__main__.py``'s full
 scientific-stack import surface) -- only ``worker/__init__.py`` and
 ``worker/errors.py`` are, because ``control.classify_failure`` imports the
@@ -57,7 +54,8 @@ import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-_BUNDLED_PACKAGES = ("control", "domain", "adapters")
+_BUNDLED_PACKAGES = ("control", "adapters")
+_DOMAIN_FILES_NEEDED = ("__init__.py", "policies.py")
 
 #: scenario_platform.control.classify_failure imports
 #: scenario_platform.worker.errors (the shared exit-code/error_class
@@ -81,17 +79,22 @@ _REQUIREMENT_LINE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9.\-+!
 
 
 def _filtered_requirements(lock_path: Path) -> list[str]:
-    """``name==version`` pins from ``lock_path``, minus :data:`_EXCLUDED_FROM_ZIP`."""
-    pins: list[str] = []
+    """Keep complete locked requirement blocks, including all wheel hashes."""
+    blocks: list[str] = []
+    current: list[str] = []
+    keep = False
     for line in lock_path.read_text(encoding="utf-8").splitlines():
-        match = _REQUIREMENT_LINE.match(line.strip())
-        if not match:
-            continue
-        name, version = match.group(1), match.group(2)
-        if name.lower() in _EXCLUDED_FROM_ZIP:
-            continue
-        pins.append(f"{name}=={version}")
-    return pins
+        match = _REQUIREMENT_LINE.match(line)
+        if match:
+            if current and keep:
+                blocks.append("\n".join(current))
+            current = [line]
+            keep = match.group(1).lower() not in _EXCLUDED_FROM_ZIP
+        elif current and line.lstrip().startswith("--hash="):
+            current.append(line)
+    if current and keep:
+        blocks.append("\n".join(current))
+    return blocks
 
 
 def build(*, output: Path, python_version: str = "3.13", skip_verify: bool = False) -> None:
@@ -104,6 +107,8 @@ def build(*, output: Path, python_version: str = "3.13", skip_verify: bool = Fal
     if not pins:
         raise RuntimeError("no packages survived filtering -- check control.lock parsing")
 
+    filtered_lock = build_dir / "control-filtered.lock"
+    filtered_lock.write_text("\n".join(pins) + "\n", encoding="utf-8")
     subprocess.run(
         [
             sys.executable,
@@ -118,7 +123,9 @@ def build(*, output: Path, python_version: str = "3.13", skip_verify: bool = Fal
             "--only-binary=:all:",
             "--target",
             str(build_dir),
-            *pins,
+            "--require-hashes",
+            "-r",
+            str(filtered_lock),
         ],
         check=True,
     )
@@ -131,6 +138,14 @@ def build(*, output: Path, python_version: str = "3.13", skip_verify: bool = Fal
             REPO_ROOT / "src" / "scenario_platform" / name,
             package_root / name,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+
+    domain_root = package_root / "domain"
+    domain_root.mkdir(exist_ok=True)
+    for filename in _DOMAIN_FILES_NEEDED:
+        shutil.copy2(
+            REPO_ROOT / "src" / "scenario_platform" / "domain" / filename,
+            domain_root / filename,
         )
 
     worker_root = package_root / "worker"
@@ -149,6 +164,18 @@ def build(*, output: Path, python_version: str = "3.13", skip_verify: bool = Fal
             if path.is_file() and "__pycache__" not in path.parts:
                 zf.write(path, path.relative_to(build_dir))
 
+    with zipfile.ZipFile(output) as archive:
+        names = set(archive.namelist())
+    forbidden_domain_files = {
+        f"scenario_platform/domain/{name}"
+        for name in ("artifacts.py", "identity.py", "serialization.py", "services.py")
+    }
+    leaked_files = sorted(names & forbidden_domain_files)
+    if leaked_files:
+        raise RuntimeError(
+            f"scientific domain files leaked into Lambda ZIP: {leaked_files}"
+        )
+
     size_mb = output.stat().st_size / 1_000_000
     print(f"Wrote {output} ({size_mb:.1f} MB)")
     if size_mb >= 15:
@@ -160,7 +187,12 @@ def build(*, output: Path, python_version: str = "3.13", skip_verify: bool = Fal
     if skip_verify:
         print("Skipped --skip-verify: NOT proven importable in a clean Lambda runtime.")
     else:
-        verify(build_dir)
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="lambda-zip-verify-") as extracted:
+            with zipfile.ZipFile(output) as archive:
+                archive.extractall(extracted)
+            verify(Path(extracted))
 
 
 #: Every module a scientific-purity check must never see imported after

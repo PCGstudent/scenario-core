@@ -9,11 +9,12 @@
         "TableName": "${jobs_table_name}",
         "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
         "UpdateExpression": "SET #status = :running, started_at = :now",
-        "ConditionExpression": "#status <> :cancelled",
+        "ConditionExpression": "#status IN (:submitted, :queued)",
         "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
           ":running": { "S": "RUNNING" },
-          ":cancelled": { "S": "CANCELLED" },
+          ":submitted": { "S": "SUBMITTED" },
+          ":queued": { "S": "QUEUED" },
           ":now": { "S.$": "$$.State.EnteredTime" }
         }
       },
@@ -85,7 +86,10 @@
         "TableName": "${jobs_table_name}",
         "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
         "UpdateExpression": "SET attempts = list_append(if_not_exists(attempts, :empty), :entry)",
+        "ConditionExpression": "#status = :running",
+        "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
+          ":running": { "S": "RUNNING" },
           ":empty": { "L": [] },
           ":entry": {
             "L": [
@@ -100,6 +104,12 @@
         }
       },
       "ResultPath": "$.recordAttemptResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+          "Next": "AlreadyCancelled"
+        }
+      ],
       "Next": "RetryDecision"
     },
     "RetryDecision": {
@@ -135,11 +145,11 @@
         "TableName": "${jobs_table_name}",
         "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
         "UpdateExpression": "SET #status = :failed, error_class = :error_class, finished_at = :now",
-        "ConditionExpression": "#status <> :cancelled",
+        "ConditionExpression": "#status = :running",
         "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
           ":failed": { "S": "FAILED" },
-          ":cancelled": { "S": "CANCELLED" },
+          ":running": { "S": "RUNNING" },
           ":error_class": { "S.$": "$.classification.error_class" },
           ":now": { "S.$": "$$.State.EnteredTime" }
         }
@@ -159,11 +169,11 @@
         "TableName": "${jobs_table_name}",
         "Key": { "pk": { "S.$": "States.Format('JOB#{}', $.job_id)" } },
         "UpdateExpression": "SET #status = :succeeded, finished_at = :now",
-        "ConditionExpression": "#status <> :cancelled",
+        "ConditionExpression": "#status = :running",
         "ExpressionAttributeNames": { "#status": "status" },
         "ExpressionAttributeValues": {
           ":succeeded": { "S": "SUCCEEDED" },
-          ":cancelled": { "S": "CANCELLED" },
+          ":running": { "S": "RUNNING" },
           ":now": { "S.$": "$$.State.EnteredTime" }
         }
       },
@@ -176,7 +186,7 @@
       "End": true
     },
     "AlreadyCancelled": {
-      "Comment": "The job was already CANCELLED (a concurrent DELETE won the race against RecordQueued/RecordSucceeded/RecordFailed's own conditional write) -- nothing further to record; the CANCELLED status set by the DELETE handler (control.jobs) is authoritative and left untouched.",
+      "Comment": "A transition precondition failed. Preserve the existing state, including every terminal state; do not start more compute.",
       "Type": "Pass",
       "End": true
     }

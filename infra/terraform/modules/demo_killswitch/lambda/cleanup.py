@@ -1,60 +1,10 @@
-"""The demo auto-cleanup Lambda -- an AWS-native dead-man's switch, deliberately
-independent of GitHub Actions (its runs are currently failing at startup,
-per this project's own standing instruction not to rely on it for this) and
-of any local machine (a laptop being asleep, closed or offline must not
-prevent this from firing).
+"""Independent demo cleanup, installed before the watched network.
 
-Triggered by a ONE-TIME `aws_scheduler_schedule` (EventBridge Scheduler),
-created alongside the demo's costly resources so it exists for exactly as
-long as they do and no longer. Deliberately narrow: this is a single-purpose
-kill switch for the one dominant demo-window cost line (the VPC interface
-endpoints) plus whatever Fargate compute might still be running against
-them -- it never runs `terraform destroy`, never touches S3/DynamoDB/KMS,
-and its IAM role (see ../main.tf) grants nothing beyond what this file
-actually calls.
-
-**Order of operations, and why each step is where it is:**
-
-1. **Deregister the watched task definition(s) first.** This is what
-   actually stops NEW compute from being placed while cleanup is in
-   progress: Step Functions' `RunSimulation` state references one fixed
-   task-definition ARN, baked in at `terraform apply` time, so
-   deregistering that exact revision makes any subsequent `ecs:RunTask`
-   call against it fail immediately at the ECS API level -- a submission
-   that arrives mid-cleanup cannot place a task, regardless of how many
-   times the state machine's own bounded retry loop tries. (A resulting
-   `RunTask` API failure is classified `TRANSIENT_INFRA` by
-   `classify_failure.py`'s existing "unrecognised ECS error" branch, so
-   such a submission still exhausts its retry budget before failing
-   closed -- this stops compute from being PLACED, not from being
-   *retried at the Step Functions level*, which is a real but bounded and
-   disclosed limitation.) Deregistering does not affect tasks already
-   running.
-2. **Stop already-running Fargate tasks**, paginated, with STOPPED
-   confirmed via a waiter -- not fire-and-forget. A running task depends
-   on the endpoints for DynamoDB/S3/ECR/Logs access, so deleting them out
-   from under it does not stop that task's own billed compute; only a
-   confirmed `StopTask` does.
-3. **Delete the interface endpoints**, verified individually (never as one
-   batched call whose failure on one ID would mask the state of the
-   others) and polled until each genuinely reports `deleted` (not
-   `deleting`, which is still in progress, not yet done).
-
-**Idempotent.** Every step describes current state before acting and
-treats "already gone" as success, not as an error to retry into. Safe to
-invoke more than once.
-
-**Verification, not assumption**, at every step -- deregistration is
-confirmed by describing the task definition afterward; task stops are
-confirmed by a waiter, not by the `StopTask` call merely being accepted;
-endpoint deletion is confirmed by polling each id individually until it
-reports `deleted`.
-
-**On any failure**, this publishes to the operator SNS topic (never
-silently exits non-zero into a log nobody reads) and then re-raises, so the
-Lambda's own `AWS/Lambda Errors` metric also fires -- the CloudWatch alarm
-in ../main.tf is a backstop for the case where this function fails too
-early or too badly to reach the `sns.publish` call itself.
+IAM time conditions on the submission and orchestration roles prohibit new
+executions/placements at the deadline; task-definition deregistration is not
+used as an instantaneous barrier. Endpoint Name tags and predetermined cluster
+ARNs allow installation before any costly endpoint exists. Cleanup confirms
+stops and deletions and reports partial failures. It never modifies data/state.
 """
 
 from __future__ import annotations
@@ -78,52 +28,27 @@ def _env_list(name: str) -> list[str]:
 
 
 def _is_not_found(exc: ClientError) -> bool:
-    code = exc.response.get("Error", {}).get("Code", "")
-    return code in (
+    return exc.response.get("Error", {}).get("Code") in (
         "InvalidVpcEndpointId.NotFound",
-        "ClientException",  # ECS's own "task definition does not exist" style code
-    ) or "does not exist" in str(exc)
+        "ClusterNotFoundException",
+    )
 
 
-# --- Step 1: deregister the watched task definition(s) ---------------------
-
-
-def _deregister_task_definitions(
-    ecs: Any, task_definition_arns: list[str], errors: list[str]
-) -> list[str]:
-    deregistered: list[str] = []
-    for arn in task_definition_arns:
-        try:
-            resp = ecs.describe_task_definition(taskDefinition=arn)
-            status = resp["taskDefinition"].get("status")
-        except ClientError as exc:
-            if _is_not_found(exc):
-                continue  # already gone -- idempotent, nothing to do
-            errors.append(f"describe_task_definition({arn}): {exc}")
-            continue
-
-        if status == "INACTIVE":
-            continue  # already deregistered by an earlier/retried invocation
-
-        try:
-            ecs.deregister_task_definition(taskDefinition=arn)
-            deregistered.append(arn)
-        except ClientError as exc:
-            if _is_not_found(exc):
-                continue
-            errors.append(f"deregister_task_definition({arn}): {exc}")
-            continue
-
-        # Verify, not assume: confirm the revision actually reports INACTIVE
-        # before treating this step as done.
-        try:
-            confirm = ecs.describe_task_definition(taskDefinition=arn)
-            if confirm["taskDefinition"].get("status") != "INACTIVE":
-                errors.append(f"deregister_task_definition({arn}): still ACTIVE after call")
-        except ClientError as exc:
-            errors.append(f"describe_task_definition (verify) ({arn}): {exc}")
-
-    return deregistered
+def _discover_endpoints(ec2: Any) -> list[str]:
+    names = _env_list("VPC_ENDPOINT_NAMES")
+    if not names:
+        return []
+    result: list[str] = []
+    for page in ec2.get_paginator("describe_vpc_endpoints").paginate(
+        Filters=[
+            {"Name": "tag:Name", "Values": names},
+            {"Name": "vpc-endpoint-type", "Values": ["Interface"]},
+        ]
+    ):
+        result.extend(
+            endpoint["VpcEndpointId"] for endpoint in page.get("VpcEndpoints", [])
+        )
+    return result
 
 
 # --- Step 2: stop running tasks, paginated, confirmed STOPPED --------------
@@ -136,11 +61,14 @@ def _running_task_arns(ecs: Any, cluster_arn: str, errors: list[str]) -> list[st
         for page in paginator.paginate(cluster=cluster_arn, desiredStatus="RUNNING"):
             task_arns.extend(page.get("taskArns", []))
     except ClientError as exc:
-        errors.append(f"list_tasks({cluster_arn}): {exc}")
+        if not _is_not_found(exc):
+            errors.append(f"list_tasks({cluster_arn}): {exc}")
     return task_arns
 
 
-def _stop_and_confirm_tasks(ecs: Any, cluster_arns: list[str], errors: list[str]) -> list[str]:
+def _stop_and_confirm_tasks(
+    ecs: Any, cluster_arns: list[str], errors: list[str]
+) -> list[str]:
     stopped: list[str] = []
     for cluster_arn in cluster_arns:
         task_arns = _running_task_arns(ecs, cluster_arn, errors)
@@ -165,16 +93,18 @@ def _stop_and_confirm_tasks(ecs: Any, cluster_arns: list[str], errors: list[str]
             continue
 
         try:
-            ecs.get_waiter("tasks_stopped").wait(
-                cluster=cluster_arn,
-                tasks=issued,
-                WaiterConfig={
-                    "Delay": _TASK_STOP_WAITER_DELAY_SECONDS,
-                    "MaxAttempts": _TASK_STOP_WAITER_MAX_ATTEMPTS,
-                },
-            )
+            # DescribeTasks accepts at most 100 task IDs per request.
+            for offset in range(0, len(issued), 100):
+                ecs.get_waiter("tasks_stopped").wait(
+                    cluster=cluster_arn,
+                    tasks=issued[offset : offset + 100],
+                    WaiterConfig={
+                        "Delay": _TASK_STOP_WAITER_DELAY_SECONDS,
+                        "MaxAttempts": _TASK_STOP_WAITER_MAX_ATTEMPTS,
+                    },
+                )
             stopped.extend(issued)
-        except WaiterError as exc:
+        except (WaiterError, ClientError) as exc:
             errors.append(
                 f"tasks in {cluster_arn} not confirmed STOPPED within "
                 f"{_TASK_STOP_WAITER_DELAY_SECONDS * _TASK_STOP_WAITER_MAX_ATTEMPTS}s: "
@@ -214,37 +144,38 @@ def _endpoint_state(ec2: Any, endpoint_id: str) -> str:
 def _delete_and_verify_endpoints(
     ec2: Any, endpoint_ids: list[str], errors: list[str]
 ) -> list[str]:
-    to_delete = [eid for eid in endpoint_ids if _endpoint_state(ec2, eid) != "deleted"]
+    to_delete: list[str] = []
+    for eid in endpoint_ids:
+        try:
+            if _endpoint_state(ec2, eid) != "deleted":
+                to_delete.append(eid)
+        except ClientError as exc:
+            errors.append(f"describe endpoint {eid}: {exc}")
     if not to_delete:
         return []
-
     try:
         resp = ec2.delete_vpc_endpoints(VpcEndpointIds=to_delete)
     except ClientError as exc:
-        errors.append(f"delete_vpc_endpoints({to_delete}): {exc}")
+        errors.append(f"delete_vpc_endpoints: {exc}")
         resp = {}
-
     for failure in resp.get("Unsuccessful", []):
         error = failure.get("Error", {})
-        if error.get("Code") in ("InvalidVpcEndpointId.NotFound",):
-            continue  # already gone -- not a real failure
-        errors.append(
-            f"delete_vpc_endpoints({failure.get('VpcEndpointId')}): "
-            f"{error.get('Code')}: {error.get('Message')}"
-        )
-
-    deadline = time.time() + _ENDPOINT_VERIFY_TIMEOUT_SECONDS
+        if error.get("Code") != "InvalidVpcEndpointId.NotFound":
+            errors.append(f"delete endpoint {failure.get('ResourceId')}: {error}")
+    deadline = time.monotonic() + _ENDPOINT_VERIFY_TIMEOUT_SECONDS
     remaining = set(to_delete)
-    while remaining and time.time() < deadline:
-        remaining = {eid for eid in remaining if _endpoint_state(ec2, eid) != "deleted"}
+    while remaining and time.monotonic() < deadline:
+        for eid in list(remaining):
+            try:
+                if _endpoint_state(ec2, eid) == "deleted":
+                    remaining.remove(eid)
+            except ClientError as exc:
+                errors.append(f"verify endpoint {eid}: {exc}")
+                return [eid for eid in to_delete if eid not in remaining]
         if remaining:
             time.sleep(_ENDPOINT_VERIFY_POLL_SECONDS)
-
     if remaining:
-        errors.append(
-            f"endpoints not confirmed deleted within {_ENDPOINT_VERIFY_TIMEOUT_SECONDS}s: "
-            f"{sorted(remaining)}"
-        )
+        errors.append(f"endpoints not confirmed deleted: {sorted(remaining)}")
     return [eid for eid in to_delete if eid not in remaining]
 
 
@@ -255,32 +186,33 @@ def handler(event: dict[str, Any], context: Any = None) -> dict[str, Any]:
 
     cluster_arns = _env_list("ECS_CLUSTER_ARNS")
     endpoint_ids = _env_list("VPC_ENDPOINT_IDS")
-    task_definition_arns = _env_list("TASK_DEFINITION_ARNS")
     topic_arn = os.environ["FAILURE_SNS_TOPIC_ARN"]
-
     errors: list[str] = []
-    deregistered = _deregister_task_definitions(ecs, task_definition_arns, errors)
-    stopped_tasks = _stop_and_confirm_tasks(ecs, cluster_arns, errors)
-    deleted_endpoints = _delete_and_verify_endpoints(ec2, endpoint_ids, errors)
-
+    stopped_tasks: list[str] = []
+    deleted_endpoints: list[str] = []
+    try:
+        # Two sweeps cover tasks whose placement was in flight at cutoff.
+        # The role's preinstalled IAM deadline blocks subsequent RunTask.
+        for _ in range(2):
+            stopped_tasks.extend(_stop_and_confirm_tasks(ecs, cluster_arns, errors))
+            if errors:
+                break
+            time.sleep(5)
+        if not errors:
+            endpoint_ids = sorted(set(endpoint_ids + _discover_endpoints(ec2)))
+            deleted_endpoints = _delete_and_verify_endpoints(ec2, endpoint_ids, errors)
+    except Exception as exc:  # noqa: BLE001 -- alert on unexpected failures too
+        errors.append(f"cleanup exception: {type(exc).__name__}: {exc}")
     result = {
-        "task_definitions_deregistered": deregistered,
-        "tasks_stopped_and_confirmed": stopped_tasks,
+        "tasks_stopped_and_confirmed": sorted(set(stopped_tasks)),
         "endpoints_deleted_and_confirmed": deleted_endpoints,
         "errors": errors,
     }
-
     if errors:
         sns.publish(
             TopicArn=topic_arn,
             Subject="4xtra demo auto-cleanup FAILED",
-            Message=(
-                "The scheduled demo auto-cleanup Lambda encountered errors and could "
-                "not confirm every targeted resource was removed. Manual teardown is "
-                "required now -- see docs/aws-demo-runbook.md's reconciliation "
-                f"procedure.\n\nDetails:\n{chr(10).join(errors)}"
-            ),
+            Message="Manual reconciliation required.\n" + "\n".join(errors),
         )
         raise RuntimeError(f"demo auto-cleanup failed: {'; '.join(errors)}")
-
     return result

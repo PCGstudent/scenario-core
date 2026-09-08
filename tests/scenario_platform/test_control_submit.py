@@ -314,3 +314,12 @@ def test_replay_after_completion_returns_terminal_status_without_restarting(appr
     out = json.loads(resp["body"])
     assert out["job_id"] == "done-1"
     assert out["status"] == "SUCCEEDED"
+
+
+def test_expired_demo_rejects_start_even_during_healing(moto_env, monkeypatch):
+    from scenario_platform.control import submit
+    from scenario_platform.control.errors import HandlerError
+
+    monkeypatch.setenv("DEMO_DEADLINE_UTC", "2000-01-01T00:00:00Z")
+    with pytest.raises(HandlerError):
+        submit._start_or_heal_execution("expired-job")

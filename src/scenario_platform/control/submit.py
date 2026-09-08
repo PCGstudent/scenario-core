@@ -93,6 +93,11 @@ def _start_or_heal_execution(job_id: str) -> str:
       immediately, best-effort, so a cancelled job does not silently keep
       running compute anyway.
     """
+    deadline = os.environ.get("DEMO_DEADLINE_UTC")
+    if deadline and datetime.now(UTC) >= datetime.fromisoformat(
+        deadline.replace("Z", "+00:00")
+    ):
+        raise HandlerError(503, "DemoWindowClosed", "the demonstration window has ended")
     state_machine_arn, execution_arn = _execution_arn_for(job_id)
     try:
         _sfn().start_execution(
@@ -164,6 +169,11 @@ def _handle_replay(idem: dict[str, Any], expected_hash: str) -> ScenarioJobOut:
 def _submit_new_job(
     request: ScenarioJobIn, *, principal: str, idempotency_key: str | None, req_hash: str
 ) -> dict[str, Any]:
+    deadline = os.environ.get("DEMO_DEADLINE_UTC")
+    if deadline and datetime.now(UTC) >= datetime.fromisoformat(
+        deadline.replace("Z", "+00:00")
+    ):
+        raise HandlerError(503, "DemoWindowClosed", "the demonstration window has ended")
     admission.check_admission(request)
     resolved_version, resolved_artifact_id = admission.resolve_and_authorize(
         request.model_version

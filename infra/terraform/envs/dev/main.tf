@@ -101,7 +101,8 @@ module "worker_image" {
 # --- Network (Section 14) ---------------------------------------------------
 
 module "network" {
-  source = "../../modules/network"
+  depends_on = [module.demo_killswitch]
+  source     = "../../modules/network"
 
   environment           = var.environment
   region                = var.region
@@ -138,20 +139,8 @@ module "ci_oidc" {
 # exist yet, by design; Section 25's slice explicitly runs against a
 # manually-registered artifact, not a calibrated one).
 #
-# infra/terraform/modules/demo_killswitch is wired in CONDITIONALLY
-# (var.demo_killswitch_enabled, default false) rather than unconditionally
-# or as a separate root/module invocation. Both alternatives were tried and
-# rejected: unconditional would make it a standing resource itself, which
-# defeats its purpose (it exists to bound a TEMPORARY demonstration
-# deployment, docs/aws-demo-runbook.md); a separate invocation applied
-# AFTER this one -- an earlier version of this comment's own plan -- means
-# module.network's costly endpoints exist for the entire gap between the
-# two applies with no auto-cleanup watching them at all, not just during a
-# partial-apply failure. Toggling it on WITHIN this same root module means
-# one `terraform apply -var demo_killswitch_enabled=true` creates the
-# endpoints and their kill switch together, atomically, in the same
-# dependency graph -- docs/aws-demo-runbook.md section 3.1 is the residual,
-# narrower risk this cannot close (the apply itself failing partway).
+# Cleanup is created before the network, using predictable names rather than
+# references to resources that do not exist yet. Terraform apply is not atomic.
 
 module "worker_compute" {
   source = "../../modules/worker_compute"
@@ -172,7 +161,8 @@ module "worker_compute" {
 }
 
 module "job_orchestrator" {
-  source = "../../modules/job_orchestrator"
+  demo_deadline_utc = "${substr(var.demo_schedule_expression, 3, 19)}Z"
+  source            = "../../modules/job_orchestrator"
 
   environment                = var.environment
   region                     = var.region
@@ -191,7 +181,8 @@ module "job_orchestrator" {
 }
 
 module "job_api" {
-  source = "../../modules/job_api"
+  demo_deadline_utc = "${substr(var.demo_schedule_expression, 3, 19)}Z"
+  source            = "../../modules/job_api"
 
   environment               = var.environment
   region                    = var.region
@@ -215,25 +206,19 @@ module "observability" {
   alert_email       = var.alert_email
 }
 
-# --- Demo-window auto-cleanup (off by default) ------------------------------
-#
-# count-based, not for-each -- there is exactly one of these per
-# environment, ever, matching the pattern every other single-instance
-# module here already uses implicitly (module blocks with no count/for_each
-# at all). `var.demo_killswitch_enabled=true` is only ever passed at apply
-# time for the duration of a demo window (docs/aws-demo-runbook.md); the
-# default `false` means a plain `terraform apply` with no extra -var never
-# creates it.
+# --- Mandatory demo-window auto-cleanup -------------------------------------
+# This module has no feature flag. A DEV apply cannot create the interface
+# endpoints without first creating the independent cleanup schedule and its
+# Lambda; module.network's depends_on above enforces that order.
 
 module "demo_killswitch" {
-  count  = var.demo_killswitch_enabled ? 1 : 0
   source = "../../modules/demo_killswitch"
 
-  environment          = var.environment
-  region               = var.region
-  vpc_endpoint_ids     = [module.network.ecr_api_endpoint_id, module.network.ecr_dkr_endpoint_id, module.network.logs_endpoint_id]
-  ecs_cluster_arns     = [module.worker_compute.cluster_arn]
-  task_definition_arns = [module.worker_compute.task_definition_arn]
-  failure_alert_email  = var.alert_email
-  schedule_expression  = var.demo_schedule_expression
+  environment         = var.environment
+  region              = var.region
+  vpc_endpoint_names  = ["4xtra-${var.environment}-ecr-api", "4xtra-${var.environment}-ecr-dkr", "4xtra-${var.environment}-logs"]
+  ecs_cluster_arns    = [for suffix in ["", "-probe"] : "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:cluster/4xtra-${var.environment}${suffix}"]
+  failure_alert_email = var.alert_email
+  schedule_expression = var.demo_schedule_expression
+  permissions_boundary_arn = module.ci_oidc.runtime_role_boundary_arn
 }

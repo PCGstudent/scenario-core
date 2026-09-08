@@ -108,8 +108,11 @@ def test_job_id_mode_matches_the_direct_local_path_bit_for_bit(moto_env):
 
     # Manifest-last completion contract, proven over S3 exactly as it is
     # proven over the local filesystem in tests/test_golden_fixture.py.
-    for name in ("returns.npy", "risk_report.json"):
-        s3.head_object(Bucket=moto_env["runs_bucket"], Key=f"runs/{job_id}/{name}")
+    for output in ("returns", "risk_report"):
+        s3.head_object(
+            Bucket=moto_env["runs_bucket"],
+            Key=f"runs/{job_id}/{manifest['outputs'][output]}",
+        )
 
 
 def test_job_id_mode_fails_closed_on_unknown_job(moto_env):
@@ -151,3 +154,34 @@ def test_retried_job_id_invocation_does_not_crash_on_superseded_publish(moto_env
 
     second_exit = main(["simulate", "--job-id", job_id])
     assert second_exit == 0
+
+
+def test_cancelled_job_never_starts_quant_compute(moto_env, monkeypatch):
+    job_id = "cancelled-before-start"
+    job_store._jobs_table().put_item(
+        Item={
+            "pk": f"JOB#{job_id}",
+            "sk": "META",
+            "job_id": job_id,
+            "status": "CANCELLED",
+            "request": job_store.to_decimal(
+                {
+                    "artifact_id": GOLDEN_ARTIFACT_ID,
+                    "model_version": GOLDEN_MODEL_VERSION,
+                    "horizon": 1,
+                    "n_paths": 1,
+                    "seed": 1,
+                }
+            ),
+        }
+    )
+    called = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("quant computation must not start")
+
+    monkeypatch.setattr("scenario_platform.worker.__main__.run_simulate", forbidden)
+    assert main(["simulate", "--job-id", job_id]) == 2
+    assert not called

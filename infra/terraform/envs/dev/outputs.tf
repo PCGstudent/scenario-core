@@ -75,6 +75,6 @@ output "logs_endpoint_id" {
 }
 
 output "demo_killswitch_schedule_arn" {
-  description = "Null unless applied with -var demo_killswitch_enabled=true. docs/aws-demo-runbook.md section 3.1: confirm this resolves immediately after any apply that was meant to create it."
-  value       = try(module.demo_killswitch[0].schedule_arn, null)
+  description = "Mandatory one-time cleanup schedule; verify it immediately after every DEV apply."
+  value       = module.demo_killswitch.schedule_arn
 }

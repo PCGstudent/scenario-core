@@ -83,9 +83,9 @@ def _describe_task(cluster_arn: str, task_arn: str) -> dict[str, Any]:
 
 
 def _exit_code_from_task(task: dict[str, Any]) -> int | None:
-    containers = task.get("containers") or []
+    containers = task.get("containers") or task.get("Containers") or []
     for container in containers:
-        code = container.get("exitCode")
+        code = container.get("exitCode", container.get("ExitCode"))
         if code is not None:
             return int(code)
     return None
@@ -107,9 +107,15 @@ def classify(
     stop_code = cause_parsed.get("stopCode") or cause_parsed.get("StopCode")
     stopped_reason = cause_parsed.get("stoppedReason") or cause_parsed.get("StoppedReason")
     exit_code = cause_parsed.get("exitCode")
+    if exit_code is None:
+        exit_code = _exit_code_from_task(cause_parsed)
 
     task_arn = _extract_task_arn(cause_parsed)
-    if (stop_code is None or stopped_reason is None) and task_arn and cluster_arn:
+    if (
+        (stop_code is None or stopped_reason is None or exit_code is None)
+        and task_arn
+        and cluster_arn
+    ):
         task = _describe_task(cluster_arn, task_arn)
         stop_code = stop_code or task.get("stopCode")
         stopped_reason = stopped_reason or task.get("stoppedReason")
@@ -119,7 +125,15 @@ def classify(
     if exit_code is not None:
         exit_code = int(exit_code)
         if exit_code == 137:
-            return _result("RESOURCE", stop_code, stopped_reason, exit_code, attempt)
+            return _result(
+                "RESOURCE"
+                if "OutOfMemoryError" in ((stopped_reason or "") + (cause or ""))
+                else "UNCLASSIFIED",
+                stop_code,
+                stopped_reason,
+                exit_code,
+                attempt,
+            )
         mapped = ERROR_CLASS_BY_EXIT_CODE.get(exit_code)
         if mapped is not None:
             # A known, deterministic worker exit code: never retried.
@@ -142,7 +156,9 @@ def classify(
         )
     if stop_code == "TaskFailedToStart":
         return _result("TRANSIENT_INFRA", stop_code, stopped_reason, exit_code, attempt)
-    if error_name == "AmazonECS.Unknown" or (error_name or "").startswith("ECS."):
+    if error_name in ("ECS.AccessDeniedException", "ECS.ClientException"):
+        return _result("CONFIG", stop_code, stopped_reason, exit_code, attempt)
+    if error_name == "AmazonECS.Unknown":
         return _result("TRANSIENT_INFRA", stop_code, stopped_reason, exit_code, attempt)
 
     return _result("UNCLASSIFIED", stop_code, stopped_reason, exit_code, attempt)

@@ -54,6 +54,9 @@ class ExitCode(IntEnum):
     INPUT = 2
     ARTIFACT_INTEGRITY = 3
     INTERNAL = 4
+    CONFIG = 5
+    TRANSIENT_INFRA = 6
+    UNCLASSIFIED = 7
 
 
 #: The complete documented exit_code -> error_class mapping. Values 0/2/3/4
@@ -78,6 +81,9 @@ ERROR_CLASS_BY_EXIT_CODE: dict[int, str | None] = {
     ExitCode.INPUT: "INPUT",
     ExitCode.ARTIFACT_INTEGRITY: "ARTIFACT_INTEGRITY",
     ExitCode.INTERNAL: "INTERNAL",
+    ExitCode.CONFIG: "CONFIG",
+    ExitCode.TRANSIENT_INFRA: "TRANSIENT_INFRA",
+    ExitCode.UNCLASSIFIED: "UNCLASSIFIED",
     # Infrastructure-classified; never emitted by this process (see above),
     # and never assigned from the exit code alone even once an orchestrator
     # exists -- see the paragraph above.

@@ -68,7 +68,12 @@ def test_get_results_returns_manifest_and_presigned_url(moto_env):
     s3.put_object(
         Bucket=moto_env["runs_bucket"],
         Key="runs/j4/manifest.json",
-        Body=json.dumps({"artifact_id": "sha256:aaa"}),
+        Body=json.dumps(
+            {
+                "artifact_id": "sha256:aaa",
+                "outputs": {"returns": "returns.npy", "risk_report": "risk_report.json"},
+            }
+        ),
     )
     s3.put_object(
         Bucket=moto_env["runs_bucket"],
@@ -107,3 +112,20 @@ def test_missing_job_id_path_param_returns_400(moto_env):
     }
     resp = jobs.handler(event)
     assert resp["statusCode"] == 400
+
+
+def test_cancel_stop_failure_can_be_retried(moto_env, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from scenario_platform.adapters import job_store
+
+    _make_job(moto_env, "retry-cancel", "RUNNING")
+    job_store.set_execution_arn("retry-cancel", "arn:execution")
+    client = MagicMock()
+    client.exceptions.ExecutionDoesNotExist = type("MissingExecution", (Exception,), {})
+    client.stop_execution.side_effect = [RuntimeError("network"), {}]
+    monkeypatch.setattr(jobs, "_sfn", lambda: client)
+    assert jobs.handler(_event(job_id="retry-cancel", method="DELETE"))["statusCode"] == 500
+    assert job_store.get_job("retry-cancel")["status"] == "CANCELLED"
+    assert jobs.handler(_event(job_id="retry-cancel", method="DELETE"))["statusCode"] == 200
+    assert client.stop_execution.call_count == 2

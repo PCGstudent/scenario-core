@@ -62,3 +62,10 @@ variable "log_retention_days" {
   type    = number
   default = 30
 }
+
+
+variable "demo_deadline_utc" {
+  type        = string
+  default     = null
+  description = "UTC RFC3339 cutoff, enforced by IAM before each new execution/placement."
+}

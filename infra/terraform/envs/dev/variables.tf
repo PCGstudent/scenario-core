@@ -88,14 +88,11 @@ variable "alert_email" {
   description = "Operational-alert recipient for modules/observability's SNS topic (Step Functions execution failures). A separate concern from modules/demo_killswitch's own failure alert, even when the same address is used for both."
 }
 
-variable "demo_killswitch_enabled" {
-  type        = bool
-  default     = false
-  description = "Off by default -- creates modules/demo_killswitch (the demo-window auto-cleanup) in the SAME apply as module.network's costly endpoints, so both are created atomically rather than in a second, separate apply that would leave the endpoints unwatched in between (docs/aws-demo-runbook.md section 3.1). Only ever set true for the duration of a demo window."
-}
-
 variable "demo_schedule_expression" {
   type        = string
-  default     = null
-  description = "Required (non-null) only when demo_killswitch_enabled=true: a one-time EventBridge Scheduler `at(yyyy-mm-ddThh:mm:ss)` expression (UTC), e.g. computed via `timeadd(timestamp(), \"4h\")` at apply time. See modules/demo_killswitch's own identical variable for why this has no default of its own."
+  description = "Explicit future UTC at(YYYY-MM-DDThh:mm:ss) cleanup deadline."
+  validation {
+    condition     = can(regex("^at\\([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\)$", var.demo_schedule_expression))
+    error_message = "Supply a one-time UTC at(YYYY-MM-DDThh:mm:ss) expression."
+  }
 }

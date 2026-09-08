@@ -180,6 +180,8 @@ resource "aws_ecs_task_definition" "simulate" {
       image                  = "${var.ecr_repository_url}@${var.worker_image_digest}"
       readonlyRootFilesystem = false # the worker stages under a temp dir it creates itself
       environment = [
+        { name = "DATA_KMS_KEY_ARN", value = var.kms_key_arn },
+        { name = "WORKER_IMAGE_REF", value = "${var.ecr_repository_url}@${var.worker_image_digest}" },
         { name = "SCENARIO_JOBS_TABLE", value = var.scenario_jobs_table_name },
         { name = "ARTIFACTS_BUCKET", value = var.artifacts_bucket_name },
         { name = "RUNS_BUCKET", value = var.runs_bucket_name },
@@ -196,3 +198,4 @@ resource "aws_ecs_task_definition" "simulate" {
     }
   ])
 }
+

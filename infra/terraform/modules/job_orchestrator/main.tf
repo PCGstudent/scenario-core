@@ -89,6 +89,21 @@ resource "aws_iam_role" "sfn_orchestrator" {
 }
 
 data "aws_iam_policy_document" "sfn_orchestrator" {
+  dynamic "statement" {
+    for_each = var.demo_deadline_utc == null ? [] : [var.demo_deadline_utc]
+    content {
+      sid       = "DenyNewWorkAfterDemoDeadline"
+      effect    = "Deny"
+      actions   = ["ecs:RunTask"]
+      resources = [var.task_definition_family_arn]
+      condition {
+        test     = "DateGreaterThanEquals"
+        variable = "aws:CurrentTime"
+        values   = [statement.value]
+      }
+    }
+  }
+
   statement {
     sid       = "RunSimulationTask"
     effect    = "Allow"
@@ -219,3 +234,4 @@ resource "aws_sfn_state_machine" "scenario_job" {
     level                  = "ERROR"
   }
 }
+

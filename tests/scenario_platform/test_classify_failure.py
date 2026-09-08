@@ -29,7 +29,7 @@ def test_artifact_integrity_exit_code_maps_correctly():
 
 
 def test_oom_exit_code_137_maps_to_resource():
-    cause = json.dumps({"exitCode": 137})
+    cause = json.dumps({"exitCode": 137, "stoppedReason": "OutOfMemoryError"})
     result = classify(
         error_name="States.TaskFailed", cause=cause, cluster_arn=None, attempt=1
     )
@@ -81,3 +81,41 @@ def test_unrecognised_failure_is_unclassified_and_never_retried():
 def test_attempt_is_echoed_back():
     result = classify(error_name="States.Timeout", cause=None, cluster_arn=None, attempt=2)
     assert result["attempt"] == 2
+
+
+def test_signal_kill_without_oom_evidence_is_unclassified():
+    result = classify(
+        error_name="States.TaskFailed",
+        cause=json.dumps({"exitCode": 137}),
+        cluster_arn=None,
+        attempt=1,
+    )
+    assert result["error_class"] == "UNCLASSIFIED"
+
+
+def test_nested_worker_network_exit_preserves_retry_class():
+    result = classify(
+        error_name="States.TaskFailed",
+        cause=json.dumps(
+            {
+                "StopCode": "EssentialContainerExited",
+                "StoppedReason": "exit",
+                "Containers": [{"ExitCode": 6}],
+            }
+        ),
+        cluster_arn=None,
+        attempt=1,
+    )
+    assert result["error_class"] == "TRANSIENT_INFRA"
+    result = classify(
+        error_name="States.TaskFailed",
+        cause=json.dumps({"exitCode": 5}),
+        cluster_arn=None,
+        attempt=1,
+    )
+    assert result["error_class"] == "CONFIG"
+
+
+def test_unknown_ecs_error_does_not_retry():
+    result = classify(error_name="ECS.Unrecognised", cause="", cluster_arn=None, attempt=1)
+    assert result["error_class"] == "UNCLASSIFIED"

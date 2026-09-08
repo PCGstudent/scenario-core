@@ -1,20 +1,4 @@
-# The demo window's independent auto-cleanup: a one-time EventBridge
-# Scheduler firing a narrowly-scoped Lambda (lambda/cleanup.py) that stops
-# any still-running demo Fargate tasks and deletes the demo's interface
-# endpoints -- the dominant cost line (~$43.80/month if left standing;
-# docs/aws-demo-runbook.md). Deliberately independent of GitHub Actions
-# (not relied on here -- its runs are currently failing at startup) and of
-# any local machine: once this apply finishes, the schedule lives entirely
-# inside AWS and fires regardless of what happens to the laptop that
-# created it.
-#
-# This module is meant to be applied IN THE SAME `terraform apply` as the
-# demo network it watches, so it exists for exactly as long as the costly
-# resources do -- never applied standing alone, never left behind after the
-# demo's own `terraform destroy` (module.network's destroy removes the
-# thing this module watches; this module's own resources are destroyed in
-# the same operation as everything else scoped to the demo window).
-
+# Installed before network creation; discovery uses exact project endpoint Name tags.
 data "aws_caller_identity" "current" {}
 
 data "archive_file" "cleanup" {
@@ -45,13 +29,9 @@ data "aws_iam_policy_document" "lambda_trust" {
 }
 
 resource "aws_iam_role" "cleanup" {
-  name               = "4xtra-${var.environment}-demo-cleanup"
-  assume_role_policy = data.aws_iam_policy_document.lambda_trust.json
-  # No permissions_boundary parameter here deliberately: this role is
-  # created directly by a human running this module (the demo-deploy step),
-  # the same direct-credential path bootstrap/envs-dev's first apply uses --
-  # not by gha-ci-dev, whose own CreateRole grant is what requires the
-  # boundary condition elsewhere in this codebase.
+  name                 = "4xtra-${var.environment}-demo-cleanup"
+  assume_role_policy   = data.aws_iam_policy_document.lambda_trust.json
+  permissions_boundary = var.permissions_boundary_arn
 }
 
 data "aws_iam_policy_document" "cleanup" {
@@ -66,7 +46,12 @@ data "aws_iam_policy_document" "cleanup" {
     sid       = "DeleteOnlyTheseEndpoints"
     effect    = "Allow"
     actions   = ["ec2:DeleteVpcEndpoints"]
-    resources = [for id in var.vpc_endpoint_ids : "arn:aws:ec2:${var.region}:${data.aws_caller_identity.current.account_id}:vpc-endpoint/${id}"]
+    resources = ["arn:aws:ec2:${var.region}:${data.aws_caller_identity.current.account_id}:vpc-endpoint/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:ResourceTag/Name"
+      values   = var.vpc_endpoint_names
+    }
   }
 
   statement {
@@ -84,36 +69,6 @@ data "aws_iam_policy_document" "cleanup" {
       variable = "ecs:cluster"
       values   = var.ecs_cluster_arns
     }
-  }
-
-  statement {
-    # DescribeTaskDefinition has no resource-level support in the AWS
-    # Service Authorization Reference for ECS (list_ecs.html) -- same
-    # justification as modules/ci_oidc's own "EcsTaskDefinitionReadOnlyAndDeregister"
-    # entry, allowlisted below for this role too.
-    sid       = "DescribeWatchedTaskDefinitions"
-    effect    = "Allow"
-    actions   = ["ecs:DescribeTaskDefinition"]
-    resources = ["*"]
-  }
-
-  statement {
-    # ecs:DeregisterTaskDefinition is NOT resource-scopable, verified
-    # against the AWS Service Authorization Reference for ECS
-    # (list_ecs.html) -- the same finding modules/ci_oidc's own
-    # "EcsTaskDefinitionReadOnlyAndDeregister" entry already establishes
-    # for this exact action (bundled there with DescribeTaskDefinition/
-    # ListTaskDefinitions for the same reason). IAM cannot narrow WHICH
-    # task definition this role is allowed to deregister; the actual
-    # narrowing is in the Lambda's own code (lambda/cleanup.py only ever
-    # calls this with the specific ARNs from var.task_definition_arns,
-    # never a wildcard or a caller-supplied value) -- a real, disclosed
-    # gap between "what IAM can express" and "what the code actually
-    # does", not a silently broader grant than intended.
-    sid       = "DeregisterTaskDefinitions"
-    effect    = "Allow"
-    actions   = ["ecs:DeregisterTaskDefinition"]
-    resources = ["*"]
   }
 
   statement {
@@ -146,6 +101,7 @@ resource "aws_iam_role_policy" "cleanup" {
 }
 
 resource "aws_lambda_function" "cleanup" {
+  depends_on    = [aws_iam_role_policy.cleanup, aws_cloudwatch_log_group.cleanup]
   function_name = "4xtra-${var.environment}-demo-cleanup"
   role          = aws_iam_role.cleanup.arn
   handler       = "cleanup.handler"
@@ -154,7 +110,7 @@ resource "aws_lambda_function" "cleanup" {
   # deregistration/API overhead -- 120s (an earlier version's value) was
   # too tight to let both waits run to their own documented timeouts
   # without the Lambda itself being killed first.
-  timeout          = 300
+  timeout          = 900
   memory_size      = 256
   filename         = data.archive_file.cleanup.output_path
   source_code_hash = data.archive_file.cleanup.output_base64sha256
@@ -163,7 +119,7 @@ resource "aws_lambda_function" "cleanup" {
     variables = {
       VPC_ENDPOINT_IDS      = join(",", var.vpc_endpoint_ids)
       ECS_CLUSTER_ARNS      = join(",", var.ecs_cluster_arns)
-      TASK_DEFINITION_ARNS  = join(",", var.task_definition_arns)
+      VPC_ENDPOINT_NAMES    = join(",", var.vpc_endpoint_names)
       FAILURE_SNS_TOPIC_ARN = aws_sns_topic.cleanup_failure.arn
     }
   }
@@ -197,7 +153,8 @@ resource "aws_cloudwatch_metric_alarm" "cleanup_lambda_errors" {
 # --- One-time schedule -------------------------------------------------
 
 resource "aws_iam_role" "scheduler_invoke" {
-  name = "4xtra-${var.environment}-demo-cleanup-scheduler"
+  name                 = "4xtra-${var.environment}-demo-cleanup-scheduler"
+  permissions_boundary = var.permissions_boundary_arn
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -222,7 +179,8 @@ resource "aws_iam_role_policy" "scheduler_invoke" {
 }
 
 resource "aws_scheduler_schedule" "deadline" {
-  name = "4xtra-${var.environment}-demo-cleanup-deadline"
+  depends_on = [aws_iam_role_policy.scheduler_invoke, aws_cloudwatch_metric_alarm.cleanup_lambda_errors]
+  name       = "4xtra-${var.environment}-demo-cleanup-deadline"
 
   # ONE-TIME, never recurring -- flexible_time_window OFF means it fires
   # at exactly the given instant, once, and the schedule then completes

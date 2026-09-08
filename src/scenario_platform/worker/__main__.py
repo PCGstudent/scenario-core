@@ -574,6 +574,10 @@ def _resolve_simulate_inputs(
         job = job_store.get_job(args.job_id)
         if job is None:
             raise WorkerInputError(f"no job found for job_id={args.job_id!r}")
+        if job.get("status") != "RUNNING":
+            raise WorkerInputError(
+                f"job {args.job_id!r} is {job.get('status')!r}, not RUNNING"
+            )
         request_data = job_store.to_native(job["request"])
         expected_artifact_id, scenario_request, risk_config = _parse_request_data(
             request_data
@@ -599,7 +603,11 @@ def _resolve_simulate_inputs(
             raise ArtifactIntegrityError(
                 f"artifact {expected_artifact_id!r} not found in S3: {exc}"
             ) from exc
-        except (s3_store.ArtifactAccessConfigError, s3_store.ArtifactTransientError):
+        except (
+            s3_store.ArtifactAccessConfigError,
+            s3_store.ArtifactTransientError,
+            s3_store.ArtifactUnknownError,
+        ):
             # Deliberately NOT mapped to ArtifactIntegrityError: a
             # permissions/endpoint-policy misconfiguration or an exhausted
             # transient retry says nothing about whether the artifact
@@ -783,12 +791,9 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         )
 
         if job_id_for_upload is not None:
-            # Section 6.1 step 4f's AWS-shaped destination: runs/{job_id}/,
-            # uploaded only after the same manifest-last local publish this
-            # process already enforces -- a partial local publish never
-            # reaches S3 at all, and any partial S3 upload here would still
-            # be missing manifest.json, so it is invisible to any consumer
-            # gating on the same completion contract this worker documents.
+            # Section 6.1 step 4f's AWS-shaped destination. Each invocation
+            # stages into its own immutable attempt prefix; a conditional
+            # stable manifest commits exactly one complete attempt.
             try:
                 s3_store.upload_run_outputs(job_id_for_upload, output_dir)
             except s3_store.ConcurrentPublishSuperseded as exc:
@@ -848,6 +853,25 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
             },
         )
         return int(ExitCode.ARTIFACT_INTEGRITY)
+    except (
+        s3_store.ArtifactAccessConfigError,
+        s3_store.ArtifactTransientError,
+        s3_store.ArtifactUnknownError,
+    ) as exc:
+        code = (
+            ExitCode.CONFIG
+            if isinstance(exc, s3_store.ArtifactAccessConfigError)
+            else ExitCode.TRANSIENT_INFRA
+            if isinstance(exc, s3_store.ArtifactTransientError)
+            else ExitCode.UNCLASSIFIED
+        )
+        error_class = code.name
+        LOGGER.error(
+            "artifact download failed",
+            exc_info=True,
+            extra={"error_class": error_class, "error": str(exc)},
+        )
+        return int(code)
     except Exception as exc:  # noqa: BLE001 -- the deliberate, documented INTERNAL catch-all
         error_class = "INTERNAL"
         LOGGER.error(

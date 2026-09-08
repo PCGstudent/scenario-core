@@ -8,7 +8,8 @@ variable "region" {
 
 variable "vpc_endpoint_ids" {
   type        = list(string)
-  description = "The specific interface-endpoint ids to delete when the deadline fires (module.network's ecr_api/ecr_dkr/logs endpoint ids) -- never discovered by a broad tag scan, so this module's IAM grant can name exact resource ARNs instead of a wildcard."
+  default     = []
+  description = "Optional known endpoint IDs; deletion remains restricted by the Name-tag IAM condition."
 }
 
 variable "ecs_cluster_arns" {
@@ -16,9 +17,9 @@ variable "ecs_cluster_arns" {
   description = "Cluster(s) to check for still-running tasks before deleting endpoints (module.worker_compute's cluster, and infra/terraform/envs/dev/probe.tf's, if both are in play during the demo window)."
 }
 
-variable "task_definition_arns" {
+variable "vpc_endpoint_names" {
   type        = list(string)
-  description = "Task-definition ARN(s) to deregister BEFORE stopping tasks/deleting endpoints (module.worker_compute's simulate task definition) -- this is what actually blocks NEW submissions from placing compute during cleanup: Step Functions' RunSimulation state references one fixed task-definition ARN, and ecs:RunTask against a deregistered revision fails immediately at the ECS API level. Deregistering does not affect tasks already running (lambda/cleanup.py's own docstring)."
+  description = "Exact Name tags of project interface endpoints, known before creation; enforced by deletion IAM."
 }
 
 variable "failure_alert_email" {
@@ -29,4 +30,9 @@ variable "failure_alert_email" {
 variable "schedule_expression" {
   type        = string
   description = "A one-time EventBridge Scheduler `at(yyyy-mm-ddThh:mm:ss)` expression (UTC) -- computed by whoever stands the demo up (e.g. `timeadd(timestamp(), \"4h\")` at apply time), never a recurring cron. Deliberately a required variable with no default: this module must never silently pick its own deadline."
+}
+
+variable "permissions_boundary_arn" {
+  type        = string
+  description = "Project runtime permissions boundary required on both kill-switch roles."
 }

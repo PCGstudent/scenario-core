@@ -41,6 +41,7 @@ def seed(
     artifact_dir: Path,
     model_version: str,
     artifacts_bucket: str,
+    kms_key_arn: str,
     registry_table: str,
     approved_by: str,
     region: str,
@@ -52,7 +53,12 @@ def seed(
     s3 = boto3.client("s3", region_name=region)
     prefix = f"artifacts/{artifact_id.replace('sha256:', 'sha256_').replace(':', '_')}/"
     for name in ("artifact.json", "state.npz"):
-        s3.upload_file(str(artifact_dir / name), artifacts_bucket, f"{prefix}{name}")
+        s3.upload_file(
+            str(artifact_dir / name),
+            artifacts_bucket,
+            f"{prefix}{name}",
+            ExtraArgs={"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": kms_key_arn},
+        )
     print(f"Uploaded artifact to s3://{artifacts_bucket}/{prefix}")
 
     now = datetime.now(UTC).isoformat()
@@ -102,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--model-version", required=True)
     parser.add_argument("--artifacts-bucket", required=True)
+    parser.add_argument("--kms-key-arn", required=True)
     parser.add_argument("--registry-table", required=True)
     parser.add_argument(
         "--approved-by", required=True, help="Your identity, for the audit trail."
@@ -112,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         artifact_dir=args.artifact_dir,
         model_version=args.model_version,
         artifacts_bucket=args.artifacts_bucket,
+        kms_key_arn=args.kms_key_arn,
         registry_table=args.registry_table,
         approved_by=args.approved_by,
         region=args.region,

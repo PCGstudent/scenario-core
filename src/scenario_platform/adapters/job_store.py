@@ -305,7 +305,7 @@ def set_execution_arn(job_id: str, execution_arn: str) -> str:
     _conditional_update(
         job_id,
         update_expression="SET execution_arn = :arn",
-        condition_expression="attribute_not_exists(execution_arn)",
+        condition_expression="attribute_exists(pk) AND attribute_not_exists(execution_arn)",
         values={":arn": execution_arn},
     )
     _conditional_update(
@@ -331,7 +331,9 @@ def mark_cancelled(job_id: str) -> str:
     _conditional_update(
         job_id,
         update_expression="SET #status = :cancelled",
-        condition_expression="NOT (#status IN (:succeeded, :failed, :cancelled))",
+        condition_expression=(
+            "attribute_exists(pk) AND NOT (#status IN (:succeeded, :failed, :cancelled))"
+        ),
         values={":cancelled": "CANCELLED", ":succeeded": "SUCCEEDED", ":failed": "FAILED"},
         names={"#status": "status"},
     )

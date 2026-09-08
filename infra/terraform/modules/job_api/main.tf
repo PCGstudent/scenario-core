@@ -30,6 +30,21 @@ resource "aws_iam_role" "api_submit" {
 }
 
 data "aws_iam_policy_document" "api_submit" {
+  dynamic "statement" {
+    for_each = var.demo_deadline_utc == null ? [] : [var.demo_deadline_utc]
+    content {
+      sid       = "DenyNewWorkAfterDemoDeadline"
+      effect    = "Deny"
+      actions   = ["states:StartExecution"]
+      resources = [var.state_machine_arn]
+      condition {
+        test     = "DateGreaterThanEquals"
+        variable = "aws:CurrentTime"
+        values   = [statement.value]
+      }
+    }
+  }
+
   statement {
     sid       = "JobsTableReadWrite"
     effect    = "Allow"
@@ -47,7 +62,7 @@ data "aws_iam_policy_document" "api_submit" {
   statement {
     sid       = "StartAndDescribeExecution"
     effect    = "Allow"
-    actions   = ["states:StartExecution", "states:DescribeExecution"]
+    actions   = ["states:StartExecution", "states:DescribeExecution", "states:StopExecution"]
     resources = [var.state_machine_arn, "${replace(var.state_machine_arn, ":stateMachine:", ":execution:")}*"]
   }
 
@@ -89,6 +104,7 @@ resource "aws_lambda_function" "api_submit" {
       STATE_MACHINE_ARN    = var.state_machine_arn
       MAX_PATH_YEARS       = tostring(var.max_path_years)
       MAX_HORIZON          = tostring(var.max_horizon)
+      DEMO_DEADLINE_UTC    = var.demo_deadline_utc == null ? "" : var.demo_deadline_utc
     }
   }
 }
@@ -244,3 +260,4 @@ resource "aws_lambda_permission" "status_invoke" {
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_api.this.execution_arn}/*/*"
 }
+

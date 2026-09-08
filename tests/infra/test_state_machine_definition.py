@@ -138,7 +138,11 @@ def test_record_queued_succeeded_failed_all_guard_against_cancelled():
     for state_name in ("RecordQueued", "RecordSucceeded", "RecordFailed"):
         state = definition["States"][state_name]
         condition = state["Parameters"]["ConditionExpression"]
-        assert "cancelled" in condition.lower(), f"{state_name} has no CANCELLED guard"
+        assert condition == (
+            "#status IN (:submitted, :queued)"
+            if state_name == "RecordQueued"
+            else "#status = :running"
+        )
         catches = state.get("Catch", [])
         assert any(
             "DynamoDB.ConditionalCheckFailedException" in c["ErrorEquals"] for c in catches
@@ -149,3 +153,13 @@ def test_already_cancelled_is_a_terminal_no_op():
     definition = _load_definition()
     assert definition["States"]["AlreadyCancelled"]["Type"] == "Pass"
     assert definition["States"]["AlreadyCancelled"]["End"] is True
+
+
+def test_attempt_recording_cannot_continue_after_cancellation():
+    state = _load_definition()["States"]["RecordAttempt"]
+    assert state["Parameters"]["ConditionExpression"] == "#status = :running"
+    assert any(
+        catch["Next"] == "AlreadyCancelled"
+        and "DynamoDB.ConditionalCheckFailedException" in catch["ErrorEquals"]
+        for catch in state["Catch"]
+    )

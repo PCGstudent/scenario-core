@@ -4,12 +4,10 @@ package (it is a standalone Lambda source file, deployed via
 ``data.archive_file`` directly, never installed), so this test imports it
 by path.
 
-Covers, against moto-mocked EC2/ECS/SNS: pagination-independent task
+Cover, against moto-mocked EC2/ECS/SNS: paginated task
 discovery, waiter-confirmed stops, per-id endpoint verification (never one
 batched call whose failure on one id masks the rest), "deleting" not being
-mistaken for "deleted", task-definition deregistration blocking (verified
-via a real ``describe_task_definition`` status check), and the SNS
-failure-alert path.
+mistaken for "deleted", repeated cleanup, and the SNS failure-alert path.
 """
 
 from __future__ import annotations
@@ -34,12 +32,13 @@ CLEANUP_PATH = (
 
 
 @pytest.fixture
-def cleanup_module():
+def cleanup_module(monkeypatch):
     spec = importlib.util.spec_from_file_location("demo_cleanup", CLEANUP_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules["demo_cleanup"] = module
     spec.loader.exec_module(module)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
     yield module
     del sys.modules["demo_cleanup"]
 
@@ -128,33 +127,6 @@ class TestDeleteAndVerifyEndpoints:
             assert errors == []
 
 
-class TestDeregisterTaskDefinitions:
-    def test_deregisters_and_confirms_inactive(self, aws_env, cleanup_module):
-        with mock_aws():
-            ecs = boto3.client("ecs", region_name=REGION)
-            _, task_def_arn, _ = _make_cluster_and_task(ecs)
-            errors: list[str] = []
-            deregistered = cleanup_module._deregister_task_definitions(
-                ecs, [task_def_arn], errors
-            )
-            assert deregistered == [task_def_arn]
-            assert errors == []
-            status = ecs.describe_task_definition(taskDefinition=task_def_arn)[
-                "taskDefinition"
-            ]["status"]
-            assert status == "INACTIVE"
-
-    def test_already_deregistered_is_idempotent(self, aws_env, cleanup_module):
-        with mock_aws():
-            ecs = boto3.client("ecs", region_name=REGION)
-            _, task_def_arn, _ = _make_cluster_and_task(ecs)
-            errors: list[str] = []
-            cleanup_module._deregister_task_definitions(ecs, [task_def_arn], errors)
-            # Second call against an already-INACTIVE definition must not error.
-            cleanup_module._deregister_task_definitions(ecs, [task_def_arn], errors)
-            assert errors == []
-
-
 class TestStopAndConfirmTasks:
     def test_stops_and_confirms_a_running_task(self, aws_env, cleanup_module):
         with mock_aws():
@@ -213,12 +185,11 @@ class TestHandlerEndToEnd:
             ecs = boto3.client("ecs", region_name=REGION)
             sns = boto3.client("sns", region_name=REGION)
             _, endpoint_id = _make_endpoint(ec2)
-            cluster_arn, task_def_arn, task_arn = _make_cluster_and_task(ecs)
+            cluster_arn, _, task_arn = _make_cluster_and_task(ecs)
             topic_arn = sns.create_topic(Name="cleanup-failure")["TopicArn"]
 
             monkeypatch.setenv("VPC_ENDPOINT_IDS", endpoint_id)
             monkeypatch.setenv("ECS_CLUSTER_ARNS", cluster_arn)
-            monkeypatch.setenv("TASK_DEFINITION_ARNS", task_def_arn)
             monkeypatch.setenv("FAILURE_SNS_TOPIC_ARN", topic_arn)
 
             result = cleanup_module.handler({}, None)
@@ -226,12 +197,7 @@ class TestHandlerEndToEnd:
             assert result["errors"] == []
             assert result["endpoints_deleted_and_confirmed"] == [endpoint_id]
             assert result["tasks_stopped_and_confirmed"] == [task_arn]
-            assert result["task_definitions_deregistered"] == [task_def_arn]
             assert cleanup_module._endpoint_state(ec2, endpoint_id) == "deleted"
-            status = ecs.describe_task_definition(taskDefinition=task_def_arn)[
-                "taskDefinition"
-            ]["status"]
-            assert status == "INACTIVE"
 
     def test_partial_failure_publishes_to_sns_and_raises(
         self, aws_env, cleanup_module, monkeypatch
@@ -242,7 +208,6 @@ class TestHandlerEndToEnd:
 
             monkeypatch.setenv("VPC_ENDPOINT_IDS", "")
             monkeypatch.setenv("ECS_CLUSTER_ARNS", "")
-            monkeypatch.setenv("TASK_DEFINITION_ARNS", "")
             monkeypatch.setenv("FAILURE_SNS_TOPIC_ARN", topic_arn)
 
             def _boom(ec2_client, endpoint_ids, errors):
@@ -253,3 +218,82 @@ class TestHandlerEndToEnd:
 
             with pytest.raises(RuntimeError, match="demo auto-cleanup failed"):
                 cleanup_module.handler({}, None)
+
+
+def test_stop_confirmation_is_batched(cleanup_module):
+    from unittest.mock import MagicMock
+
+    ecs = MagicMock()
+    ids = [f"task-{i}" for i in range(205)]
+    ecs.get_paginator.return_value.paginate.return_value = [
+        {"taskArns": ids[:110]},
+        {"taskArns": ids[110:]},
+    ]
+    errors = []
+    assert cleanup_module._stop_and_confirm_tasks(ecs, ["cluster"], errors) == ids
+    assert not errors
+    assert [
+        len(call.kwargs["tasks"])
+        for call in ecs.get_waiter.return_value.wait.call_args_list
+    ] == [100, 100, 5]
+
+
+def test_deleting_is_not_success(cleanup_module, monkeypatch):
+    from unittest.mock import MagicMock
+
+    ec2 = MagicMock()
+    ec2.describe_vpc_endpoints.return_value = {"VpcEndpoints": [{"State": "deleting"}]}
+    ec2.delete_vpc_endpoints.return_value = {}
+    ticks = iter([0, 0, 100])
+    monkeypatch.setattr(cleanup_module.time, "monotonic", lambda: next(ticks))
+    errors = []
+    assert cleanup_module._delete_and_verify_endpoints(ec2, ["vpce-x"], errors) == []
+    assert errors
+
+
+def test_delete_unsuccessful_is_reported(cleanup_module, monkeypatch):
+    from unittest.mock import MagicMock
+
+    ec2 = MagicMock()
+    ec2.describe_vpc_endpoints.side_effect = [
+        {"VpcEndpoints": [{"State": "available"}]},
+        {"VpcEndpoints": [{"State": "deleted"}]},
+    ]
+    ec2.delete_vpc_endpoints.return_value = {
+        "Unsuccessful": [
+            {"ResourceId": "vpce-x", "Error": {"Code": "AccessDenied", "Message": "denied"}}
+        ]
+    }
+    errors = []
+    cleanup_module._delete_and_verify_endpoints(ec2, ["vpce-x"], errors)
+    assert any("AccessDenied" in e for e in errors)
+
+
+def test_client_exception_is_not_assumed_absent(cleanup_module):
+    from botocore.exceptions import ClientError
+
+    assert not cleanup_module._is_not_found(
+        ClientError(
+            {"Error": {"Code": "ClientException", "Message": "bad request"}}, "StopTask"
+        )
+    )
+
+
+def test_unexpected_failure_alerts_and_preserves_endpoints(cleanup_module, monkeypatch):
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    monkeypatch.setattr(cleanup_module.boto3, "client", lambda service: client)
+    monkeypatch.setenv("FAILURE_SNS_TOPIC_ARN", "test-topic")
+    monkeypatch.setenv("ECS_CLUSTER_ARNS", "cluster")
+    monkeypatch.setenv("VPC_ENDPOINT_IDS", "vpce-x")
+
+    def fail(*args):
+        raise RuntimeError("unexpected stop failure")
+
+    monkeypatch.setattr(cleanup_module, "_stop_and_confirm_tasks", fail)
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        cleanup_module.handler({})
+    client.sns.publish.assert_not_called()
+    client.publish.assert_called_once()
+    client.delete_vpc_endpoints.assert_not_called()

@@ -44,8 +44,8 @@ def artifact_prefix(artifact_id: str) -> str:
 
 
 class ArtifactNotFound(Exception):
-    """The artifact object genuinely does not exist (or the bucket does
-    not) -- Section 8.3's "artifact missing ... on the loader", mapped by
+    """The artifact object genuinely does not exist -- Section 8.3's
+    "artifact missing ... on the loader", mapped by
     the caller to ``ARTIFACT_INTEGRITY``. Never retried internally: a
     missing object does not become present by asking again."""
 
@@ -59,6 +59,10 @@ class ArtifactAccessConfigError(Exception):
     is true here). Never retried internally: a permissions problem does
     not resolve itself between one call and the next a few seconds later.
     """
+
+
+class ArtifactUnknownError(Exception):
+    """Unclassified download failure: preserve the cause and fail closed."""
 
 
 class ArtifactTransientError(Exception):
@@ -86,13 +90,22 @@ def _classify_download_error(exc: Exception) -> Exception:
     """Maps a raw boto3/botocore exception to one of the three classes
     above, preserving the original as ``__cause__`` either way (the caller
     always re-raises via ``raise ... from exc``, never swallowing it)."""
-    from botocore.exceptions import ClientError, EndpointConnectionError
+    from botocore.exceptions import (
+        ClientError,
+        ConnectionClosedError,
+        ConnectTimeoutError,
+        EndpointConnectionError,
+        NoCredentialsError,
+        PartialCredentialsError,
+        ReadTimeoutError,
+    )
 
     if isinstance(exc, ClientError):
         code = exc.response.get("Error", {}).get("Code", "")
-        if code in ("NoSuchKey", "NoSuchBucket", "404"):
+        if code in ("NoSuchKey", "404"):
             return ArtifactNotFound(str(exc))
         if code in (
+            "NoSuchBucket",
             "AccessDenied",
             "AccessDeniedException",
             "403",
@@ -100,17 +113,25 @@ def _classify_download_error(exc: Exception) -> Exception:
             "SignatureDoesNotMatch",
         ):
             return ArtifactAccessConfigError(str(exc))
-        if code in _TRANSIENT_CLIENT_ERROR_CODES:
+        if (
+            code in _TRANSIENT_CLIENT_ERROR_CODES
+            or exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) >= 500
+        ):
             return ArtifactTransientError(str(exc))
-        # An unrecognised ClientError code is treated as a config problem
-        # rather than guessed as transient -- Section 6.3's own warning
-        # against speculative classification applies here too: retrying an
-        # error this function cannot actually place is more likely to burn
-        # time on a permanent failure than to recover a real transient one.
-        return ArtifactAccessConfigError(str(exc))
-    if isinstance(exc, EndpointConnectionError):
+        return ArtifactUnknownError(str(exc))
+    if isinstance(
+        exc,
+        (
+            EndpointConnectionError,
+            ConnectTimeoutError,
+            ReadTimeoutError,
+            ConnectionClosedError,
+        ),
+    ):
         return ArtifactTransientError(str(exc))
-    return ArtifactAccessConfigError(str(exc))
+    if isinstance(exc, (NoCredentialsError, PartialCredentialsError)):
+        return ArtifactAccessConfigError(str(exc))
+    return ArtifactUnknownError(str(exc))
 
 
 def download_artifact(artifact_id: str, dest_dir: Path) -> None:
@@ -160,6 +181,14 @@ def download_artifact(artifact_id: str, dest_dir: Path) -> None:
     ) from last_exc
 
 
+def _encryption_args() -> dict[str, str]:
+    """Explicit headers required by the existing bucket policies."""
+    return {
+        "ServerSideEncryption": "aws:kms",
+        "SSEKMSKeyId": os.environ["DATA_KMS_KEY_ARN"],
+    }
+
+
 def upload_artifact(artifact_id: str, source_dir: Path) -> None:
     """The registry-seeding counterpart to :func:`download_artifact` --
     used by ``scripts/seed_registry.py``, never by the worker or control
@@ -167,7 +196,9 @@ def upload_artifact(artifact_id: str, source_dir: Path) -> None:
     bucket = os.environ["ARTIFACTS_BUCKET"]
     prefix = artifact_prefix(artifact_id)
     for name in _ARTIFACT_FILES:
-        _client().upload_file(str(source_dir / name), bucket, f"{prefix}{name}")
+        _client().upload_file(
+            str(source_dir / name), bucket, f"{prefix}{name}", ExtraArgs=_encryption_args()
+        )
 
 
 def runs_prefix(job_id: str) -> str:
@@ -175,76 +206,73 @@ def runs_prefix(job_id: str) -> str:
 
 
 class ConcurrentPublishSuperseded(Exception):
-    """Raised when this invocation's ``manifest.json`` write lost the race
-    to an already-published, already-complete result at the same key --
-    never treated as an error by the worker (Section 6.3: a re-run over the
-    same job is deterministic, so whichever invocation's manifest actually
-    got published names byte-identical content either way)."""
+    """Another invocation already committed this job's authoritative manifest."""
 
 
 def upload_run_outputs(job_id: str, local_dir: Path) -> None:
-    """Upload every file :func:`worker.__main__._write_outputs_atomically`
-    already published in ``local_dir`` to ``runs/{job_id}/``.
+    """Stage immutable attempt objects, then conditionally commit one manifest.
 
-    **Manifest-last is necessary but not sufficient.** Uploading files in
-    manifest-last order (as the worker's own local-filesystem publish
-    already does) prevents a consumer from ever seeing a manifest without
-    its data -- but it does NOT, by itself, stop a SECOND invocation
-    (a retried Fargate task after a transient failure, Section 6.3) from
-    partially overwriting an already-complete result: both invocations can
-    reach the upload step, both can start writing `returns.npy`/
-    `risk_report.json` in some interleaved order, and "manifest exists"
-    alone says nothing about which invocation's other files a reader
-    actually sees alongside it.
-
-    **The actual protection is S3's own conditional write on
-    ``manifest.json``** (``IfNoneMatch: "*"`` -- "create only if this key
-    does not already exist"): whichever invocation's ``PutObject`` for the
-    manifest lands first wins and becomes the authoritative "this job is
-    complete" marker; every other invocation's manifest write is rejected
-    with ``PreconditionFailed`` (412), raised here as
-    :class:`ConcurrentPublishSuperseded` rather than left as a raw
-    ``ClientError`` -- a signal to the caller that ANOTHER invocation's
-    result is the one now on record, not a failure of this invocation's
-    own computation. Because a re-run over the same job is deterministic
-    (Section 6.3: "rewrites identical bytes to the same keys"), the
-    superseded invocation's own `returns.npy`/`risk_report.json` writes
-    (already issued, non-conditional, before the manifest write) are
-    content-identical to the winner's anyway -- so a reader is never
-    exposed to a "wrong" result, only to whichever byte-identical copy
-    happened to publish its manifest first.
+    Losing or interrupted attempts never write objects referenced by a winner.
+    Unreferenced attempt objects remain for the runs bucket lifecycle to expire;
+    the worker deliberately has no delete permission.
     """
-    bucket = os.environ["RUNS_BUCKET"]
-    prefix = runs_prefix(job_id)
-    data_files = [
-        name
-        for name in ("returns.npy", "risk_report.json", "variances.npy")
-        if (local_dir / name).is_file()
-    ]
-    for name in data_files:
-        _client().upload_file(str(local_dir / name), bucket, f"{prefix}{name}")
-
-    manifest_path = local_dir / "manifest.json"
-    if not manifest_path.is_file():
-        return  # nothing to publish yet -- caller never reached the manifest-write step
+    from uuid import uuid4
 
     from botocore.exceptions import ClientError
 
+    manifest_path = local_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    bucket = os.environ["RUNS_BUCKET"]
+    prefix = runs_prefix(job_id)
+    attempt = f"attempts/{uuid4().hex}/"
+    outputs = {"returns": "returns.npy", "risk_report": "risk_report.json"}
+    if (local_dir / "variances.npy").is_file():
+        outputs["variances"] = "variances.npy"
+    # Validate the complete local set before performing any remote writes.
+    for name in outputs.values():
+        if not (local_dir / name).is_file():
+            raise ValueError(f"incomplete local result: missing {name}")
+    for name in outputs.values():
+        with (local_dir / name).open("rb") as body:
+            _client().put_object(
+                Bucket=bucket,
+                Key=f"{prefix}{attempt}{name}",
+                Body=body,
+                IfNoneMatch="*",
+                **_encryption_args(),
+            )
+    manifest["outputs"] = {key: attempt + name for key, name in outputs.items()}
+    manifest["outputs"]["manifest"] = "manifest.json"
     try:
         _client().put_object(
             Bucket=bucket,
             Key=f"{prefix}manifest.json",
-            Body=manifest_path.read_bytes(),
+            Body=json.dumps(manifest, sort_keys=True).encode(),
             IfNoneMatch="*",
+            **_encryption_args(),
         )
     except ClientError as exc:
-        if exc.response.get("Error", {}).get("Code") == "PreconditionFailed":
+        if exc.response.get("Error", {}).get("Code") in ("PreconditionFailed", "412"):
             raise ConcurrentPublishSuperseded(
-                f"runs/{job_id}/manifest.json was already published by another "
-                "invocation; this invocation's own (content-identical) result was "
-                "not the one recorded"
+                f"job {job_id} already has a committed result"
             ) from exc
         raise
+
+
+def _result_key(job_id: str, output: str) -> str | None:
+    manifest = get_manifest(job_id)
+    if manifest is None:
+        return None
+    relative = manifest.get("outputs", {}).get(output)
+    if (
+        not isinstance(relative, str)
+        or relative.startswith("/")
+        or any(part in ("", ".", "..") for part in relative.split("/"))
+    ):
+        raise ValueError(f"invalid manifest output {output!r}")
+    return runs_prefix(job_id) + relative
 
 
 def get_manifest(job_id: str) -> dict[str, Any] | None:
@@ -256,7 +284,8 @@ def get_manifest(job_id: str) -> dict[str, Any] | None:
 
 
 def get_risk_report(job_id: str) -> dict[str, Any] | None:
-    return _get_json(os.environ["RUNS_BUCKET"], f"{runs_prefix(job_id)}risk_report.json")
+    key = _result_key(job_id, "risk_report")
+    return None if key is None else _get_json(os.environ["RUNS_BUCKET"], key)
 
 
 def presigned_returns_url(job_id: str, *, expires_in: int = 900) -> str:
@@ -269,7 +298,9 @@ def presigned_returns_url(job_id: str, *, expires_in: int = 900) -> str:
     ``generate_presigned_url``.
     """
     bucket = os.environ["RUNS_BUCKET"]
-    key = f"{runs_prefix(job_id)}returns.npy"
+    key = _result_key(job_id, "returns")
+    if key is None:
+        raise ValueError("job has no committed manifest")
     return str(
         _client().generate_presigned_url(
             "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=expires_in

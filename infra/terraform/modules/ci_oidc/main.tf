@@ -79,6 +79,19 @@ resource "aws_iam_role" "gha_ci_dev" {
 # grant.
 data "aws_iam_policy_document" "runtime_role_boundary" {
   statement {
+    sid       = "BoundarySyncCallback"
+    effect    = "Allow"
+    actions   = ["events:PutRule", "events:PutTargets", "events:DescribeRule"]
+    resources = ["arn:aws:events:${var.region}:${data.aws_caller_identity.current.account_id}:rule/StepFunctionsGetEventsForECSTaskRule"]
+  }
+  statement {
+    sid       = "BoundaryLogDelivery"
+    effect    = "Allow"
+    actions   = ["logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery", "logs:DeleteLogDelivery", "logs:ListLogDeliveries", "logs:PutResourcePolicy", "logs:DescribeResourcePolicies"]
+    resources = ["*"]
+  }
+
+  statement {
     sid    = "ProjectScopedDataPlane"
     effect = "Allow"
     actions = [
@@ -112,7 +125,9 @@ data "aws_iam_policy_document" "runtime_role_boundary" {
       "ecs:RunTask",
       "ecs:StopTask",
       "ecs:DescribeTasks",
+      "ecs:ListTasks",
       "lambda:InvokeFunction",
+      "sns:Publish",
     ]
     resources = [
       "arn:aws:s3:::${var.resource_name_prefix}-*",
@@ -120,13 +135,43 @@ data "aws_iam_policy_document" "runtime_role_boundary" {
       "arn:aws:dynamodb:${var.region}:${data.aws_caller_identity.current.account_id}:table/${var.resource_name_prefix}-*",
       "arn:aws:kms:${var.region}:${data.aws_caller_identity.current.account_id}:key/*",
       "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/4xtra/*",
+      "arn:aws:logs:${var.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${var.resource_name_prefix}-*",
       "arn:aws:ecr:${var.region}:${data.aws_caller_identity.current.account_id}:repository/${var.resource_name_prefix}-*",
       "arn:aws:states:${var.region}:${data.aws_caller_identity.current.account_id}:stateMachine:${var.resource_name_prefix}-*",
       "arn:aws:states:${var.region}:${data.aws_caller_identity.current.account_id}:execution:${var.resource_name_prefix}-*:*",
       "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:task-definition/${var.resource_name_prefix}-*",
       "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:task/${var.resource_name_prefix}-*/*",
+      "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:task/${var.resource_name_prefix}/*",
+      "arn:aws:ecs:${var.region}:${data.aws_caller_identity.current.account_id}:cluster/${var.resource_name_prefix}-*",
       "arn:aws:lambda:${var.region}:${data.aws_caller_identity.current.account_id}:function:${var.resource_name_prefix}-*",
+      "arn:aws:sns:${var.region}:${data.aws_caller_identity.current.account_id}:${var.resource_name_prefix}-*",
     ]
+  }
+
+  statement {
+    sid       = "BoundaryCleanupEndpointDelete"
+    effect    = "Allow"
+    actions   = ["ec2:DeleteVpcEndpoints"]
+    resources = ["arn:aws:ec2:${var.region}:${data.aws_caller_identity.current.account_id}:vpc-endpoint/*"]
+    condition {
+      test     = "StringLike"
+      variable = "ec2:ResourceTag/Name"
+      values   = ["${var.resource_name_prefix}-*"]
+    }
+  }
+
+  statement {
+    sid       = "BoundaryCleanupEndpointDescribe"
+    effect    = "Allow"
+    actions   = ["ec2:DescribeVpcEndpoints"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid       = "BoundaryDescribeLogGroups"
+    effect    = "Allow"
+    actions   = ["logs:DescribeLogGroups"]
+    resources = ["*"]
   }
 
   # ecr:GetAuthorizationToken does not support resource-level permissions

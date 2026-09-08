@@ -18,6 +18,29 @@
 # own section below, but are not subject to the same test.
 
 runtime:
+  - role: "runtime roles via permissions boundary"
+    action: "ec2:DescribeVpcEndpoints"
+    sid: "BoundaryCleanupEndpointDescribe"
+    file: "infra/terraform/modules/ci_oidc/main.tf"
+    justification: >
+      DescribeVpcEndpoints has no resource-level IAM support. This boundary
+      entry is only a ceiling for the cleanup role's identical read action;
+      endpoint deletion is separately ARN- and project-Name-tag-scoped.
+  - role: "runtime roles via permissions boundary"
+    action: "logs:DescribeLogGroups"
+    sid: "BoundaryDescribeLogGroups"
+    file: "infra/terraform/modules/ci_oidc/main.tf"
+    justification: >
+      This action has no resource type and is kept separate, matching
+      SfnLogGroupDescribe. https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazoncloudwatchlogs.html
+  - role: "runtime roles via permissions boundary"
+    action: "logs:CreateLogDelivery, logs:GetLogDelivery, logs:UpdateLogDelivery, logs:DeleteLogDelivery, logs:ListLogDeliveries, logs:PutResourcePolicy, logs:DescribeResourcePolicies"
+    sid: "BoundaryLogDelivery"
+    file: "infra/terraform/modules/ci_oidc/main.tf"
+    justification: >
+      Ceiling for the same unscopable log-delivery actions already granted to
+      the SFN role. Without this boundary allowance its identity grant is denied.
+      https://docs.aws.amazon.com/step-functions/latest/dg/cw-logs.html
   # Section 13.1's enumerated runtime exception, restated per attaching
   # role. "runtime" means: a role assumed by application compute, never a
   # deployment/CI identity.
@@ -141,6 +164,16 @@ runtime:
       is not Resource="*".
 
 deployment:
+  - role: "gha-ci-dev"
+    action: "sns:Unsubscribe"
+    sid: "SnsSubscriptionDelete"
+    file: "infra/terraform/modules/ci_oidc/policy.tf"
+    justification: >
+      Unsubscribe is authorized against the opaque subscription ARN returned
+      only after a subscription exists and is confirmed; AWS SNS does not
+      support constraining this action to the project's topic ARN. Topic
+      creation, mutation, subscription creation and reads remain scoped to
+      arn:aws:sns:{region}:{account}:4xtra-{env}-*.
   # Section 13.1 point 5: deployment roles are reviewed separately, and
   # this list is broader by design -- infrastructure creation legitimately
   # needs a wider surface than any runtime identity.

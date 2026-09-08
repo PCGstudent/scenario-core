@@ -60,6 +60,9 @@ def _reset_cached_aws_clients():
 
 @pytest.fixture
 def moto_env(aws_credentials, monkeypatch):
+    monkeypatch.setenv(
+        "DATA_KMS_KEY_ARN", "arn:aws:kms:eu-west-1:123456789012:key/test-key"
+    )
     _reset_cached_aws_clients()
     with mock_aws():
         dynamodb = boto3.client("dynamodb", region_name=REGION)

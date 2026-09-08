@@ -83,21 +83,19 @@ def _get_results(job_id: str) -> dict[str, Any]:
 def _delete(job_id: str) -> dict[str, Any]:
     job = _job_or_404(job_id)
     status = job.get("status")
-    if status in job_store.TERMINAL_STATUSES:
+    if status in job_store.TERMINAL_STATUSES - {"CANCELLED"}:
         return json_response(200, {"job_id": job_id, "status": status})
-    execution_arn = job.get("execution_arn")
-    if execution_arn:
-        try:
-            _sfn().stop_execution(executionArn=execution_arn)
-        except _sfn().exceptions.ExecutionDoesNotExist:
-            pass
-    # mark_cancelled's own conditional write re-checks status at write time
-    # (not this function's now-possibly-stale read above), so a job that
-    # completed in the gap between the read and this call correctly stays
-    # SUCCEEDED/FAILED rather than being regressed to CANCELLED -- the
-    # returned status reflects what actually happened, not what this
-    # handler assumed would happen.
+    # Commit cancellation before stopping the execution. A retry must still
+    # attempt StopExecution if a previous call failed after this write.
     final_status = job_store.mark_cancelled(job_id)
+    if final_status == "CANCELLED":
+        current = _job_or_404(job_id)
+        execution_arn = current.get("execution_arn")
+        if execution_arn:
+            try:
+                _sfn().stop_execution(executionArn=execution_arn)
+            except _sfn().exceptions.ExecutionDoesNotExist:
+                pass
     return json_response(200, {"job_id": job_id, "status": final_status})
 
 
