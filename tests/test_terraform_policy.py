@@ -954,3 +954,21 @@ def test_negative_control_delete_object_on_lock_file_is_permitted():
             "resources": ["arn:aws:s3:::bucket/envs/dev/terraform.tfstate.tflock"],
         }
     )
+
+
+def test_dev_backend_uses_kms_sse_matching_the_bucket_policy():
+    """The bootstrap bucket policy denies any PutObject whose
+    s3:x-amz-server-side-encryption header is not literally "aws:kms"
+    (infra/terraform/bootstrap). `encrypt = true` alone does not produce
+    that header -- the S3 backend's default SSE algorithm without
+    `kms_key_id` is AES256, which the policy rejects for both the state
+    object and the use_lockfile=true lockfile. Reproduced directly: a
+    `terraform plan` against this backend failed with AccessDenied on the
+    lockfile PutObject before `kms_key_id` was added below."""
+    parsed = _load_tf(INFRA_ROOT / "envs" / "dev" / "backend.tf")
+    backend = _unquote(parsed["terraform"][0]["backend"][0]["s3"])
+    assert backend["bucket"] == "4xtra-dev-tfstate-758895552145"
+    assert backend["key"] == "envs/dev/terraform.tfstate"
+    assert backend["use_lockfile"] is True
+    assert backend["encrypt"] is True
+    assert backend["kms_key_id"] == "alias/4xtra-dev-tfstate"
