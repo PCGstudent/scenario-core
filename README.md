@@ -1,4 +1,4 @@
-# 4-Xtra Senior DS/MLE Take-Home
+# Scenario Core Predictions
 
 A compact, reproducible R&D workflow for generating and validating synthetic Brent crude return scenarios.
 
